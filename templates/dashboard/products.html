@@ -1,0 +1,26 @@
+{% extends "dashboard/base.html" %}
+{% block title %}المنتجات — {{ store.name }}{% endblock %}
+{% block content %}
+<div class="page-heading"><h1>المنتجات</h1><a class="button" href="/dashboard/products/new">إضافة منتج</a></div>
+<section class="panel">
+{% if products %}
+  <div class="group-list">
+  {% for product in products %}
+    <div class="list-row">
+      <div class="row-main">
+        <a class="row-title" href="/dashboard/products/{{ product.id }}">{{ product.name }}</a>
+        <span class="row-meta">{{ product.base_price|money }} دج · {{ product.variants|length|money }} متغيرات · {{ "نشط" if product.is_active else "معطل" }}</span>
+      </div>
+      <div class="row-actions">
+        <a class="button secondary" href="/dashboard/products/{{ product.id }}">إدارة</a>
+        <form method="post" action="/dashboard/products/{{ product.id }}/toggle">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="{{ 'destructive' if product.is_active else 'secondary' }}" type="submit">{{ "تعطيل" if product.is_active else "تفعيل" }}</button>
+        </form>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+{% else %}<p class="muted">لا توجد منتجات بعد.</p>{% endif %}
+</section>
+{% endblock %}

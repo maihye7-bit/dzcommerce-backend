@@ -1,0 +1,17 @@
+{% extends "dashboard/base.html" %}
+{% block title %}إضافة منتج — {{ store.name }}{% endblock %}
+{% block content %}
+<h1>إضافة منتج</h1>
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+<section class="panel narrow">
+  <form method="post" action="/dashboard/products">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>اسم المنتج<input name="name" required maxlength="255"></label>
+    <label>الوصف<textarea name="description" rows="3"></textarea></label>
+    <label>السعر الأساسي (دج)<input name="base_price" type="number" min="0" step="0.01" required></label>
+    <label>رمز المنتج (اختياري)<input name="sku"></label>
+    <label>المخزون الابتدائي<input name="initial_quantity" type="number" min="0" value="0" required></label>
+    <button type="submit">حفظ المنتج</button>
+  </form>
+</section>
+{% endblock %}

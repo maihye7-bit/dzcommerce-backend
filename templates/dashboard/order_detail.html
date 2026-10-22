@@ -1,0 +1,27 @@
+{% extends "dashboard/base.html" %}
+{% block title %}تفاصيل الطلب — {{ store.name }}{% endblock %}
+{% block content %}
+<h1>تفاصيل الطلب</h1>
+<section class="panel">
+  <dl class="details">
+    <dt>مرجع الطلب</dt><dd class="reference">{{ order|order_reference }}</dd>
+    <dt>المعرّف الداخلي</dt><dd class="reference">{{ order.id }}</dd>
+    <dt>العميل</dt><dd>{{ customer.name if customer else "—" }}</dd>
+    <dt>الحالة</dt><dd><span class="badge badge-{{ order.status.value }}">{{ order.status|order_status_ar }}</span></dd>
+    <dt>المجموع الفرعي</dt><dd>{{ order.subtotal|money }} دج</dd>
+    <dt>التوصيل</dt><dd>{{ order.shipping_cost|money }} دج</dd>
+    <dt>الإجمالي</dt><dd>{{ order.total|money }} دج</dd>
+    <dt>الولاية</dt><dd>{{ order.wilaya or "—" }}</dd>
+    <dt>عنوان الشحن</dt><dd>{{ order.shipping_address or "—" }}</dd>
+  </dl>
+</section>
+<section class="panel">
+  <h2>العناصر</h2>
+  <div class="group-list">{% for item, product, variant in item_details %}
+    <div class="list-row">
+      <div class="row-main"><span class="row-title">{{ product.name if product else "—" }}</span><span class="row-meta">{{ variant.name if variant else "—" }} · الكمية {{ item.quantity|money }}</span></div>
+      <strong>{{ item.unit_price|money }} دج</strong>
+    </div>
+  {% endfor %}</div>
+</section>
+{% endblock %}

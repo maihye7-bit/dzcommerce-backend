@@ -1,0 +1,104 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}إدارة المتاجر{% endblock %}
+
+{% block content %}
+<div class="sa-shell">
+  {% if notice %}
+  <div class="sa-toast sa-toast-{{ notice_type }}" role="status" data-toast>
+    {{ notice }}
+  </div>
+  {% endif %}
+
+  <section class="sa-hero">
+    <div>
+      <p class="sa-kicker">مساحة الإدارة</p>
+      <h1>إدارة المتاجر</h1>
+      <p class="sa-lead">نظرة عامة ومتابعة المتاجر المرتبطة بالمنصة.</p>
+    </div>
+    <a class="sa-button sa-button-primary" href="/super-admin/stores/new">
+      <span aria-hidden="true">＋</span> إنشاء متجر جديد
+    </a>
+  </section>
+
+  <section class="sa-stat-grid" aria-label="إحصائيات المتاجر">
+    <article class="sa-stat sa-glass">
+      <span>إجمالي المتاجر</span><strong>{{ total_count }}</strong>
+    </article>
+    <article class="sa-stat sa-glass">
+      <span>نشط</span><strong class="sa-green">{{ active_count }}</strong>
+    </article>
+    <article class="sa-stat sa-glass">
+      <span>معلّق</span><strong class="sa-orange">{{ suspended_count }}</strong>
+    </article>
+  </section>
+
+  <section class="sa-panel sa-glass">
+    <form class="sa-filters" method="get" action="/super-admin">
+      <label class="sa-search">
+        <span class="sr-only">البحث بالاسم أو المعرّف</span>
+        <span aria-hidden="true">⌕</span>
+        <input type="search" name="q" value="{{ query }}" placeholder="ابحث باسم المتجر أو معرّفه">
+      </label>
+      <div class="sa-segmented" role="group" aria-label="تصفية حسب حالة المتجر">
+        <button type="submit" name="state" value="all" class="{{ 'active' if state == 'all' else '' }}">الكل</button>
+        <button type="submit" name="state" value="active" class="{{ 'active' if state == 'active' else '' }}">نشط</button>
+        <button type="submit" name="state" value="suspended" class="{{ 'active' if state == 'suspended' else '' }}">معلّق</button>
+      </div>
+    </form>
+
+    <div class="sa-list-heading">
+      <h2>المتاجر</h2>
+      <span>{{ stores|length }} نتيجة</span>
+    </div>
+
+    <div class="sa-store-list">
+      {% for store in stores %}
+      <article class="sa-store-row">
+        <div class="sa-store-identity">
+          <div class="sa-store-symbol" aria-hidden="true">◈</div>
+          <div>
+            <a class="sa-store-name" href="/super-admin/stores/{{ store.slug }}">{{ store.name }}</a>
+            <div class="sa-store-slug">{{ store.slug }}</div>
+          </div>
+        </div>
+        <div class="sa-store-controls">
+          <span class="sa-status {{ 'is-active' if store.is_active else 'is-suspended' }}">
+            {{ 'نشط' if store.is_active else 'معلّق' }}
+          </span>
+          <a class="sa-icon-button" href="/super-admin/stores/{{ store.slug }}" aria-label="عرض تفاصيل {{ store.name }}" title="عرض التفاصيل">◉</a>
+          <form method="post" action="/super-admin/stores/{{ store.id }}/toggle">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="sa-icon-button" type="submit" aria-label="{{ 'تعليق' if store.is_active else 'تفعيل' }} {{ store.name }}" title="{{ 'تعليق' if store.is_active else 'تفعيل' }}">
+              {{ 'Ⅱ' if store.is_active else '▶' }}
+            </button>
+          </form>
+          <form method="post" action="/super-admin/stores/{{ store.id }}/impersonate">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="sa-button sa-button-secondary" type="submit">الدخول كمالك</button>
+          </form>
+          <form method="post" action="/super-admin/stores/{{ store.id }}/delete" onsubmit="return confirm('سيؤدي حذف المتجر إلى حذف بياناته المرتبطة. هل تريد المتابعة؟')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="sa-icon-button sa-danger-text" type="submit" aria-label="حذف {{ store.name }}" title="حذف">⌫</button>
+          </form>
+        </div>
+      </article>
+      {% else %}
+      <div class="sa-empty">
+        <span class="sa-empty-icon" aria-hidden="true">⌕</span>
+        <strong>لا توجد متاجر مطابقة</strong>
+        <span>جرّب تغيير عبارة البحث أو الفلتر المحدد.</span>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+<script>
+  document.querySelectorAll("[data-toast]").forEach((toast) => {
+    window.setTimeout(() => {
+      toast.classList.add("sa-toast-hide");
+      window.setTimeout(() => toast.remove(), 250);
+    }, 3000);
+  });
+</script>
+{% endblock %}

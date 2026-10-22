@@ -1,0 +1,16 @@
+{% extends "dashboard/base.html" %}
+{% block title %}إعدادات المتجر — {{ store.name }}{% endblock %}
+{% block content %}
+<h1>إعدادات المتجر</h1>
+{% if saved %}<p class="alert success">تم حفظ الإعدادات. ستُستخدم المعلومات الموثقة في ردود المساعد.</p>{% endif %}
+<section class="panel narrow">
+  <form method="post" action="/dashboard/settings">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>اسم المتجر<input name="name" value="{{ store.name }}" required maxlength="255"></label>
+    <label>العنوان<textarea name="address" rows="3">{{ store.address or "" }}</textarea></label>
+    <label>سياسة التوصيل<textarea name="delivery_policy_text" rows="5">{{ store.delivery_policy_text or "" }}</textarea></label>
+    <label>الولايات المخدومة (افصل بينها بفواصل)<textarea name="served_wilayas" rows="3">{{ store.served_wilayas or "" }}</textarea></label>
+    <button type="submit">حفظ الإعدادات</button>
+  </form>
+</section>
+{% endblock %}

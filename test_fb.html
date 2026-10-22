@@ -1,0 +1,113 @@
+﻿<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DzCommerce - Facebook Webhook Tester</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; padding: 2rem; color: #1f2937; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #2563eb; text-align: center; margin-bottom: 2rem; }
+        .form-group { margin-bottom: 1.5rem; }
+        label { display: block; margin-bottom: 0.5rem; font-weight: bold; }
+        textarea { width: 100%; padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 6px; font-size: 1rem; resize: vertical; min-height: 100px; }
+        button { width: 100%; padding: 1rem; background-color: #2563eb; color: white; border: none; border-radius: 6px; font-size: 1.1rem; cursor: pointer; transition: background 0.2s; }
+        button:hover { background-color: #1d4ed8; }
+        button:disabled { background-color: #9ca3af; cursor: not-allowed; }
+        .response-box { margin-top: 2rem; background-color: #111827; color: #4ade80; padding: 1.5rem; border-radius: 8px; font-family: monospace; white-space: pre-wrap; word-break: break-word; min-height: 200px; overflow-y: auto; max-height: 400px; }
+        .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.875rem; font-weight: bold; margin-bottom: 1rem; }
+        .success { background-color: #dcfce7; color: #166534; }
+        .error { background-color: #fee2e2; color: #991b1b; }
+        .loading { background-color: #dbeafe; color: #1e40af; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🧪 DzCommerce AI Agent Tester</h1>
+    <p style="text-align: center; color: #6b7280;">محاكاة رسالة واردة من Facebook Messenger</p>
+
+    <div class="form-group">
+        <label for="messageInput">نص الرسالة من العميل:</label>
+        <textarea id="messageInput">مرحبا، هل تتوفر سماعات رأس لاسلكية؟ ما سعرها؟</textarea>
+    </div>
+
+    <button id="sendBtn" onclick="sendMessage()">🚀 إرسال إلى الخادم (AI)</button>
+
+    <div id="statusArea"></div>
+
+    <div class="form-group">
+        <label>استجابة الخادم (Server Response):</label>
+        <div class="response-box" id="responseOutput">في انتظار الإرسال...</div>
+    </div>
+</div>
+
+<script>
+    async function sendMessage() {
+        const btn = document.getElementById('sendBtn');
+        const output = document.getElementById('responseOutput');
+        const statusArea = document.getElementById('statusArea');
+        const messageText = document.getElementById('messageInput').value;
+
+        // Update UI to Loading state
+        btn.disabled = true;
+        btn.textContent = "جارٍ المعالجة...";
+        output.textContent = "";
+        statusArea.innerHTML = '<span class="status-badge loading">جاري الاتصال بـ OpenRouter...</span>';
+
+        // Construct the Payload exactly as Facebook sends it
+        const payload = {
+            object: "page",
+            entry: [
+                {
+                    id: "test_page_id_123",
+                    time: Math.floor(Date.now() / 1000),
+                    messaging: [
+                        {
+                            sender: { id: "user_browser_test" },
+                            recipient: { id: "test_page_id_123" },
+                            timestamp: Date.now(),
+                            message: { 
+                                text: messageText 
+                            }
+                        }
+                    ]
+                }
+            ]
+        };
+
+        try {
+            // Send POST request to Local Backend
+            const response = await fetch("http://localhost:8000/webhooks/meta", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                body: JSON.stringify(payload),
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            
+            // Display Success
+            statusArea.innerHTML = '<span class="status-badge success">✅ تم الاستقبال والمعالجة بنجاح</span>';
+            output.textContent = JSON.stringify(data, null, 2);
+
+        } catch (error) {
+            // Display Error
+            statusArea.innerHTML = '<span class="status-badge error">❌ فشل الاتصال بالخادم</span>';
+            output.textContent = `Error: ${error.message}\n\nتأكد من تشغيل الباكند على http://localhost:8000`;
+            console.error(error);
+        } finally {
+            // Reset Button
+            btn.disabled = false;
+            btn.textContent = "🚀 إرسال إلى الخادم (AI)";
+        }
+    }
+</script>
+
+</body>
+</html>

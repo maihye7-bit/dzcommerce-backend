@@ -1,0 +1,29 @@
+{% extends "dashboard/base.html" %}
+{% block title %}الطلبات — {{ store.name }}{% endblock %}
+{% block content %}
+<div class="page-heading"><h1>الطلبات</h1></div>
+<nav class="segmented" aria-label="تصفية الطلبات بالحالة">
+  <a href="/dashboard/orders" class="{% if not selected_status %}active{% endif %}">الكل</a>
+  {% for state in statuses %}
+  <a href="/dashboard/orders?status_filter={{ state.value }}" class="{% if selected_status == state.value %}active{% endif %}">{{ state|order_status_ar }}</a>
+  {% endfor %}
+</nav>
+<section class="panel">
+{% if orders %}
+<div class="group-list">
+  {% for order in orders %}
+  <a class="list-row" href="/dashboard/orders/{{ order.id }}">
+    <div class="row-main">
+      <span class="row-title reference">{{ order|order_reference }}</span>
+      <span class="row-meta">{{ customers.get(order.customer_id, "—") }} · {{ order.created_at.strftime("%Y-%m-%d %H:%M") if order.created_at else "—" }}</span>
+    </div>
+    <div class="row-actions">
+      <span class="badge badge-{{ order.status.value }}">{{ order.status|order_status_ar }}</span>
+      <strong>{{ order.total|money }} دج</strong>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}<p class="muted">لا توجد طلبات مطابقة.</p>{% endif %}
+</section>
+{% endblock %}

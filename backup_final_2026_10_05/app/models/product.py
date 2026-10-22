@@ -1,0 +1,51 @@
+"""
+Product model - Core commerce entity.
+Supports variants (size, color) and multi-tenancy.
+"""
+import uuid
+from datetime import datetime
+from sqlalchemy import String, Text, Boolean, Numeric, ForeignKey, func, DateTime
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.database import Base
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
+    
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True) # Stock Keeping Unit
+    
+    base_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False) # Price in DZD
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    variants = relationship("ProductVariant", back_populates="product", cascade="all, delete-orphan")
+
+class ProductVariant(Base):
+    __tablename__ = "product_variants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    
+    name: Mapped[str] = mapped_column(String(100), nullable=False) # e.g., "Noir - 42"
+    sku: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
+    price_adjustment: Mapped[float] = mapped_column(Numeric(10, 2), default=0) # Extra cost for this variant
+    attributes_json: Mapped[dict | None] = mapped_column(
+        MutableDict.as_mutable(JSONB),
+        nullable=True,
+        default=dict,
+    )
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    product = relationship("Product", back_populates="variants")
+    inventory_item = relationship("InventoryItem", back_populates="variant", uselist=False)

@@ -1,0 +1,69 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}إنشاء متجر جديد{% endblock %}
+
+{% block content %}
+<div class="sa-shell sa-form-shell">
+  <section class="sa-hero">
+    <div>
+      <p class="sa-kicker">إدارة المتاجر</p>
+      <h1>إنشاء متجر جديد</h1>
+      <p class="sa-lead">سيُنشأ حساب مالك مرتبط بالمتجر في العملية نفسها.</p>
+    </div>
+    <a class="sa-button sa-button-secondary" href="/super-admin">إلغاء</a>
+  </section>
+
+  <section class="sa-panel sa-glass sa-create-panel">
+    {% if error %}
+    <div class="sa-toast sa-toast-error" role="alert" data-toast>{{ error }}</div>
+    {% endif %}
+    <form method="post" action="/super-admin/stores/new">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="sa-form-grid">
+        <label>اسم المتجر
+          <input id="store-name" name="name" type="text" maxlength="255" required value="{{ form_data.get('name', '') }}" autocomplete="organization">
+        </label>
+        <label>معرّف المتجر
+          <input id="store-slug" name="slug" type="text" maxlength="255" required value="{{ form_data.get('slug', '') }}" autocomplete="off" dir="ltr">
+          <small>يُنشأ تلقائياً من الاسم ويمكن تعديله.</small>
+        </label>
+        <label>اسم المالك
+          <input name="owner_name" type="text" maxlength="255" required value="{{ form_data.get('owner_name', '') }}" autocomplete="name">
+        </label>
+        <label>البريد الإلكتروني <span class="sa-optional">(اختياري)</span>
+          <input name="email" type="email" maxlength="255" value="{{ form_data.get('email', '') }}" autocomplete="email" dir="ltr">
+        </label>
+        <label class="sa-full-width">كلمة مرور المالك
+          <input name="password" type="password" minlength="12" maxlength="128" required autocomplete="new-password">
+          <small>12 حرفاً على الأقل. لا تُحفظ كلمة المرور أو تُعرض بعد إنشاء الحساب.</small>
+        </label>
+      </div>
+      <div class="sa-form-actions">
+        <button class="sa-button sa-button-primary" type="submit">إنشاء المتجر</button>
+        <a class="sa-button sa-button-secondary" href="/super-admin">إلغاء</a>
+      </div>
+    </form>
+  </section>
+</div>
+<script>
+  document.querySelectorAll("[data-toast]").forEach((toast) => {
+    window.setTimeout(() => {
+      toast.classList.add("sa-toast-hide");
+      window.setTimeout(() => toast.remove(), 250);
+    }, 3000);
+  });
+  const storeName = document.getElementById("store-name");
+  const storeSlug = document.getElementById("store-slug");
+  let slugWasEdited = storeSlug.value.length > 0;
+  storeSlug.addEventListener("input", () => { slugWasEdited = true; });
+  storeName.addEventListener("input", () => {
+    if (!slugWasEdited) {
+      storeSlug.value = storeName.value
+        .trim()
+        .toLocaleLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, "-")
+        .replace(/^-+|-+$/g, "");
+    }
+  });
+</script>
+{% endblock %}

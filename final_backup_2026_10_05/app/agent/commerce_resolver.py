@@ -1,0 +1,439 @@
+﻿from __future__ import annotations
+
+import uuid
+import re
+import logging
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum
+from typing import Any, Optional
+
+from sqlalchemy.orm import Session
+
+from app.models.conversation import Conversation
+from app.models.inventory import InventoryItem
+from app.models.product import Product, ProductVariant
+from app.services.attribute_normalizer import normalize_attributes, normalize_value
+
+
+logger = logging.getLogger(__name__)
+
+_LEGACY_COLOR_ALIASES = {
+    "سودا": "black",
+    "سوداء": "black",
+}
+
+
+class CommerceStage(str, Enum):
+    EMPTY = "EMPTY"
+    PRODUCT_CANDIDATES = "PRODUCT_CANDIDATES" # New Stage for multiple results
+    PRODUCT_SELECTED = "PRODUCT_SELECTED"
+    VARIANT_SELECTED = "VARIANT_SELECTED"
+    DRAFT_PENDING = "DRAFT_PENDING"
+    ORDER_CONFIRMED = "ORDER_CONFIRMED"
+
+
+class AllowedAction(str, Enum):
+    SEARCH_PRODUCTS = "EXECUTE_TOOL:search_products"
+    GET_PRODUCT_DETAILS = "EXECUTE_TOOL:get_product_details"
+    CREATE_DRAFT = "CALL_SERVICE:create_draft"
+    UPDATE_DRAFT = "CALL_SERVICE:update_draft"
+    CONFIRM_ORDER = "EXECUTE_TOOL:confirm_order"
+    RESOLVE_VARIANT = "CALL_SERVICE:resolve_variant"
+    RE_SEARCH_OR_CONFIRM_CHANGE = "RESPOND:text_only"
+    ASK_FOR_CLARIFICATION = "RESPOND:text_only"
+    BLOCK_UNLESS_EXPLICIT_RESET = "RESPOND:text_only"
+    INFO_ALREADY_CONFIRMED = "RESPOND:text_only"
+    ERROR_NO_DRAFT_YET = "RESPOND:text_only"
+    UPDATE_SELECTION = "CALL_SERVICE:update_selection"
+    LIST_CANDIDATES = "RESPOND:text_only" # Action to show list
+
+
+@dataclass
+class ResolutionResult:
+    allowed_action: str
+    resolved_entities: dict[str, Any] = field(default_factory=dict)
+    context_updates: dict[str, Any] = field(default_factory=dict)
+    response_hint: str = ""
+
+
+class CommerceResolver:
+    """
+    Pure decision layer between Qwen NLU output and business execution.
+    """
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def resolve(
+        self, 
+        nlu_output: dict[str, Any], 
+        current_state: dict[str, Any],
+        store_id: uuid.UUID
+    ) -> ResolutionResult:
+        state = current_state or {}
+        
+        # 1. Determine Stage from DB Facts
+        stage = self._get_current_stage_from_db(state)
+
+        intent = (nlu_output or {}).get("intent") or (nlu_output or {}).get("intent_guess", "unknown")
+        raw_attributes = (nlu_output or {}).get("attributes") or {}
+        attributes = normalize_attributes(raw_attributes) if isinstance(raw_attributes, dict) else {}
+        quantity = (nlu_output or {}).get("quantity") or 1
+        product_mention = (nlu_output or {}).get("product_mention")
+        confirmation_phrase = bool((nlu_output or {}).get("confirmation_phrase", False))
+
+        # Base context to preserve history
+        base_context = {
+            "commerce_stage": stage.value,
+            "selected_product_id": state.get("selected_product_id"),
+            "selected_variant_id": state.get("selected_variant_id"),
+            "selected_attributes": state.get("selected_attributes") or {},
+            "candidate_product_ids": state.get("candidate_product_ids") or [],
+            "last_intent": intent,
+            "last_nlu": nlu_output or {},
+        }
+
+        # ---------------------------------------------------------
+        # DECISION MATRIX
+        # ---------------------------------------------------------
+
+        if stage == CommerceStage.EMPTY:
+            if intent == "product_search" and product_mention:
+                return ResolutionResult(
+                    allowed_action=AllowedAction.SEARCH_PRODUCTS.value,
+                    resolved_entities={"query": product_mention},
+                    context_updates=base_context,
+                    response_hint=f"Searching for '{product_mention}'...",
+                )
+            return ResolutionResult(
+                allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+                resolved_entities={},
+                context_updates=base_context,
+                response_hint="What product are you looking for?",
+            )
+
+        if stage == CommerceStage.PRODUCT_CANDIDATES:
+            # User needs to choose one of the candidates
+            if intent == "variant_selection" or intent == "order_create":
+                 # Ambiguous, ask user to specify
+                 return ResolutionResult(
+                    allowed_action=AllowedAction.LIST_CANDIDATES.value,
+                    resolved_entities={},
+                    context_updates=base_context,
+                    response_hint="I found several products. Which one do you mean? Please be specific.",
+                )
+            elif intent == "product_search":
+                 # New search resets candidates
+                 return ResolutionResult(
+                    allowed_action=AllowedAction.SEARCH_PRODUCTS.value,
+                    resolved_entities={"query": product_mention},
+                    context_updates=base_context,
+                    response_hint=f"Searching again for '{product_mention}'...",
+                )
+            return self._default_result(base_context)
+
+        if stage == CommerceStage.PRODUCT_SELECTED:
+            prod_id_str = state.get("selected_product_id")
+            
+            if intent == "variant_selection":
+                if not prod_id_str:
+                     return self._error_result(base_context, "No product selected.")
+                
+                try:
+                    prod_uuid = uuid.UUID(prod_id_str)
+                except ValueError:
+                    return self._error_result(base_context, "Invalid product ID format.")
+
+                # Resolve Variant from DB using Attributes
+                variant = self._resolve_variant_from_attributes(store_id, prod_uuid, attributes)
+                
+                if variant:
+                    logger.info(
+                        "Resolved variant %s for product %s in store %s",
+                        variant.id,
+                        prod_uuid,
+                        store_id,
+                    )
+                    new_ctx = {
+                        **base_context,
+                        "selected_variant_id": str(variant.id),
+                        "selected_attributes": attributes,
+                        "commerce_stage": CommerceStage.VARIANT_SELECTED.value
+                    }
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.RESOLVE_VARIANT.value,
+                        resolved_entities={
+                            "product_id": str(prod_uuid),
+                            "variant_id": str(variant.id),
+                            "price": float(self._get_price_for_variant(store_id, variant)),
+                            "stock": self._get_stock_count(store_id, variant.id)
+                        },
+                        context_updates=new_ctx,
+                        response_hint=f"Found: {variant.name}. Ready to order?",
+                    )
+                else:
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
+                        resolved_entities={"product_id": str(prod_uuid)},
+                        context_updates=base_context,
+                        response_hint="Showing all variants for this product.",
+                    )
+
+            elif intent == "order_create":
+                var_id_str = state.get("selected_variant_id")
+                if var_id_str:
+                     return self._prepare_draft_creation(store_id, prod_id_str, var_id_str, quantity, base_context)
+                else:
+                     return ResolutionResult(
+                        allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
+                        resolved_entities={"product_id": prod_id_str},
+                        context_updates=base_context,
+                        response_hint="Please select a color/size first.",
+                    )
+            
+            elif intent == "product_search":
+                 return ResolutionResult(
+                    allowed_action=AllowedAction.RE_SEARCH_OR_CONFIRM_CHANGE.value,
+                    resolved_entities={},
+                    context_updates=base_context,
+                    response_hint="You already have a product selected. Do you want to switch?",
+                )
+
+            return self._default_result(base_context)
+
+        if stage == CommerceStage.VARIANT_SELECTED:
+            prod_id_str = state.get("selected_product_id")
+            var_id_str = state.get("selected_variant_id")
+
+            if intent == "order_create":
+                if not var_id_str:
+                    return self._error_result(base_context, "No variant selected.")
+                return self._prepare_draft_creation(store_id, prod_id_str, var_id_str, quantity, base_context)
+
+            elif intent == "variant_selection":
+                return ResolutionResult(
+                    allowed_action=AllowedAction.UPDATE_SELECTION.value,
+                    resolved_entities={"product_id": prod_id_str},
+                    context_updates=base_context,
+                    response_hint="Updating variant selection...",
+                )
+            
+            elif intent == "order_confirm":
+                 return self._error_result(base_context, "Cannot confirm without a draft. Say 'ديرلي طلب' first.")
+
+            return self._default_result(base_context)
+
+        if stage == CommerceStage.DRAFT_PENDING:
+            if intent == "order_confirm" or confirmation_phrase:
+                return ResolutionResult(
+                    allowed_action=AllowedAction.CONFIRM_ORDER.value,
+                    resolved_entities={},
+                    context_updates={**base_context, "commerce_stage": CommerceStage.ORDER_CONFIRMED.value},
+                    response_hint="Confirming order...",
+                )
+            
+            elif intent == "order_create":
+                 return ResolutionResult(
+                    allowed_action=AllowedAction.UPDATE_DRAFT.value,
+                    resolved_entities={},
+                    context_updates=base_context,
+                    response_hint="Draft exists. Updating items...",
+                )
+            
+            elif intent == "product_search":
+                 return ResolutionResult(
+                    allowed_action=AllowedAction.BLOCK_UNLESS_EXPLICIT_RESET.value,
+                    resolved_entities={},
+                    context_updates=base_context,
+                    response_hint="You have an active draft. Confirm or cancel it first.",
+                )
+
+            return self._default_result(base_context)
+
+        if stage == CommerceStage.ORDER_CONFIRMED:
+            return ResolutionResult(
+                allowed_action=AllowedAction.INFO_ALREADY_CONFIRMED.value,
+                resolved_entities={},
+                context_updates=base_context,
+                response_hint="Your order is confirmed. Thank you!",
+            )
+
+        return self._default_result(base_context)
+
+    # --- Helper Methods ---
+
+    def _get_current_stage_from_db(self, state: dict) -> CommerceStage:
+        """Determines stage strictly based on presence of data in state."""
+        # Check Draft First (Highest Priority)
+        draft = state.get("active_draft_json")
+        if draft and isinstance(draft, dict) and draft.get("items"):
+            return CommerceStage.DRAFT_PENDING
+        
+        # Check Variant Selection
+        if state.get("selected_variant_id"):
+            return CommerceStage.VARIANT_SELECTED
+            
+        # Check Product Candidates (Multiple results found but none selected)
+        if state.get("candidate_product_ids") and not state.get("selected_product_id"):
+             return CommerceStage.PRODUCT_CANDIDATES
+
+        # Check Product Selection
+        if state.get("selected_product_id"):
+            return CommerceStage.PRODUCT_SELECTED
+            
+        return CommerceStage.EMPTY
+
+    def _prepare_draft_creation(
+        self, 
+        store_id: uuid.UUID, 
+        prod_id_str: Optional[str], 
+        var_id_str: Optional[str], 
+        qty: int, 
+        base_context: dict
+    ) -> ResolutionResult:
+        """Validates entities and prepares result for Draft Service."""
+        if not prod_id_str or not var_id_str:
+             return self._error_result(base_context, "Missing product or variant ID.")
+        
+        try:
+            var_uuid = uuid.UUID(var_id_str)
+        except ValueError:
+             return self._error_result(base_context, "Invalid Variant ID format.")
+
+        # Final Safety Check: Does this variant belong to this store?
+        variant = self.db.query(ProductVariant).join(Product).filter(
+            ProductVariant.id == var_uuid,
+            Product.store_id == store_id
+        ).first()
+
+        if not variant:
+            return self._error_result(base_context, "Selected item is no longer available.")
+
+        price = self._get_price_for_variant(store_id, variant)
+        stock = self._get_stock_count(store_id, variant.id)
+
+        if stock < qty:
+            return ResolutionResult(
+                allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+                resolved_entities={},
+                context_updates=base_context,
+                response_hint=f"Not enough stock. Only {stock} left.",
+            )
+
+        return ResolutionResult(
+            allowed_action=AllowedAction.CREATE_DRAFT.value,
+            resolved_entities={
+                "product_id": str(variant.product_id),
+                "variant_id": str(variant.id),
+                "quantity": qty,
+                "unit_price": float(price),
+                "total_price": float(price * qty)
+            },
+            context_updates={
+                **base_context,
+                "commerce_stage": CommerceStage.DRAFT_PENDING.value
+            },
+            response_hint="Creating order draft...",
+        )
+
+    def _resolve_variant_from_attributes(
+        self, 
+        store_id: uuid.UUID, 
+        product_id: uuid.UUID, 
+        attributes: dict
+    ) -> Optional[ProductVariant]:
+        """Matches requested attributes against DB variants."""
+        variants = self.db.query(ProductVariant).join(Product).filter(
+            ProductVariant.product_id == product_id,
+            Product.store_id == store_id,
+            Product.is_active == True
+        ).all()
+
+        if not variants:
+            return None
+        
+        if not attributes:
+            return variants[0] # Default to first if no specs given
+
+        requested_attributes = normalize_attributes(attributes)
+
+        for v in variants:
+            v_attrs = getattr(v, "attributes_json", None)
+            if isinstance(v_attrs, dict) and v_attrs:
+                normalized_variant_attributes = normalize_attributes(v_attrs)
+                match = all(
+                    key in normalized_variant_attributes
+                    and normalized_variant_attributes[key] == value
+                    for key, value in requested_attributes.items()
+                )
+            else:
+                match = self._variant_name_matches_attributes(
+                    v.name or "",
+                    requested_attributes,
+                )
+
+            if match:
+                return v
+        
+        return None
+
+    @staticmethod
+    def _variant_name_matches_attributes(name: str, attributes: dict[str, Any]) -> bool:
+        """Match normalized requested values against legacy variant-name text."""
+        name_tokens = re.findall(r"\w+", name.casefold())
+        for key, value in attributes.items():
+            expected = CommerceResolver._normalize_legacy_name_value(str(value), key)
+            value_tokens = re.findall(r"\w+", expected.casefold())
+            if not value_tokens:
+                return False
+
+            matched = False
+            max_window = min(4, len(name_tokens))
+            for window_size in range(1, max_window + 1):
+                for start in range(len(name_tokens) - window_size + 1):
+                    candidate = " ".join(name_tokens[start:start + window_size])
+                    if CommerceResolver._normalize_legacy_name_value(candidate, key) == expected:
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched:
+                return False
+
+        return True
+
+    @staticmethod
+    def _normalize_legacy_name_value(value: str, key: str) -> str:
+        normalized = normalize_value(value, key)
+        if key == "color":
+            return _LEGACY_COLOR_ALIASES.get(normalized, normalized)
+        return normalized
+
+    def _get_price_for_variant(self, store_id: uuid.UUID, variant: ProductVariant) -> Decimal:
+        base = getattr(variant.product, 'base_price', 0)
+        adj = getattr(variant, 'price_adjustment', 0)
+        return Decimal(str(base)) + Decimal(str(adj))
+
+    def _get_stock_count(self, store_id: uuid.UUID, variant_id: uuid.UUID) -> int:
+        inv = self.db.query(InventoryItem).filter(
+            InventoryItem.variant_id == variant_id,
+            InventoryItem.store_id == store_id
+        ).first()
+        return inv.quantity if inv else 0
+
+    def _error_result(self, ctx: dict, msg: str) -> ResolutionResult:
+        return ResolutionResult(
+            allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+            resolved_entities={},
+            context_updates=ctx,
+            response_hint=msg
+        )
+
+    def _default_result(self, ctx: dict) -> ResolutionResult:
+        return ResolutionResult(
+            allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+            resolved_entities={},
+            context_updates=ctx,
+            response_hint="I didn't understand that action. Please clarify."
+        )

@@ -1,0 +1,159 @@
+﻿<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DzCommerce Agent</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #667eea; min-height: 100vh; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; display: grid; grid-template-columns: 300px 1fr; gap: 20px; }
+        .panel { background: white; border-radius: 15px; padding: 25px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+        h1 { color: #667eea; text-align: center; font-size: 22px; }
+        h2 { color: #333; border-bottom: 2px solid #667eea; padding-bottom: 10px; font-size: 16px; }
+        input { width: 100%; padding: 10px; margin: 5px 0 15px; border: 2px solid #e0e0e0; border-radius: 8px; }
+        button { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; margin-top: 5px; }
+        button:hover { background: #5568d3; }
+        .status { padding: 10px; border-radius: 8px; margin-top: 10px; font-size: 13px; display: none; }
+        .success { background: #d4edda; color: #155724; display: block; }
+        .error { background: #f8d7da; color: #721c24; display: block; }
+        .chat-area { display: flex; flex-direction: column; height: 500px; }
+        .messages { flex: 1; overflow-y: auto; padding: 15px; background: #f8f9fa; border-radius: 10px; margin-bottom: 10px; }
+        .message { margin-bottom: 10px; padding: 10px; border-radius: 10px; max-width: 80%; }
+        .user { background: #667eea; color: white; margin-left: auto; }
+        .bot { background: white; border: 2px solid #e0e0e0; }
+        .system { background: #fff3cd; color: #856404; text-align: center; font-size: 12px; max-width: 100%; }
+        .input-area { display: flex; gap: 10px; }
+        .input-area input { margin: 0; }
+        .input-area button { width: auto; padding: 10px 25px; margin: 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="panel">
+            <h1>🤖 DzCommerce Agent</h1>
+            <h2>🔐 المصادقة</h2>
+            <input type="email" id="email" placeholder="البريد اللكتروني" value="test@example.com">
+            <input type="password" id="password" placeholder="كلمة المرور (8 حرف)" value="test1234">
+            <input type="text" id="fullName" placeholder="الاسم الكامل" value="Test User">
+            <input type="text" id="storeName" placeholder="اسم المتجر" value="My Store">
+            <button onclick="register()">📝 تسجيل</button>
+            <button onclick="login()">🔑 تسجيل الدخول</button>
+            <button onclick="getStores()">📋 جلب المتاجر</button>
+            <div id="status" class="status"></div>
+            <h2 style="margin-top: 20px;">⚙️ العدادات</h2>
+            <input type="text" id="storeId" placeholder="Store ID (تلقائي)">
+            <input type="text" id="token" placeholder="Token (تلقائي)">
+        </div>
+
+        <div class="panel chat-area">
+            <h2>💬 المحادثة</h2>
+            <div id="messages" class="messages">
+                <div class="message system">سجل دخولك للبدء</div>
+            </div>
+            <div class="input-area">
+                <input type="text" id="msgInput" placeholder="اكتب رسالتك..." onkeypress="if(event.key==='Enter')sendMessage()">
+                <button onclick="sendMessage()">رسال</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = 'http://localhost:8000';
+
+        function showStatus(msg, type) {
+            const s = document.getElementById('status');
+            s.textContent = msg;
+            s.className = 'status ' + type;
+        }
+
+        async function register() {
+            try {
+                const r = await fetch(API + '/api/auth/register', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        email: document.getElementById('email').value,
+                        password: document.getElementById('password').value,
+                        full_name: document.getElementById('fullName').value,
+                        store_name: document.getElementById('storeName').value
+                    })
+                });
+                if (r.ok) showStatus('✅ تم التسجيل! سجل الدخول الآن', 'success');
+                else showStatus('❌ فشل: ' + JSON.stringify(await r.json()), 'error');
+            } catch(e) { showStatus('❌ خط: ' + e.message, 'error'); }
+        }
+
+        async function login() {
+            try {
+                const r = await fetch(API + '/api/auth/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'username=' + encodeURIComponent(document.getElementById('email').value) + '&password=' + encodeURIComponent(document.getElementById('password').value)
+                });
+                if (r.ok) {
+                    const d = await r.json();
+                    document.getElementById('token').value = d.access_token;
+                    showStatus('✅ تم الدخول! اجلب المتاجر', 'success');
+                } else showStatus('❌ فشل الدخول', 'error');
+            } catch(e) { showStatus('❌ خط: ' + e.message, 'error'); }
+        }
+
+        async function getStores() {
+            try {
+                const token = document.getElementById('token').value;
+                const r = await fetch(API + '/api/stores/', {
+                    headers: {'Authorization': 'Bearer ' + token}
+                });
+                if (r.ok) {
+                    const stores = await r.json();
+                    if (stores.length > 0) {
+                        document.getElementById('storeId').value = stores[0].id;
+                        showStatus('✅ المتجر: ' + stores[0].name, 'success');
+                        addMsg('system', '✅ جاهز! المتجر: ' + stores[0].name);
+                    }
+                }
+            } catch(e) { showStatus('❌ خط: ' + e.message, 'error'); }
+        }
+
+        async function sendMessage() {
+            const msg = document.getElementById('msgInput').value.trim();
+            if (!msg) return;
+            addMsg('user', msg);
+            document.getElementById('msgInput').value = '';
+
+            try {
+                const r = await fetch(API + '/api/agent/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + document.getElementById('token').value
+                    },
+                    body: JSON.stringify({
+                        store_id: document.getElementById('storeId').value,
+                        message: msg,
+                        channel: 'web'
+                    })
+                });
+                if (r.ok) {
+                    const d = await r.json();
+                    let reply = d.response || 'لا استجابة';
+                    if (d.tool_calls && d.tool_calls.length > 0) {
+                        reply += '\n🔧 دوات: ' + d.tool_calls.map(t => t.name).join(', ');
+                    }
+                    if (d.handoff) reply += '\n🤝 تحويل لى موظف';
+                    addMsg('bot', reply);
+                } else addMsg('bot', '❌ خط في الاتصال');
+            } catch(e) { addMsg('bot', '❌ ' + e.message); }
+        }
+
+        function addMsg(type, text) {
+            const m = document.getElementById('messages');
+            const div = document.createElement('div');
+            div.className = 'message ' + type;
+            div.textContent = text;
+            m.appendChild(div);
+            m.scrollTop = m.scrollHeight;
+        }
+    </script>
+</body>
+</html>

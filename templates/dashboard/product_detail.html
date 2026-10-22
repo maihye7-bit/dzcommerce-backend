@@ -1,0 +1,47 @@
+{% extends "dashboard/base.html" %}
+{% block title %}إدارة {{ product.name }} — {{ store.name }}{% endblock %}
+{% block content %}
+<h1>إدارة المنتج</h1>
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+<section class="panel narrow">
+  <h2>بيانات المنتج</h2>
+  <form method="post" action="/dashboard/products/{{ product.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>الاسم<input name="name" value="{{ product.name }}" required></label>
+    <label>الوصف<textarea name="description" rows="3">{{ product.description or "" }}</textarea></label>
+    <label>السعر الأساسي (دج)<input name="base_price" type="number" min="0" step="0.01" value="{{ product.base_price }}" required></label>
+    <label>رمز المنتج<input name="sku" value="{{ product.sku or '' }}"></label>
+    <button type="submit">حفظ التعديلات</button>
+  </form>
+</section>
+<section class="panel">
+  <h2>المتغيرات والمخزون</h2>
+  {% for variant in variants %}
+  <article class="variant-card">
+    <form method="post" action="/dashboard/products/{{ product.id }}/variants/{{ variant.id }}" class="form-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>اسم الخيار<input name="name" value="{{ variant.name }}" required></label>
+      <label>زيادة السعر<input name="price_adjustment" type="number" min="0" step="0.01" value="{{ variant.price_adjustment or 0 }}"></label>
+      <label>رمز الخيار<input name="sku" value="{{ variant.sku or '' }}"></label>
+      <label>خصائص الخيار<textarea name="attributes_json" rows="2">{{ variant.attributes_json|tojson }}</textarea></label>
+      <button type="submit">حفظ الخيار</button>
+    </form>
+    <form method="post" action="/dashboard/variants/{{ variant.id }}/stock" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>المخزون<input name="quantity" type="number" min="0" value="{{ variant.inventory_item.quantity if variant.inventory_item else 0 }}" required></label>
+      <button type="submit">تحديث المخزون</button>
+    </form>
+  </article>
+  {% endfor %}
+  <h3>إضافة خيار</h3>
+  <form method="post" action="/dashboard/products/{{ product.id }}/variants" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>اسم الخيار<input name="name" required></label>
+    <label>زيادة السعر<input name="price_adjustment" type="number" min="0" step="0.01" value="0"></label>
+    <label>رمز الخيار<input name="sku"></label>
+    <label>خصائص الخيار<textarea name="attributes_json" rows="2">{}</textarea></label>
+    <label>المخزون الابتدائي<input name="initial_quantity" type="number" min="0" value="0"></label>
+    <button type="submit">إضافة الخيار</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "dashboard/base.html" %}
+{% block title %}الرئيسية — {{ store.name }}{% endblock %}
+{% block content %}
+<h1>الرئيسية</h1>
+<section class="cards">
+  <article class="card"><span>طلبات اليوم</span><strong>{{ orders_today|money }}</strong></article>
+  <article class="card"><span>الطلبات المؤكدة</span><strong>{{ confirmed_count|money }}</strong></article>
+  <article class="card"><span>إجمالي قيمة الطلبات المؤكدة</span><strong>{{ confirmed_total|money }} دج</strong></article>
+</section>
+<section class="panel">
+  <h2>تنبيه المخزون المنخفض <small>(أقل من ٣)</small></h2>
+  {% if low_stock %}
+  <div class="group-list">
+    {% for product_name, variant_name, quantity in low_stock %}
+    <div class="list-row">
+      <div class="row-main"><span class="row-title">{{ product_name }}</span><span class="row-meta">{{ variant_name }}</span></div>
+      <span class="badge badge-cancelled">المتوفر: {{ quantity|money }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}<p class="muted">لا توجد تنبيهات مخزون حالياً.</p>{% endif %}
+</section>
+{% endblock %}

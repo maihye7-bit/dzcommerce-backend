@@ -1,0 +1,97 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}{{ store.name }} — تفاصيل المتجر{% endblock %}
+
+{% block content %}
+<div class="sa-shell">
+  {% if notice %}
+  <div class="sa-toast sa-toast-{{ notice_type }}" role="status" data-toast>{{ notice }}</div>
+  {% endif %}
+  <section class="sa-hero">
+    <div>
+      <p class="sa-kicker"><a href="/super-admin">إدارة المتاجر</a> / تفاصيل المتجر</p>
+      <h1>{{ store.name }}</h1>
+      <p class="sa-lead" dir="ltr">{{ store.slug }}</p>
+    </div>
+    <div class="sa-detail-actions">
+      <form method="post" action="/super-admin/stores/{{ store.id }}/toggle">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="sa-button sa-button-secondary" type="submit">{{ 'تعليق المتجر' if store.is_active else 'تفعيل المتجر' }}</button>
+      </form>
+      <form method="post" action="/super-admin/stores/{{ store.id }}/delete" onsubmit="return confirm('سيؤدي حذف المتجر إلى حذف بياناته المرتبطة. هل تريد المتابعة؟')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="sa-button sa-button-danger" type="submit">حذف المتجر</button>
+      </form>
+      <a class="sa-button sa-button-secondary" href="/super-admin">رجوع</a>
+    </div>
+  </section>
+
+  <section class="sa-panel sa-glass">
+    <h2>معلومات المتجر</h2>
+    <dl class="sa-details">
+      <div><dt>اسم المتجر</dt><dd>{{ store.name }}</dd></div>
+      <div><dt>المعرّف</dt><dd dir="ltr">{{ store.slug }}</dd></div>
+      <div><dt>الحالة</dt><dd><span class="sa-status {{ 'is-active' if store.is_active else 'is-suspended' }}">{{ 'نشط' if store.is_active else 'معلّق' }}</span></dd></div>
+      <div><dt>تاريخ الإنشاء</dt><dd>{{ store.created_at.strftime('%Y-%m-%d %H:%M') if store.created_at else '—' }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="sa-stat-grid">
+    <article class="sa-stat sa-glass"><span>المنتجات</span><strong>{{ product_count }}</strong></article>
+    <article class="sa-stat sa-glass"><span>الطلبات خلال 30 يوماً</span><strong>{{ order_count_30d }}</strong></article>
+    <article class="sa-stat sa-glass"><span>إيرادات الطلبات المؤكدة · 30 يوماً</span><strong class="sa-green">{{ revenue_30d|money }} دج</strong></article>
+  </section>
+
+  <section class="sa-panel sa-glass">
+    <div class="sa-list-heading"><h2>أحدث الطلبات</h2><span>آخر 10</span></div>
+    <div class="sa-table-wrap">
+      <table class="sa-table">
+        <thead><tr><th>رقم الطلب</th><th>الحالة</th><th>المبلغ</th><th>التاريخ</th></tr></thead>
+        <tbody>
+          {% for order in recent_orders %}
+          <tr>
+            <td class="sa-reference">{{ order|order_reference }}</td>
+            <td><span class="sa-status">{{ order_status_labels.get(order.status.value if order.status.value is defined else order.status, order.status) }}</span></td>
+            <td>{{ order.total|money }} دج</td>
+            <td>{{ order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '—' }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="sa-table-empty">لا توجد طلبات حتى الآن.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="sa-panel sa-glass">
+    <div class="sa-list-heading"><h2>أحدث المحادثات</h2><span>آخر 5</span></div>
+    <div class="sa-store-list">
+      {% for conversation in recent_conversations %}
+      <article class="sa-store-row">
+        <div class="sa-store-identity">
+          <div class="sa-store-symbol" aria-hidden="true">◌</div>
+          <div>
+            <strong>محادثة {{ conversation.id.hex[:8].upper() }}</strong>
+            <div class="sa-store-slug">
+              {{ channel_labels.get(conversation.channel|lower, conversation.channel) }} ·
+              {{ conversation_status_labels.get(conversation.status, conversation.status) }}
+            </div>
+          </div>
+        </div>
+        <time class="sa-store-slug">{{ conversation.updated_at.strftime('%Y-%m-%d %H:%M') if conversation.updated_at else '—' }}</time>
+      </article>
+      {% else %}
+      <div class="sa-empty"><strong>لا توجد محادثات بعد.</strong></div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+<script>
+  document.querySelectorAll("[data-toast]").forEach((toast) => {
+    window.setTimeout(() => {
+      toast.classList.add("sa-toast-hide");
+      window.setTimeout(() => toast.remove(), 250);
+    }, 3000);
+  });
+</script>
+{% endblock %}

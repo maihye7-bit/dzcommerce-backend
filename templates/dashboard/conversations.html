@@ -1,0 +1,29 @@
+{% extends "dashboard/base.html" %}
+{% block title %}المحادثات — {{ store.name }}{% endblock %}
+{% block content %}
+<h1>المحادثات (للعرض فقط)</h1>
+{% if selected %}
+  <p><a href="/dashboard/conversations">← كل المحادثات</a></p>
+  <section class="panel"><h2>{{ selected[1].name }} · {{ selected[0].channel|channel_ar }}</h2>
+    <p class="muted">الحالة: {{ selected[0].status|conversation_status_ar }} · {{ selected[0].updated_at }}</p>
+    <div class="transcript">{% for message in messages %}
+      <article class="message {{ 'agent' if message.role == 'agent' else 'customer' }}">
+        <strong>{{ "المساعد" if message.role == "agent" else "العميل" if message.role == "customer" else "النظام" }}</strong>
+        <p>{{ message.content }}</p>
+        <small>{{ message.created_at }}</small>
+      </article>
+    {% endfor %}</div>
+  </section>
+{% else %}
+  <section class="panel">
+  {% if conversations %}
+    <div class="group-list">{% for conversation, customer in conversations %}
+      <a class="list-row" href="/dashboard/conversations/{{ conversation.id }}">
+        <div class="row-main"><span class="row-title">{{ customer.name }}</span><span class="row-meta">{{ conversation.channel|channel_ar }} · {{ conversation.updated_at }}</span></div>
+        <span class="badge">{{ conversation.status|conversation_status_ar }}</span>
+      </a>
+    {% endfor %}</div>
+  {% else %}<p class="muted">لا توجد محادثات بعد.</p>{% endif %}
+  </section>
+{% endif %}
+{% endblock %}
