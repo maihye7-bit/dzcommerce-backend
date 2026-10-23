@@ -15,18 +15,29 @@ import hmac
 import os
 from typing import Optional
 
-from app.core.config import FACEBOOK_APP_SECRET
-
 
 def _get_app_secret() -> str:
-    """Get Meta app secret from environment. Never hard-code."""
-    secret = os.environ.get("META_APP_SECRET") or FACEBOOK_APP_SECRET
+    """
+    Get Meta app secret from environment variables dynamically.
+    
+    Priority:
+    1. META_APP_SECRET
+    2. FACEBOOK_APP_SECRET
+    
+    This function reads directly from os.environ at runtime to avoid
+    issues with static imports or cached values during deployment.
+    """
+    # Read directly from environment to ensure fresh values
+    secret = os.environ.get("META_APP_SECRET") or os.environ.get("FACEBOOK_APP_SECRET")
+    
     if not secret:
         raise RuntimeError(
-            "META_APP_SECRET environment variable is not set. "
-            "Webhook signature verification cannot proceed."
+            "Neither META_APP_SECRET nor FACEBOOK_APP_SECRET is set in environment. "
+            "Please add one of these variables in Render > Environment."
         )
-    return secret
+    
+    # Strip whitespace to prevent hidden character errors
+    return secret.strip()
 
 
 def verify_meta_signature(
@@ -51,14 +62,17 @@ def verify_meta_signature(
     if not signature_header:
         return False
 
+    # Use provided secret or fetch from environment
     secret = app_secret or _get_app_secret()
 
     # Header format: sha256=<hex_digest>
     if not signature_header.startswith("sha256="):
         return False
 
-    expected_hash = signature_header[7:]  # Strip "sha256=" prefix
+    # Extract the hash part after "sha256="
+    expected_hash = signature_header[len("sha256="):].strip()
 
+    # Compute HMAC-SHA256 locally
     computed_hash = hmac.new(
         key=secret.encode("utf-8"),
         msg=payload_body,
@@ -79,10 +93,10 @@ def verify_whatsapp_verify_token(
     hub.mode=subscribe, hub.verify_token=<token>, hub.challenge=<challenge>.
     We must validate the token and echo back the challenge.
     """
-    expected_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+    expected_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "").strip()
     if not expected_token:
         raise RuntimeError("WHATSAPP_VERIFY_TOKEN environment variable is not set.")
-    return hmac.compare_digest(verify_token_param, expected_token)
+    return hmac.compare_digest(verify_token_param.strip(), expected_token)
 
 
 def verify_meta_verify_token(
@@ -92,9 +106,14 @@ def verify_meta_verify_token(
     Verify the hub.verify_token parameter during Facebook/Instagram webhook setup.
     Same mechanism as WhatsApp but may use a different token value.
     """
-    expected_token = os.environ.get("META_VERIFY_TOKEN") or os.environ.get(
-        "FACEBOOK_VERIFY_TOKEN", ""
-    )
+    # Try multiple possible environment variable names for flexibility
+    expected_token = (
+        os.environ.get("META_VERIFY_TOKEN") 
+        or os.environ.get("FACEBOOK_VERIFY_TOKEN") 
+        or ""
+    ).strip()
+    
     if not expected_token:
         raise RuntimeError("Meta webhook verification token is not configured.")
-    return hmac.compare_digest(verify_token_param, expected_token)
+        
+    return hmac.compare_digest(verify_token_param.strip(), expected_token)
