@@ -32,6 +32,9 @@ app = FastAPI(
     version="0.12.0", # Updated version for Phase 12-D
 )
 
+# ✅ تم إضافة هذا السطر هنا لإصلاح مشكلة 404 في Render
+app.router.redirect_slashes = False
+
 # Register Tools
 _search_tool = SearchProductsTool()
 if not tool_registry.get(_search_tool.name):
