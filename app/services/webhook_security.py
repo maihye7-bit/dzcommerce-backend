@@ -15,6 +15,9 @@ import hmac
 import os
 from typing import Optional
 
+# NOTE: We removed the static import 'from app.core.config...' to avoid 
+# caching issues during deployment. Now we read strictly from environment.
+
 
 def _get_app_secret() -> str:
     """
@@ -63,7 +66,11 @@ def verify_meta_signature(
         return False
 
     # Use provided secret or fetch from environment
-    secret = app_secret or _get_app_secret()
+    try:
+        secret = app_secret or _get_app_secret()
+    except RuntimeError:
+        # If secret is missing, verification fails gracefully rather than crashing
+        return False
 
     # Header format: sha256=<hex_digest>
     if not signature_header.startswith("sha256="):
