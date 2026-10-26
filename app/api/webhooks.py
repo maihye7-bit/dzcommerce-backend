@@ -26,6 +26,7 @@ from app.services.webhook_security import (
 from app.agent.conversation_engine import ConversationEngine
 from app.agent.providers.mock_provider import MockLLMProvider
 from app.agent.providers.qwen_provider import QwenLLMProvider
+from app.agent.providers.freellm_provider import FreeLLMProvider
 from app.agent.tools import tool_registry
 
 router = APIRouter(prefix="/webhooks", tags=["social-webhooks"])
@@ -37,6 +38,8 @@ class InboundMessagePersistenceError(Exception):
 def _build_llm_provider():
     if AGENT_PROVIDER == "qwen":
         return QwenLLMProvider()
+    if AGENT_PROVIDER == "freellm":
+        return FreeLLMProvider()
     return MockLLMProvider()
 
 async def _send_facebook_comment_reply(comment_id: str, text: str) -> httpx.Response:
@@ -483,13 +486,15 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                             )
                         else:
                             logger.error(
-                                "SEND_FAIL status_code=%d",
+                                "SEND_FAIL status_code=%d response=%s",
                                 send_response.status_code,
+                                send_response.text,
                             )
                     except (httpx.HTTPError, RuntimeError) as send_err:
                         logger.error(
-                            "SEND_FAIL error_type=%s",
+                            "SEND_FAIL error_type=%s message=%s",
                             type(send_err).__name__,
+                            str(send_err),
                         )
 
             logger.info(
