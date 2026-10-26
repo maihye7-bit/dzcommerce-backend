@@ -22,6 +22,12 @@ QWEN_BASE_URL = os.getenv(
 )
 QWEN_TIMEOUT = int(os.getenv("QWEN_TIMEOUT", "60"))
 
+# FreeLLM Configuration
+FREE_LLM_API_KEY = os.getenv("FREE_LLM_API_KEY", "")
+FREE_LLM_MODEL = os.getenv("FREE_LLM_MODEL", "auto")
+FREE_LLM_BASE_URL = os.getenv("FREE_LLM_BASE_URL", "")
+FREE_LLM_TIMEOUT = int(os.getenv("FREE_LLM_TIMEOUT", "60"))
+
 # Context Management
 QWEN_RECENT_MESSAGES_LIMIT = int(os.getenv("QWEN_RECENT_MESSAGES_LIMIT", "10"))
 QWEN_MAX_CONTEXT_TOKENS = int(os.getenv("QWEN_MAX_CONTEXT_TOKENS", "32000"))
