@@ -6,19 +6,59 @@
   font-family: "Segoe UI", Tahoma, Arial, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --background: 210 40% 98%;
-  --foreground: 222 47% 11%;
-  --card: 0 0% 100%;
-  --card-foreground: 222 47% 11%;
-  --primary: 221 83% 53%;
-  --primary-foreground: 210 40% 98%;
-  --muted: 210 40% 94%;
-  --muted-foreground: 215 16% 47%;
-  --border: 214 32% 88%;
-  --input: 214 32% 88%;
-  --ring: 221 83% 53%;
-  --destructive: 0 72% 51%;
-  --radius: 0.75rem;
+  /* Light mode */
+  --background: 210 40% 98%; /* ~#f8fafc */
+  --foreground: 220 10% 20%; /* ~#2d3748 */
+  --card: 0 0% 100%; /* #ffffff */
+  --card-foreground: 220 10% 20%; /* #2d3748 */
+  --primary: 210 70% 45%; /* GitHub Blue #0969DA */
+  --primary-foreground: 0 0% 100%; /* #ffffff */
+  --muted: 210 30% 90%; /* #e2e8f0 */
+  --muted-foreground: 210 10% 40%; /* #64748b */
+  --border: 210 30% 85%; /* #cbd5e1 */
+  --input: 0 0% 100%; /* #ffffff */
+  --ring: 210 70% 60%; /* #3b82f6 */
+  --destructive: 0 72% 51%; /* #ef4444 */
+  --accent: 140 60% 45%; /* GitHub Green #28a745 */
+  --accent-foreground: 0 0% 100%; /* #ffffff */
+  --radius: 1rem; /* iOS-like rounding */
+}
+
+/* Dark mode */
+.dark {
+  --background: 220 20% 12%; /* #0d1117 */
+  --foreground: 210 20% 90%; /* #c9d1d9 */
+  --card: 220 20% 16%; /* #161b22 */
+  --card-foreground: 210 20% 90%; /* #c9d1d9 */
+  --primary: 210 70% 55%; /* #58a6ff */
+  --primary-foreground: 0 0% 100%; /* #ffffff */
+  --muted: 210 20% 20%; /* #30363d */
+  --muted-foreground: 210 10% 60%; /* #8b949e */
+  --border: 210 20% 25%; /* #21262d */
+  --input: 220 20% 15%; /* #0d1117 (slightly lighter) */
+  --ring: 210 70% 60%; /* #58a6ff */
+  --destructive: 0 70% 50%; /* #f85149 */
+  --accent: 140 60% 45%; /* #28a745 (still visible on dark) */
+  --accent-foreground: 0 0% 100%; /* #ffffff */
+  --radius: 1rem;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  transition: background 0.2s, color 0.2s;
+}
+
+button,
+input {
+  font: inherit;
 }
 
 * {
