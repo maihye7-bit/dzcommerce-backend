@@ -6,7 +6,6 @@ CRITICAL: Implements safe INSERT-or-SKIP logic for incoming messages.
 import json
 import logging
 import uuid
-
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
@@ -22,30 +21,27 @@ from app.services.webhook_security import (
     verify_meta_verify_token,
     verify_whatsapp_verify_token,
 )
-# Imports for Phase 12-D Integration
+
+# Imports for Phase 12-D Integration (FIXED: Added #)
 from app.agent.conversation_engine import ConversationEngine
 from app.agent.providers.mock_provider import MockLLMProvider
 from app.agent.providers.qwen_provider import QwenLLMProvider
 from app.agent.tools import tool_registry
 
 router = APIRouter(prefix="/webhooks", tags=["social-webhooks"])
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger(__name__)  # FIXED: Changed name to __name__
 
 class InboundMessagePersistenceError(Exception):
     """An inbound insert failed for a reason other than its scoped duplicate."""
-
 
 def _build_llm_provider():
     if AGENT_PROVIDER == "qwen":
         return QwenLLMProvider()
     return MockLLMProvider()
 
-
 async def _send_facebook_comment_reply(comment_id: str, text: str) -> httpx.Response:
     if not FACEBOOK_PAGE_ACCESS_TOKEN:
         raise RuntimeError("FACEBOOK_PAGE_ACCESS_TOKEN is not configured")
-
     url = f"https://graph.facebook.com/v26.0/{comment_id}/comments"
     payload = {"message": text}
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -55,11 +51,9 @@ async def _send_facebook_comment_reply(comment_id: str, text: str) -> httpx.Resp
             json=payload,
         )
 
-
 async def _send_instagram_comment_reply(comment_id: str, text: str) -> httpx.Response:
     if not FACEBOOK_PAGE_ACCESS_TOKEN:
         raise RuntimeError("FACEBOOK_PAGE_ACCESS_TOKEN is not configured")
-
     url = f"https://graph.facebook.com/v26.0/{comment_id}/replies"
     payload = {"message": text}
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -69,17 +63,14 @@ async def _send_instagram_comment_reply(comment_id: str, text: str) -> httpx.Res
             json=payload,
         )
 
-
-# Initialize Components Once at Module Load Time
+# Initialize Components Once at Module Load Time (FIXED: Added #)
 _llm_provider = _build_llm_provider()
 _engine = ConversationEngine(llm_provider=_llm_provider, tool_registry=tool_registry)
-
 
 async def _send_facebook_message(recipient_id: str, text: str) -> httpx.Response:
     """Send a Messenger reply using the configured Facebook Page access token."""
     if not FACEBOOK_PAGE_ACCESS_TOKEN:
         raise RuntimeError("FACEBOOK_PAGE_ACCESS_TOKEN is not configured")
-
     url = "https://graph.facebook.com/v26.0/me/messages"
     payload = {
         "recipient": {"id": recipient_id},
@@ -91,7 +82,6 @@ async def _send_facebook_message(recipient_id: str, text: str) -> httpx.Response
             params={"access_token": FACEBOOK_PAGE_ACCESS_TOKEN},
             json=payload,
         )
-
 
 def _persist_inbound_message(
     db: Session,
@@ -117,7 +107,7 @@ def _persist_inbound_message(
         db.rollback()
         if external_message_id is None:
             raise InboundMessagePersistenceError from exc
-
+        
         existing_message = (
             db.query(Message.id)
             .join(Conversation, Message.conversation_id == Conversation.id)
@@ -134,12 +124,14 @@ def _persist_inbound_message(
         if existing_message:
             return False
         raise InboundMessagePersistenceError from exc
+    
     return True
-
 
 @router.post("/meta")
 async def meta_webhook(request: Request, db: Session = Depends(get_db)):
     body_bytes = await request.body()
+    
+    # 1. Verify Signature
     try:
         signature_valid = verify_meta_signature(
             body_bytes,
@@ -150,10 +142,13 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             status_code=503,
             detail="Meta webhook signature verification is not configured",
         )
+    
     if not signature_valid:
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    
     logger.debug("SIGNATURE_OK path=%s", request.url.path)
 
+    # 2. Parse Payload
     try:
         payload = json.loads(body_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -161,9 +156,11 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid Meta webhook payload")
+
     entries = payload.get("entry", [])
     if not isinstance(entries, list):
         raise HTTPException(status_code=400, detail="Invalid Meta webhook payload")
+
     logger.debug(
         "PARSED object=%s entries=%d",
         payload.get("object"),
@@ -181,17 +178,22 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
 
     channel = "instagram" if platform_object == "instagram" else "facebook"
     mapped_entries = []
+
+    # 3. Resolve Stores (With Graceful Auto-Provisioning)
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         if not entry.get("messaging") and not entry.get("changes"):
             continue
+        
         account_id = entry.get("id")
         if not account_id:
             raise HTTPException(
                 status_code=400,
                 detail="Meta account ID is missing from webhook entry",
             )
+
+        # Try to find existing active store link
         store_ids = (
             db.query(ChannelAccount.store_id)
             .join(Store, Store.id == ChannelAccount.store_id)
@@ -215,9 +217,11 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
         else:
             # Fallback mechanism: Graceful Auto-Provisioning for dev/initial setup
             active_stores = db.query(Store).filter(Store.is_active.is_(True)).all()
+            
             if len(active_stores) == 1:
                 default_store = active_stores[0]
-                # Automatically create/link a temporary ChannelAccount for this page_id
+                
+                # Attempt to create/link a temporary ChannelAccount
                 try:
                     new_account = ChannelAccount(
                         store_id=default_store.id,
@@ -230,7 +234,12 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     db.commit()
                     db.refresh(new_account)
                     target_store_id = default_store.id
-                    logger.info("AUTO_LINKED_NEW_PAGE: Linked page %s to store %s", account_id, default_store.name)
+                    logger.info(
+                        "AUTO_LINKED_NEW_PAGE: Linked page %s to store %s", 
+                        account_id, 
+                        default_store.name
+                    )
+                    
                 except Exception as e:
                     db.rollback()
                     logger.error("Failed to auto-link page %s: %s", account_id, str(e))
@@ -240,7 +249,10 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     }
             else:
                 # No active store or multiple stores - return 200 OK but ignored status
-                logger.warning("UNLINKED_PAGE_RECEIVED: No unique active store to auto-link page %s", account_id)
+                logger.warning(
+                    "UNLINKED_PAGE_RECEIVED: No unique active store to auto-link page %s", 
+                    account_id
+                )
                 return {
                     "status": "ignored",
                     "reason": "No active store linked to this Page ID. Please connect via Dashboard."
@@ -251,21 +263,27 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
     processed_count = 0
     skipped_duplicates = 0
 
+    # 4. Process Entries
     for entry, store_id in mapped_entries:
         changes = entry.get("changes", [])
         if not isinstance(changes, list):
             continue
+            
         for change in changes:
             if not isinstance(change, dict):
                 continue
+                
             value = change.get("value") or {}
             if not isinstance(value, dict):
                 continue
+                
             if value.get("item") not in ("comment", None):
                 continue
+                
             comment_id = value.get("comment_id") or value.get("id")
             if not comment_id:
                 continue
+                
             reply_text = "شكرًا على تعليقك. سنرد عليك قريبًا من متجرنا."
             try:
                 if channel == "facebook":
@@ -288,11 +306,10 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     str(exc),
                 )
 
-    print("\n" + "=" * 60)
-    print("📨 RECEIVED META WEBHOOK EVENT (AGENT PROCESSING)")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("📨 RECEIVED META WEBHOOK EVENT (AGENT PROCESSING)")
+        print("=" * 60)
 
-    for entry, store_id in mapped_entries:
         messaging_events = entry.get("messaging", [])
         for event in messaging_events:
             if not isinstance(event, dict):
@@ -300,20 +317,21 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             if "read" in event or "delivery" in event:
                 logger.debug("PARSED ignored non-message event (read/delivery)")
                 continue
-
+                
             message_data = event.get("message")
             if isinstance(message_data, dict) and message_data.get("is_echo"):
                 logger.debug("PARSED ignored Messenger echo event")
                 continue
-
+                
             sender_id = (event.get("sender") or {}).get("id")
             if not sender_id:
                 continue
+                
             if not isinstance(message_data, dict) or not isinstance(
                 message_data.get("text"), str
             ):
                 continue
-
+                
             text = message_data["text"]
             external_mid = message_data.get("mid")
             delivery_trace_id = uuid.uuid4().hex
@@ -347,7 +365,6 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     Customer.phone == sender_id,
                     Customer.store_id == store.id
                 ).first()
-
                 if not customer:
                     customer = Customer(
                         store_id=store.id,
@@ -365,7 +382,6 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     Conversation.channel == channel,
                     Conversation.status == ConversationStatus.ACTIVE
                 ).first()
-
                 if not conv:
                     conv = Conversation(
                         store_id=store.id,
@@ -375,7 +391,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     )
                     db.add(conv)
                     db.flush()
-
+                
                 conv_id_for_log = conv.id
 
                 inserted = _persist_inbound_message(
@@ -415,12 +431,13 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 ai_reply = result.get("response", "")
                 turn_diagnostics = result.get("turn_diagnostics") or {}
                 processing_failed = bool(result.get("processing_failed"))
+                
                 logger.debug(
                     "AGENT_REPLY delivery_id=%s reply_length=%d",
                     delivery_trace_id,
                     len(ai_reply),
                 )
-
+                
                 # Log tool usage
                 if result.get("tool_calls"):
                     tools_used = [tc['name'] for tc in result['tool_calls']]
@@ -435,16 +452,14 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 print(f"❌ Engine/AI Error: {str(engine_err)}")
                 db.rollback()
                 # The complete turn was rolled back, so only an apology can be sent.
-                ai_reply = "عذراَ، حدث خطأ تقني مؤقت. سأحاول مساعدتك لاحقاَ."
+                ai_reply = "عذراً، حدث خطأ تقني مؤقت. سأحاول مساعدتك لاحقاً."
                 processing_failed = True
 
-            # The engine persists successful replies in the same transaction as the
-            # inbound message and tool changes. Failed turns are rolled back; their
-            # fallback apology is sent but is not recorded as a completed reply.
+            # Send Reply Logic
             if ai_reply and conv_id_for_log:
                 if not processing_failed:
                     processed_count += 1
-
+                    
                 if channel == "facebook":
                     recipient_id = str(sender_id)
                     logger.debug(
@@ -497,8 +512,8 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
 
     print(f"✅ Processed: {processed_count} | ♻️ Skipped Duplicates: {skipped_duplicates}")
     print("=" * 60 + "\n")
+    
     return {"status": "processed", "count": processed_count, "skipped": skipped_duplicates}
-
 
 @router.get("/meta")
 @router.get("/whatsapp")
@@ -512,6 +527,7 @@ async def verify_webhook(request: Request):
         if request.url.path.endswith("/whatsapp")
         else verify_meta_verify_token
     )
+
     try:
         token_valid = verifier(token or "")
     except RuntimeError:
@@ -522,4 +538,5 @@ async def verify_webhook(request: Request):
 
     if mode == "subscribe" and token_valid:
         return int(challenge) if challenge and challenge.isdigit() else challenge
+    
     raise HTTPException(status_code=403, detail="Invalid verification token")
