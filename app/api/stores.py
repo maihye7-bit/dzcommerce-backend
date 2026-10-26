@@ -11,6 +11,7 @@ from app.models.user import User
 from app.models.meta_app_config import MetaAppConfig
 from app.models.store_meta_token import StoreMetaToken
 from app.schemas.store import MyStoreOut, StoreOut, StoreUpdate
+from app.schemas.store_meta_connection import StoreMetaConnection
 
 router = APIRouter(prefix="/api/stores", tags=["stores"])
 
