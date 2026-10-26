@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
 from app.api.dashboard_ui import _csrf_token, _money, _order_reference, _verify_csrf
@@ -23,6 +23,7 @@ from app.models.product import Product
 from app.models.store import Store
 from app.models.store_user import StoreRole, StoreUser
 from app.models.user import User
+from app.models.meta_app_config import MetaAppConfig
 
 router = APIRouter(prefix="/super-admin", tags=["super-admin"])
 templates = Jinja2Templates(
@@ -434,6 +435,48 @@ def stop_impersonation(
         }
     )
     return RedirectResponse("/super-admin", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/meta-config")
+def get_meta_config(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    user = _require_super_admin(request, db)
+    config = db.query(MetaAppConfig).first()
+    if not config:
+        # Return empty config; frontend can handle missing
+        return JSONResponse(content={"appId": "", "verificationToken": ""})
+    return JSONResponse(content={
+        "appId": config.app_id,
+        "verificationToken": config.verification_token
+    })
+
+@router.put("/meta-config")
+def update_meta_config(
+    request: Request,
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    user = _require_super_admin(request, db)
+    app_id = payload.get("appId", "").strip()
+    verification_token = payload.get("verificationToken", "").strip()
+    if not app_id or not verification_token:
+        raise HTTPException(status_code=400, detail="App ID and verification token are required")
+    config = db.query(MetaAppConfig).first()
+    if not config:
+        config = MetaAppConfig(
+            app_id=app_id,
+            app_secret="",  # In practice, we would also need app secret; but for verification only token is needed
+            verification_token=verification_token
+        )
+        db.add(config)
+    else:
+        config.app_id = app_id
+        config.verification_token = verification_token
+        # app_secret left as is; could be updated via separate endpoint if needed
+    db.commit()
+    return JSONResponse(content={"success": True})
 
 
 @router.post("/logout")

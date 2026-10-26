@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_store_owner, get_current_user, get_store_membership
@@ -8,6 +8,8 @@ from app.database import get_db
 from app.models.store import Store
 from app.models.store_user import StoreUser
 from app.models.user import User
+from app.models.meta_app_config import MetaAppConfig
+from app.models.store_meta_token import StoreMetaToken
 from app.schemas.store import MyStoreOut, StoreOut, StoreUpdate
 
 router = APIRouter(prefix="/api/stores", tags=["stores"])
@@ -64,3 +66,55 @@ def update_store(
     db.commit()
     db.refresh(store)
     return store
+
+
+@router.get("/{store_id}/meta-connection", response_model=StoreMetaConnection)
+def get_store_meta_connection(
+    store_id: uuid.UUID,
+    membership: StoreUser = Depends(get_store_membership),
+    db: Session = Depends(get_db),
+):
+    token = db.query(StoreMetaToken).filter(StoreMetaToken.store_id == store_id).first()
+    if not token:
+        return StoreMetaConnection(connected=False, pageId=None, pageName=None)
+    return StoreMetaConnection(connected=True, pageId=token.page_id, pageName=token.page_name)
+
+
+@router.post("/{store_id}/meta-connection", response_model=StoreMetaConnection)
+def connect_store_meta(
+    store_id: uuid.UUID,
+    membership: StoreUser = Depends(get_current_store_owner),
+    db: Session = Depends(get_db),
+):
+    # In a real implementation, this would initiate the OAuth flow.
+    # For simplicity, we'll create a mock connection.
+    # We'll check if there's already a token and update it, otherwise create.
+    token = db.query(StoreMetaToken).filter(StoreMetaToken.store_id == store_id).first()
+    if not token:
+        token = StoreMetaToken(
+            store_id=store_id,
+            page_id="1234567890",  # Mock page ID
+            page_name="Mock Page Name",
+            access_token="mock_access_token",  # In production, this would be the real token from OAuth
+        )
+        db.add(token)
+    else:
+        token.page_id = "1234567890"
+        token.page_name = "Mock Page Name"
+        token.access_token = "mock_access_token"
+    db.commit()
+    db.refresh(token)
+    return StoreMetaConnection(connected=True, pageId=token.page_id, pageName=token.page_name)
+
+
+@router.delete("/{store_id}/meta-connection", response_model=StoreMetaConnection)
+def disconnect_store_meta(
+    store_id: uuid.UUID,
+    membership: StoreUser = Depends(get_current_store_owner),
+    db: Session = Depends(get_db),
+):
+    token = db.query(StoreMetaToken).filter(StoreMetaToken.store_id == store_id).first()
+    if token:
+        db.delete(token)
+        db.commit()
+    return StoreMetaConnection(connected=False, pageId=None, pageName=None)

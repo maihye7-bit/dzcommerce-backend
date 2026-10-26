@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { MetaConnectionCard } from "@/components/MetaConnectionCard";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 import {
   useStoreProfile,
@@ -47,58 +48,61 @@ export function SettingsPage() {
         />
       )}
       {profileQuery.data && (
-        <Card>
-          <CardHeader>
-            <CardTitle>ملف المتجر</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-6">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor="store-id">معرّف المتجر</Label>
-                <Input id="store-id" value={profileQuery.data.id} readOnly />
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>ملف المتجر</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="store-id">معرّف المتجر</Label>
+                  <Input id="store-id" value={profileQuery.data.id} readOnly />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="store-created-at">تاريخ الإنشاء</Label>
+                  <Input
+                    id="store-created-at"
+                    value="غير متاح من API ملف المتجر"
+                    readOnly
+                  />
+                </div>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="store-created-at">تاريخ الإنشاء</Label>
-                <Input
-                  id="store-created-at"
-                  value="غير متاح من API ملف المتجر"
-                  readOnly
-                />
-              </div>
-            </div>
-            <form className="space-y-4 border-t pt-5" onSubmit={handleSubmit}>
-              <div className="space-y-2">
-                <Label htmlFor="store-name">اسم المتجر</Label>
-                <Input
-                  id="store-name"
-                  maxLength={255}
-                  minLength={1}
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  readOnly={!isOwner}
-                  required
-                />
-              </div>
-              {!isOwner && (
-                <p className="text-sm text-muted-foreground">
-                  صلاحية القراءة فقط. يقتصر تعديل الملف على مالك المتجر.
-                </p>
-              )}
-              {isOwner && (
-                <Button
-                  type="submit"
-                  disabled={
-                    updateMutation.isPending ||
-                    !name.trim() ||
-                    name.trim() === profileQuery.data.name
-                  }
-                >
-                  {updateMutation.isPending ? "جارٍ الحفظ..." : "حفظ التغييرات"}
-                </Button>
-              )}
-            </form>
-          </CardContent>
-        </Card>
+              <form className="space-y-4 border-t pt-5" onSubmit={handleSubmit}>
+                <div className="space-y-2">
+                  <Label htmlFor="store-name">اسم المتجر</Label>
+                  <Input
+                    id="store-name"
+                    maxLength={255}
+                    minLength={1}
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    readOnly={!isOwner}
+                    required
+                  />
+                </div>
+                {!isOwner && (
+                  <p className="text-sm text-muted-foreground">
+                    صلاحية القراءة فقط. يقتصر تعديل الملف على مالك المتجر.
+                  </p>
+                )}
+                {isOwner && (
+                  <Button
+                    type="submit"
+                    disabled={
+                      updateMutation.isPending ||
+                      !name.trim() ||
+                      name.trim() === profileQuery.data.name
+                    }
+                  >
+                    {updateMutation.isPending ? "جارٍ الحفظ..." : "حفظ التغييرات"}
+                  </Button>
+                )}
+              </form>
+            </CardContent>
+          </Card>
+          <MetaConnectionCard storeId={profileQuery.data.id} />
+        </>
       )}
     </section>
   );
