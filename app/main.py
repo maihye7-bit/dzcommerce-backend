@@ -125,3 +125,33 @@ app.mount(
 @app.get("/api/health", tags=["health"])
 def health_check():
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+def startup_event():
+    """Ensure a default store exists on startup to prevent cold-start failures."""
+    from app.database import SessionLocal
+    from app.models.store import Store
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        store_count = db.query(Store).count()
+        if store_count == 0:
+            store = Store(
+                name="Default Store",
+                slug="default-store",
+                is_active=True,
+                address="Main Branch",
+                delivery_policy_text="Standard delivery policy",
+                served_wilayas="All",
+            )
+            db.add(store)
+            db.commit()
+            logger.info("Auto-created 'Default Store' during startup.")
+    except Exception as e:
+        db.rollback()
+        logger.error("Failed to auto-create default store on startup: %s", str(e))
+    finally:
+        db.close()

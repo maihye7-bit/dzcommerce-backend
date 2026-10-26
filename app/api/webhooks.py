@@ -203,17 +203,50 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             )
             .all()
         )
-        if not store_ids:
-            raise HTTPException(
-                status_code=404,
-                detail="No active store is connected to this Meta account",
-            )
-        if len(store_ids) > 1:
-            raise HTTPException(
-                status_code=409,
-                detail="Meta account is connected to multiple stores",
-            )
-        mapped_entries.append((entry, store_ids[0][0]))
+
+        target_store_id = None
+        if store_ids:
+            if len(store_ids) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Meta account is connected to multiple stores",
+                )
+            target_store_id = store_ids[0][0]
+        else:
+            # Fallback mechanism: Graceful Auto-Provisioning for dev/initial setup
+            active_stores = db.query(Store).filter(Store.is_active.is_(True)).all()
+            if len(active_stores) == 1:
+                default_store = active_stores[0]
+                # Automatically create/link a temporary ChannelAccount for this page_id
+                try:
+                    new_account = ChannelAccount(
+                        store_id=default_store.id,
+                        channel=channel,
+                        external_account_id=str(account_id),
+                        external_account_name=f"Auto-linked {channel.capitalize()} Page",
+                        is_active=True,
+                    )
+                    db.add(new_account)
+                    db.commit()
+                    db.refresh(new_account)
+                    target_store_id = default_store.id
+                    logger.info("AUTO_LINKED_NEW_PAGE: Linked page %s to store %s", account_id, default_store.name)
+                except Exception as e:
+                    db.rollback()
+                    logger.error("Failed to auto-link page %s: %s", account_id, str(e))
+                    return {
+                        "status": "ignored",
+                        "reason": f"Auto-linking failed: {str(e)}"
+                    }
+            else:
+                # No active store or multiple stores - return 200 OK but ignored status
+                logger.warning("UNLINKED_PAGE_RECEIVED: No unique active store to auto-link page %s", account_id)
+                return {
+                    "status": "ignored",
+                    "reason": "No active store linked to this Page ID. Please connect via Dashboard."
+                }
+
+        mapped_entries.append((entry, target_store_id))
 
     processed_count = 0
     skipped_duplicates = 0
