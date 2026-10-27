@@ -129,13 +129,51 @@ def health_check():
 
 @app.on_event("startup")
 def startup_event():
-    """Ensure a default store exists on startup to prevent cold-start failures."""
+    """Ensure default data exists on startup to prevent cold-start failures."""
     from app.database import SessionLocal
     from app.models.store import Store
+    from app.models.user import User
+    from app.core.security import hash_password
+    import os
     import logging
 
     logger = logging.getLogger(__name__)
     db = SessionLocal()
+
+    # --- Auto-create / update Super Admin user ---
+    admin_email = os.getenv("ADMIN_EMAIL")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_email and admin_password:
+        normalized = admin_email.strip().casefold()
+        try:
+            user = db.query(User).filter(User.email == normalized).first()
+            if not user:
+                user = User(
+                    email=normalized,
+                    hashed_password=hash_password(admin_password),
+                    full_name="Super Admin",
+                    is_active=True,
+                    is_superuser=True,
+                    is_super_admin=True,
+                )
+                db.add(user)
+                db.commit()
+                logger.info("Auto-created Super Admin user '%s' during startup.", admin_email)
+            else:
+                # Optionally update password and privileges to match env vars
+                user.hashed_password = hash_password(admin_password)
+                user.is_super_admin = True
+                user.is_superuser = True
+                user.is_active = True
+                db.commit()
+                logger.info("Updated Super Admin user '%s' privileges during startup.", admin_email)
+        except Exception as e:
+            db.rollback()
+            logger.error("Failed to auto-create/update admin user on startup: %s", str(e))
+    finally:
+        db.close()
+
+    # --- Auto-create default store if none exist ---
     try:
         store_count = db.query(Store).count()
         if store_count == 0:
