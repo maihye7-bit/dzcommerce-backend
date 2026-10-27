@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-ARG CACHE_BUST=1
+ARG CACHE_BUST=1793121320
 FROM node:20-alpine AS frontend-builder
 WORKDIR /frontend
 COPY frontend/package*.json ./
