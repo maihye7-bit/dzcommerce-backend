@@ -140,3 +140,17 @@ export interface ConversationPreview {
   last_message_preview: string;
   updated_at: string;
 }
+
+export interface StoreMetaConnection {
+  connected: boolean;
+  pageId: string | null;
+  pageName: string | null;
+}
+
+export interface UserOut {
+  id: string;
+  email: string;
+  full_name: string;
+  is_active: boolean;
+  is_super_admin: boolean;
+}

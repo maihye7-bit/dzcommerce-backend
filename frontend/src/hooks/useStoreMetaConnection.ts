@@ -1,7 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { fetchStoreMetaConnection, connectStoreMeta, disconnectStoreMeta } from "@/lib/meta-api";
 import { showToast } from "@/lib/toast";
-import type { StoreMetaConnection } from "@/types/api";
 
 export function useStoreMetaConnection(storeId: string | null) {
   const queryClient = useQueryClient();
@@ -14,7 +13,7 @@ export function useStoreMetaConnection(storeId: string | null) {
 
   const connectMutation = useMutation({
     mutationFn: connectStoreMeta,
-    onSuccess: (data, variables, context) => {
+    onSuccess: (_data, variables) => {
       showToast("تم ربط الصفحة بنجاح", "success");
       queryClient.invalidateQueries({ queryKey: ["store", "meta-connection", variables] });
     },
@@ -25,7 +24,7 @@ export function useStoreMetaConnection(storeId: string | null) {
 
   const disconnectMutation = useMutation({
     mutationFn: disconnectStoreMeta,
-    onSuccess: (data, variables, context) => {
+    onSuccess: (_data, variables) => {
       showToast("تم قطع الاتصال بالصفحة", "success");
       queryClient.invalidateQueries({ queryKey: ["store", "meta-connection", variables] });
     },
