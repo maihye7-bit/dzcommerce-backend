@@ -286,7 +286,7 @@ def dashboard_login_page(request: Request):
 @router.get("/super-admin")
 def super_admin_dashboard(request: Request, db: Session = Depends(get_db)):
     _require_super_admin(request, db)
-    return RedirectResponse("/super-admin", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/login")
@@ -320,7 +320,7 @@ def dashboard_login(
             }
         )
         return RedirectResponse(
-            "/super-admin",
+            "/",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -349,7 +349,7 @@ def dashboard_login(
             "csrf_token": secrets.token_urlsafe(32),
         }
     )
-    return RedirectResponse("/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/logout")
