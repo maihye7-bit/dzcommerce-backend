@@ -27,4 +27,5 @@ COPY . .
 
 EXPOSE 8000
 
-# No CMD here – railway.json controls startup via prestart.sh
+# Use shell form to ensure $PORT is expanded correctly
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT"]
