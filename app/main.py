@@ -170,8 +170,8 @@ def startup_event():
         except Exception as e:
             db.rollback()
             logger.error("Failed to auto-create/update admin user on startup: %s", str(e))
-    finally:
-        db.close()
+        finally:
+            db.close()
 
     # --- Auto-create default store if none exist ---
     try:
