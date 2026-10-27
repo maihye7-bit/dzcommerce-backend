@@ -11,6 +11,7 @@ import { AnalyticsPage } from "@/pages/AnalyticsPage";
 import { ProductsPage } from "@/pages/ProductsPage";
 import { InventoryPage } from "@/pages/InventoryPage";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { MetaConfigPage } from "@/pages/super-admin/MetaConfigPage";
 import { ToastProvider } from "@/context/ToastProvider";
 
 const queryClient = new QueryClient({
@@ -43,6 +44,7 @@ export default function App() {
                     element={<AnalyticsPage />}
                   />
                 </Route>
+                <Route path="/super-admin" element={<MetaConfigPage />} />
               </Route>
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

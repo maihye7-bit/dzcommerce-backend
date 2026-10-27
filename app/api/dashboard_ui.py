@@ -361,7 +361,7 @@ def dashboard_logout(
     del owner
     _verify_csrf(request, csrf_token)
     request.session.clear()
-    return RedirectResponse("/dashboard/login", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/appearance")
@@ -545,7 +545,7 @@ def create_product(
             product=None,
             error=str(exc),
         )
-    return RedirectResponse("/dashboard/products", status_code=303)
+    return RedirectResponse("/products", status_code=303)
 
 
 @router.get("/products/{product_id}")
@@ -631,7 +631,7 @@ def toggle_product(
     product_service.update_product(
         db, owner.store.id, product.id, is_active=not product.is_active
     )
-    return RedirectResponse("/dashboard/products", status_code=303)
+    return RedirectResponse("/products", status_code=303)
 
 
 @router.post("/products/{product_id}/variants")
