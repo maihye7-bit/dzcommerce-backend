@@ -8,7 +8,6 @@ alembic upgrade head
 # 3. Ensure/Update Admin user
 python scripts/reset_admin_password.py
 # 4. Start application
-# Use PORT with fallback for safety
-PORT="${PORT:-8080}"
+# Railway injects PORT dynamically; no fallback to avoid binding to wrong port
 echo "Starting Gunicorn on port $PORT..."
 exec gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT
