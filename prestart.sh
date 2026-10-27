@@ -2,7 +2,9 @@
 set -e
 echo "=== Starting prestart.sh ==="
 echo "PORT=$PORT"
+echo "PWD=$(pwd)"
 echo "DATABASE_URL exists: $([ -n "$DATABASE_URL" ] && echo 'YES' || echo 'NO')"
+ls -la /app/
 
 # 1. Fix orphaned revision hash in DB
 echo "Step 1: Fixing alembic revision hash..."
