@@ -68,7 +68,7 @@ export function MetaConfigPage() {
         <Card>
           <CardHeader>
             <CardTitle>إعدادات تطبيق Meta</CardTitle>
-          </Header>
+          </CardHeader>
           <CardContent className="space-y-6">
             <form className="space-y-4 border-t pt-5" onSubmit={handleSubmit}>
               <div className="space-y-2">
