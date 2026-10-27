@@ -111,6 +111,10 @@ app.include_router(conversations.router)
 app.include_router(dashboard.router)
 app.include_router(super_admin.router)
 
+@app.get("/api/health", tags=["health"])
+def health_check():
+    return {"status": "ok"}
+
 app.mount(
     "/dashboard/static",
     StaticFiles(
@@ -128,11 +132,6 @@ app.mount(
     ),
     name="spa",
 )
-
-
-@app.get("/api/health", tags=["health"])
-def health_check():
-    return {"status": "ok"}
 
 
 @app.on_event("startup")
