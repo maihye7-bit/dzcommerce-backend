@@ -14,7 +14,6 @@ from app.api import (
     auth,
     conversations,
     dashboard,
-    dashboard_ui,
     inventory,
     orders,
     products,
@@ -110,7 +109,6 @@ app.include_router(webhooks.router)
 app.include_router(stats.router)
 app.include_router(conversations.router)
 app.include_router(dashboard.router)
-app.include_router(dashboard_ui.router)
 app.include_router(super_admin.router)
 
 app.mount(
