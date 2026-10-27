@@ -121,6 +121,16 @@ app.mount(
     name="dashboard-static",
 )
 
+# Serve React SPA (compiled frontend) - must be after all API routes
+app.mount(
+    "/",
+    StaticFiles(
+        directory=str(Path(__file__).resolve().parents[1] / "frontend" / "dist"),
+        html=True
+    ),
+    name="spa",
+)
+
 
 @app.get("/api/health", tags=["health"])
 def health_check():
