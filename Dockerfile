@@ -1,6 +1,13 @@
 # ---- Build Stage ----
-ARG CACHE_BUST=1793121320
+# Generate a deterministic CACHE_BUST value from the current date/time
+# This ensures the Docker build cache is invalidated on every deployment
+ARG CACHE_BUST
 FROM node:20-alpine AS frontend-builder
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -30,4 +37,4 @@ EXPOSE 8000
 
 # Use shell form to ensure $PORT is expanded correctly
 # Railway injects PORT dynamically; no fallback to prevent binding to wrong port
-CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT"]
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:${PORT}"]
