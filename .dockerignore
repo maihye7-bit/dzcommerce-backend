@@ -17,3 +17,6 @@ tests/
 *.log
 .coverage
 htmlcov/
+# Exclude local frontend build to ensure clean build in Docker
+frontend/dist
+frontend/node_modules
