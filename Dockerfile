@@ -28,4 +28,5 @@ COPY . .
 EXPOSE 8000
 
 # Use shell form to ensure $PORT is expanded correctly
-CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT"]
+# This CMD serves as fallback; Railway uses prestart.sh as startCommand
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:${PORT:-8080}"]
