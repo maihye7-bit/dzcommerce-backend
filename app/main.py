@@ -62,7 +62,7 @@ class TrailingSlashFixMiddleware(BaseHTTPMiddleware):
 app = FastAPI(
     title="DzCommerce Agent API",
     description="Backend API for the Algerian AI Commerce Agent.",
-    version="0.12.1", # Version bumped for critical webhook fix
+    version="0.12.2", # Version bumped for cache invalidation 2026
 )
 
 # Register Tools
