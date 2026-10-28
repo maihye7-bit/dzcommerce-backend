@@ -2,7 +2,7 @@ import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "@/context/useAuth";
 
 export function ProtectedRoute() {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading, token, logout } = useAuth();
   const location = useLocation();
 
   if (isLoading) {
@@ -14,6 +14,10 @@ export function ProtectedRoute() {
   }
 
   if (!isAuthenticated) {
+    // If there's a token but user is not authenticated, redirect to login
+    if (token) {
+      logout();
+    }
     return <Navigate to="/login" replace state={{ from: location }} />;
   }
 

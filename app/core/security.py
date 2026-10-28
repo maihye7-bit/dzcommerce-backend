@@ -14,10 +14,9 @@ from passlib.context import CryptContext
 
 from app.config import settings
 
-# bcrypt_sha256 avoids bcrypt's 72-byte truncation; legacy bcrypt/Argon2 hashes remain verifiable.
+# bcrypt_sha256 avoids bcrypt's 72-byte truncation; legacy bcrypt hashes remain verifiable.
 pwd_context = CryptContext(
-    schemes=["bcrypt_sha256", "bcrypt", "argon2"],
-    deprecated=["argon2"],
+    schemes=["bcrypt_sha256", "bcrypt"],
 )
 
 

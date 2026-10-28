@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     # Auth
     JWT_SECRET_KEY: str = Field(
-        default="insecure-dev-secret-change-me",
+        default="",
         validation_alias=AliasChoices("JWT_SECRET_KEY", "SECRET_KEY"),
     )
     JWT_ALGORITHM: str = Field(

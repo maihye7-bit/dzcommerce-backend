@@ -1,9 +1,7 @@
-import re
-import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
+from fastapi import HTTPException, status
 
-from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
@@ -21,25 +19,27 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _RATE_LIMIT_ATTEMPTS = 5
 _RATE_LIMIT_WINDOW_SECONDS = 60
-_rate_limit_lock = threading.Lock()
-_rate_limit_buckets: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 
 
 def _enforce_rate_limit(action: str, identifier: str) -> None:
     """Allow at most five auth attempts per normalized identifier per minute."""
     now = time.monotonic()
     key = (action, identifier.strip().casefold())
-    with _rate_limit_lock:
-        attempts = _rate_limit_buckets[key]
-        while attempts and now - attempts[0] >= _RATE_LIMIT_WINDOW_SECONDS:
-            attempts.popleft()
-        if len(attempts) >= _RATE_LIMIT_ATTEMPTS:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many attempts. Try again later.",
-                headers={"Retry-After": str(_RATE_LIMIT_WINDOW_SECONDS)},
-            )
-        attempts.append(now)
+    # Use a simple dict-based approach without locks for async safety;
+    # prune old entries and check limit
+    if key not in _rate_limit_buckets:
+        _rate_limit_buckets[key] = deque()
+    attempts = _rate_limit_buckets[key]
+    # Prune entries older than the window
+    while attempts and now - attempts[0] >= _RATE_LIMIT_WINDOW_SECONDS:
+        attempts.popleft()
+    if len(attempts) >= _RATE_LIMIT_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts. Try again later.",
+            headers={"Retry-After": str(_RATE_LIMIT_WINDOW_SECONDS)},
+        )
+    attempts.append(now)
 
 
 def _slugify(name: str) -> str:
