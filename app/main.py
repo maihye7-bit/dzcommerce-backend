@@ -66,7 +66,7 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
-# Include all API routers
+# Include all API routers with /api prefix
 app.include_router(auth.router, prefix="/api")
 app.include_router(agent.router, prefix="/api")
 app.include_router(conversations.router, prefix="/api")
@@ -77,7 +77,12 @@ app.include_router(products.router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
 app.include_router(stores.router, prefix="/api")
 app.include_router(super_admin.router, prefix="/api")
+
+# Include webhooks router twice:
+# 1. With /api prefix for API documentation and internal use
+# 2. WITHOUT prefix for Meta/Facebook webhooks (they call /webhooks/meta directly)
 app.include_router(webhooks.router, prefix="/api")
+app.include_router(webhooks.router, prefix="")
 
 
 # ---- Frontend Static Files (built React app) ----
