@@ -31,8 +31,7 @@ from app.config import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: register tools
-    tool_registry.register(SearchProductsTool())
+    # Startup: tools are registered in app/agent/tools/__init__.py
     yield
     # Shutdown: cleanup if needed
 
@@ -82,8 +81,7 @@ app.include_router(webhooks.router, prefix="/api")
 
 
 # ---- Frontend Static Files (built React app) ----
-# Path calculation: from app/main.py go to parents[1] (= /backend folder),
-# then add /frontend/dist
+# Path calculation: from app/main.py go to parents[1] (= /backend folder), then add /frontend/dist
 main_py_path = Path(__file__).resolve()
 backend_folder = main_py_path.parents[1]  # C:\Users\Win10LTSC\Documents\backend
 frontend_dist = backend_folder / "frontend" / "dist"
