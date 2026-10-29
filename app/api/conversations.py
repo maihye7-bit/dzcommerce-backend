@@ -17,7 +17,7 @@ from app.models.conversation import Conversation, Message
 from app.models.store_user import StoreUser
 from app.models.user import User
 
-router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 # --- Pydantic Schemas ---
 

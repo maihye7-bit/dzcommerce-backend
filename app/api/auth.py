@@ -16,7 +16,7 @@ from app.models.user import User
 from app.schemas.auth import RegisterRequest, TokenResponse
 from app.schemas.user import UserOut
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"])
 
 _RATE_LIMIT_ATTEMPTS = 5
 _RATE_LIMIT_WINDOW_SECONDS = 60

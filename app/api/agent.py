@@ -35,7 +35,7 @@ from app.models.user import User
 from app.schemas.conversation import (AgentChatRequest, AgentChatResponse,
                                       ToolCallInfo)
 
-router = APIRouter(prefix="/api/agent", tags=["agent"])
+router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 def _build_engine() -> ConversationEngine:
