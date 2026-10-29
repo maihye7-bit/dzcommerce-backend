@@ -4,6 +4,7 @@ import {
   PackageSearch,
   ShoppingCart,
 } from "lucide-react";
+import { DzLogo } from "@/components/logo/DzLogo";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { useDashboardStats } from "@/hooks/useAnalytics";
 import { StatCard } from "@/components/StatCard";
@@ -14,13 +15,11 @@ export function DashboardPage() {
   const firstError = statsQuery.error;
 
   return (
-    <section className="space-y-6" dir="rtl">
+    <section className="space-y-6 dz-dark" dir="rtl">
       <div className="flex items-baseline">
-        <span className="bg-blue-100 text-blue-800 text-xs font-medium mr-2 px-2 rounded-md">UI TEST — MIMO</span>
-        <div>
-          <p className="text-sm font-medium text-primary">لوحة التحكم</p>
-          <h1 className="mt-2 text-3xl font-bold tracking-tight">الرئيسية</h1>
-        </div>
+        <DzLogo size={24} className="mr-2" />
+        <span className="text-sm font-medium text-primary">لوحة التحكم</span>
+        <h1 className="mt-2 text-2xl font-bold tracking-tight">الرئيسية</h1>
       </div>
       {firstError && (
         <div className="alert alert-error">
@@ -33,8 +32,6 @@ export function DashboardPage() {
             title="إجمالي الطلبات"
             value={statsQuery.data.total_orders.toLocaleString("ar-DZ")}
             icon={ShoppingCart}
-            change={String(statsQuery.data.total_orders_change)}
-            changeType={statsQuery.data.total_orders_change_type as "increase" | "decrease" | undefined}
           />
           <StatCard
             title="الإيرادات"
@@ -44,22 +41,16 @@ export function DashboardPage() {
               maximumFractionDigits: 0,
             }).format(statsQuery.data.total_revenue)}
             icon={CircleDollarSign}
-            change={String(statsQuery.data.total_revenue_change)}
-            changeType={statsQuery.data.total_revenue_change_type as "increase" | "decrease" | undefined}
           />
           <StatCard
             title="طلبات اليوم"
             value={statsQuery.data.orders_today.toLocaleString("ar-DZ")}
             icon={Boxes}
-            change={String(statsQuery.data.orders_today_change)}
-            changeType={statsQuery.data.orders_today_change_type as "increase" | "decrease" | undefined}
           />
           <StatCard
             title="مخزون منخفض"
             value={statsQuery.data.low_stock_items_count.toLocaleString("ar-DZ")}
             icon={PackageSearch}
-            change={String(statsQuery.data.low_stock_items_change)}
-            changeType={statsQuery.data.low_stock_items_change_type as "increase" | "decrease" | undefined}
           />
         </div>
       )}

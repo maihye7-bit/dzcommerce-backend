@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 64 64" fill="none" stroke="var(--dz-orange)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="64" height="64" xmlns="http://www.w3.org/2000/svg">
+  <path d="M2 12l20-8v4l16 12h-8l12 16v-4l-20 8h8l-12-16v4zM36 28l16-8v4l12 16h-8l-12 16v-4l16-8zM34 44l20 8v-4l-16-12h8l16 12v4zM22 36l-16 8v-4l-12-16h8l12-16v4z"/>
+</svg>

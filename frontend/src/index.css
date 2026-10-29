@@ -2,16 +2,16 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Reduced motion preference */
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0s !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0s !important;
-    scroll-behavior: auto !important;
-  }
+/* DzCommerce SaaS Color Variables */
+:root {
+  --dz-orange: #FF6B00;
+  --dz-charcoal: #171717;
+  --dz-gray-light: #F4F5F7;
+  --dz-white: #FFFFFF;
+  --dz-text-primary: #202124;
+  --dz-text-secondary: #777777;
+  --dz-success: #22A06B;
+  --dz-error: #E5484D;
 }
 
 /* Liquid Glass theme variables - iOS 26 + GitHub style */
