@@ -8,7 +8,7 @@ from app.models.order import Order
 from app.models.store_user import StoreUser
 from app.models.user import User
 
-router = APIRouter(prefix="/api/orders", tags=["orders"])
+router = APIRouter(prefix="/orders", tags=["orders"])
 
 
 @router.get("/")

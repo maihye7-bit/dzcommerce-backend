@@ -13,7 +13,7 @@ from app.models.store_meta_token import StoreMetaToken
 from app.schemas.store import MyStoreOut, StoreOut, StoreUpdate
 from app.schemas.store_meta_connection import StoreMetaConnection
 
-router = APIRouter(prefix="/api/stores", tags=["stores"])
+router = APIRouter(prefix="/stores", tags=["stores"])
 
 
 @router.get("", response_model=list[MyStoreOut])

@@ -19,7 +19,7 @@ from app.models.product import Product, ProductVariant
 from app.models.store_user import StoreUser
 from app.models.user import User
 
-router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/usage")

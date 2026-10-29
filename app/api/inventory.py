@@ -12,9 +12,9 @@ from app.schemas.inventory import InventoryOut, InventoryUpdate
 from app.services import inventory_service
 from app.services.exceptions import NotFoundError
 
-read_router = APIRouter(prefix="/api/stores/{store_id}/inventory", tags=["inventory"])
+read_router = APIRouter(prefix="/stores/{store_id}/inventory", tags=["inventory"])
 router = APIRouter(
-    prefix="/api/stores/{store_id}/variants/{variant_id}/inventory", tags=["inventory"]
+    prefix="/stores/{store_id}/variants/{variant_id}/inventory", tags=["inventory"]
 )
 
 

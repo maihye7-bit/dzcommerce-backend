@@ -12,7 +12,7 @@ from app.models.product import Product
 from app.models.store_user import StoreUser
 from app.models.conversation import Conversation
 
-router = APIRouter(prefix="/api/stats", tags=["stats"])
+router = APIRouter(prefix="/stats", tags=["stats"])
 
 
 @router.get("/dashboard")

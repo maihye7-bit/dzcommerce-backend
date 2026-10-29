@@ -14,7 +14,7 @@ from app.services.exceptions import DuplicateSKUError, NotFoundError
 # (which reads a `store_id` path parameter) applies to all of them --
 # no route in this router can be reached without proving membership in
 # that exact store first.
-router = APIRouter(prefix="/api/stores/{store_id}/products", tags=["products"])
+router = APIRouter(prefix="/stores/{store_id}/products", tags=["products"])
 
 
 @router.post("", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
