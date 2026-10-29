@@ -9,9 +9,14 @@ import {
 export function DashboardPage() {
   return (
     <section className="space-y-6">
-      <div>
-        <p className="text-sm font-medium text-primary">لوحة التحكم</p>
-        <h1 className="mt-2 text-3xl font-bold tracking-tight">الرئيسية</h1>
+      <div className="flex items-baseline items-baseline flex-row flex-row flex-row flex-row flex-row flex-row flex-row items-baseline">
+        <div className="flex items-baseline">
+          <span className="bg-blue-100 text-blue-800 text-xs font-medium mr-2 px-2 rounded-md">UI TEST — MIMO</span>
+        </div>
+        <div>
+          <p className="text-sm font-medium text-primary">لوحة التحكم</p>
+          <h1 className="mt-2 text-3xl font-bold tracking-tight">الرئيسية</h1>
+        </div>
       </div>
       <Card>
         <CardHeader>
