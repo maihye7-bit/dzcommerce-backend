@@ -1775,6 +1775,129 @@ async def test_agent_forged_price_is_rejected_for_verified_template(db_session):
     assert "Samsung Galaxy" in result["response"]
 
 
+@pytest.mark.asyncio
+async def test_cross_store_isolation_prevents_accessing_other_store_products(db_session):
+    """
+    Regression test: ensure that a conversation with one store cannot
+    access or reference products from another store, even through the
+    LLM's output or context.
+    """
+    from app.models.store import Store
+
+    # Create two separate stores
+    store_a = Store(name="Store A", slug="store-a")
+    store_b = Store(name="Store B", slug="store-b")
+    db_session.add_all([store_a, store_b])
+    db_session.flush()
+
+    # Create products in each store
+    product_a = Product(
+        store_id=store_a.id,
+        name="Product A",
+        description="From store A",
+        base_price=Decimal("50.00"),
+        is_active=True,
+    )
+    product_b = Product(
+        store_id=store_b.id,
+        name="Product B",
+        description="From store B",
+        base_price=Decimal("75.00"),
+        is_active=True,
+    )
+    db_session.add_all([product_a, product_b])
+
+    # Create variants for each product
+    variant_a = ProductVariant(
+        product_id=product_a.id,
+        name="Variant A",
+        price_adjustment=Decimal("0.00"),
+        attributes_json={},
+    )
+    variant_b = ProductVariant(
+        product_id=product_b.id,
+        name="Variant B",
+        price_adjustment=Decimal("0.00"),
+        attributes_json={},
+    )
+    db_session.add_all([variant_a, variant_b])
+
+    # Add inventory for each variant
+    db_session.add_all([
+        InventoryItem(store_id=store_a.id, variant_id=variant_a.id, quantity=10),
+        InventoryItem(store_id=store_b.id, variant_id=variant_b.id, quantity=3),
+    ])
+    db_session.commit()
+
+    # Create customers for each store
+    customer_a = Customer(store_id=store_a.id, name="Customer A")
+    customer_b = Customer(store_id=store_b.id, name="Customer B")
+    db_session.add_all([customer_a, customer_b])
+    db_session.flush()
+
+    # Create conversations for each store
+    conversation_a = Conversation(
+        store_id=store_a.id,
+        customer_id=customer_a.id,
+        channel="test",
+        status="active",
+        metadata_json={},
+    )
+    conversation_b = Conversation(
+        store_id=store_b.id,
+        customer_id=customer_b.id,
+        channel="test",
+        status="active",
+        metadata_json={},
+    )
+    db_session.add_all([conversation_a, conversation_b])
+    db_session.commit()
+
+    # Set up conversation A with product A selected
+    conversation_a.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product_a.id),
+        "selected_product_name": product_a.name,
+        "selected_variant_id": str(variant_a.id),
+        "selected_attributes": {"color": "default"},
+    }
+    db_session.commit()
+
+    # Set up registry and engine for store A
+    registry = make_registry()
+    engine = ConversationEngine(ScriptedToolProvider([]), registry)
+
+    # Now simulate a message from store A's customer
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store_a.id,
+        customer_id=customer_a.id,
+        conversation_id=conversation_a.id,
+        channel="test",
+        user_message="What about Product B?",
+    )
+
+    # Verify store A's conversation still references only product A
+    assert conversation_a.metadata_json["selected_product_id"] == str(product_a.id)
+    assert "Product B" not in result["response"]
+    assert product_a.name in result["response"]
+    assert str(product_b.id) not in json.dumps(conversation_a.metadata_json)
+
+    # Verify store B's conversation is untouched
+    result_b = await engine.process_message(
+        db=db_session,
+        store_id=store_b.id,
+        customer_id=customer_b.id,
+        conversation_id=conversation_b.id,
+        channel="test",
+        user_message="What about Product A?",
+    )
+    assert conversation_b.metadata_json["selected_product_id"] == str(product_b.id)
+    assert "Product A" not in result_b["response"]
+    assert product_b.name in result_b["response"]
+    assert str(product_a.id) not in json.dumps(conversation_b.metadata_json)
+
+
 def test_agent_reply_validator_rejects_unverified_price_and_policy():
     from app.agent.reply_composer import ReplyComposer
 
