@@ -4,13 +4,6 @@ import {
   PackageSearch,
   ShoppingCart,
 } from "lucide-react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { useDashboardStats } from "@/hooks/useAnalytics";
 import { StatCard } from "@/components/StatCard";
