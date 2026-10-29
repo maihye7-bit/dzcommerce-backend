@@ -33,7 +33,7 @@ COPY --from=frontend-builder /frontend/dist ./frontend/dist
 # Copy backend code
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8080
 
 # Use shell form to ensure $PORT is expanded correctly
 # Railway injects PORT dynamically; no fallback to prevent binding to wrong port
