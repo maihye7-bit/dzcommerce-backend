@@ -51,6 +51,14 @@ export interface DashboardStats {
   total_revenue: number;
   low_stock_items_count: number;
   orders_today: number;
+  total_orders_change?: number;
+  total_orders_change_type?: "increase" | "decrease";
+  total_revenue_change?: number;
+  total_revenue_change_type?: "increase" | "decrease";
+  orders_today_change?: number;
+  orders_today_change_type?: "increase" | "decrease";
+  low_stock_items_change?: number;
+  low_stock_items_change_type?: "increase" | "decrease";
 }
 
 export interface TopProduct {
