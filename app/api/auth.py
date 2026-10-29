@@ -1,3 +1,4 @@
+import re
 import time
 from collections import deque
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -19,6 +20,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _RATE_LIMIT_ATTEMPTS = 5
 _RATE_LIMIT_WINDOW_SECONDS = 60
+_rate_limit_buckets: dict[tuple[str, str], deque[float]] = {}
 
 
 def _enforce_rate_limit(action: str, identifier: str) -> None:
