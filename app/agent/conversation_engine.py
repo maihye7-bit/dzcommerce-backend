@@ -28,6 +28,7 @@ from app.agent.tools.registry import ToolRegistry
 from app.agent.tools.store_info import StoreInfoTool
 from app.agent.commerce_resolver import CommerceResolver, ResolutionResult, AllowedAction
 from app.agent.reply_composer import ReplyComposer
+from app.agent.classifier import ConversationClassifier, classify_message
 from app.core.config import QWEN_TIMEOUT
 from app.models.conversation import (
     Conversation,
@@ -2149,6 +2150,13 @@ class ConversationEngine:
             post_confirmation_response is None
             and post_confirmation_nlu is None
             and not confirmation_pending
+            #
+            # --- ConversationClassifier bypass ---
+            # Allow non-commercial messages to bypass the agent loop so the
+            # Qwen agent can generate a natural conversational response without
+            # forcing unnecessary commerce tool calls. The classifier determines
+            # whether the message is commercial or purely conversational.
+            and not ConversationClassifier.is_non_commercial_message(user_message)
             and
             self.agent_tool_loop_enabled
             and self.llm is not None
@@ -2156,6 +2164,17 @@ class ConversationEngine:
             and not variant_availability_query
             and not self._contains_sensitive_nlu_content(user_message)
         ):
+            # Run classifier for logging/routing information (but only if we
+            # are actually going to enter the agent loop; if the bypass above
+            # triggered, we skip the classifier since the message is non-commercial)
+            classifier_result = ConversationClassifier.classify(
+                user_message,
+                language=current_state.get("language"),
+                recent_turns=dialogue_context[-4:] if dialogue_context else None,
+                commerce_stage=current_state.get("commerce_stage"),
+                selected_product_id=current_state.get("selected_product_id"),
+                selected_product_name=current_state.get("selected_product_name"),
+            )
             fallback_nlu = self._heuristic_nlu(user_message, current_state)
             if re.search(r"[\u0600-\u06ff]", user_message):
                 fallback_nlu["language"] = "ar"
