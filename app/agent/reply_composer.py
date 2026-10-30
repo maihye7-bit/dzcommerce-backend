@@ -9,8 +9,77 @@ from typing import Any
 
 from app.agent.providers.base import LLMMessage
 
+# Internal diagnostic codes for ReplyComposer validation failures.
+# These are used only within this module; _is_safe_reply() still returns True/False.
+# They help operators understand why a reply was rejected without exposing user data.
+DIALECTIC_CODES = {
+    "EMPTY_REPLY": "Reply text is empty",
+    "INTERNAL_IDENTIFIER": "Reply contains internal IDs (product_id, order_id, etc.)",
+    "UNSUPPORTED_CLAIM": "Reply contains unsupported policy claims (warranty, delivery, return, authenticity)",
+    "PRODUCT_NAME_MISMATCH": "Reply does not contain verified product names",
+    "LANGUAGE_MISMATCH": "Reply language script does not match detected language",
+    "PRICE_MISMATCH": "Reply contains price claims not verified against product data",
+    "STOCK_MISMATCH": "Reply contains inconsistent stock claims",
+}
 
-logger = logging.getLogger(__name__)
+
+# Diagnostic wrapper that mimics _is_safe_reply() logic and returns a code.
+# Callers use this to understand validation failures without changing the public API.
+@staticmethod
+def diagnose_reply(reply: str, language: str, products: list[dict[str, str | None]]) -> tuple[bool, str | None]:
+    """Diagnose why a reply fails _is_safe_reply() validation.
+
+    Returns (is_safe, diagnostic_code) where diagnostic_code is None when
+    is_safe is True, or a code from DIALECTIC_CODES when is_safe is False.
+    The logic mirrors _is_safe_reply() so both stay consistent.
+
+    Callers concerned only with the boolean result should use _is_safe_reply();
+    callers needing the reason should use diagnose_reply().
+    """
+    if not reply:
+        return False, "EMPTY_REPLY"
+    if len(reply) > 500:
+        return False, "EMPTY_REPLY"
+    if any(ord(char) < 32 and char not in "\n\t" for char in reply):
+        return False, "INTERNAL_IDENTIFIER"
+    if re.search(r"\b(?:product_id|variant_id|order_id|store_id|customer_id|conversation_id|sku)\b", reply, re.IGNORECASE):
+        return False, "INTERNAL_IDENTIFIER"
+    if re.search(r"(?i)(?:ضمان|warranty|توصيل|delivery|إرجاع|return|خصم|discount)", reply):
+        return False, "UNSUPPORTED_CLAIM"
+
+    names = [p.get("name", "").strip() for p in products if isinstance(p.get("name"), str)]
+    if not names or any(n.lower() not in reply.lower() for n in names):
+        return False, "PRODUCT_NAME_MISMATCH"
+
+    if language == "ar" and not re.search(r"[؀-ۿ]", reply):
+        return False, "LANGUAGE_MISMATCH"
+    if language in ("fr", "en") and not re.search(r"[A-Za-z]", reply):
+        return False, "LANGUAGE_MISMATCH"
+
+    # Price verification: check that any price mentioned in the reply
+    # matches a verified product price.
+    verified_price_values: set[Decimal] = set()
+    for p in products:
+        pv = p.get("price")
+        if pv is not None:
+            try:
+                verified_price_values.add(Decimal(str(pv)).normalize())
+            except Exception:
+                pass
+
+    import re as re_mod
+    # Extract price-like strings from the reply and verify they match
+    # a verified product price.
+    for price_match in re_mod.finditer(r"[\d][\d.,  ]*[\d]|[\d]", reply):
+        pval = Decimal(str(price_match.group())).normalize() if price_match.group() else None
+        if pval is not None and pval.is_finite() and pval >= 0:
+            if pval not in verified_price_values:
+                return False, "PRICE_MISMATCH"
+
+    return True, None
+
+
+# Keep the original _is_safe_reply() signature unchanged for backward compatibility.
 
 _CURRENCY_AMOUNT = re.compile(
     r"(?<![\w])([\d][\d., \u00a0]*[\d]|[\d])\s*"
@@ -480,8 +549,24 @@ class ReplyComposer:
             return None
 
         reply = parsed["reply"].strip()
-        if not self._is_safe_reply(reply, language, products):
-            logger.warning("ReplyComposer response failed validation; use deterministic reply")
+        is_safe, diagnostic_code = self.diagnose_reply(reply, language, products)
+        if not is_safe:
+            # Log the diagnostic code without exposing user data.
+            # The codes are internal; map to a short descriptive message for the log.
+            code_messages = {
+                "EMPTY_REPLY": "Empty reply",
+                "INTERNAL_IDENTIFIER": "Internal ID detected in reply",
+                "UNSUPPORTED_CLAIM": "Unsupported policy claim detected",
+                "PRODUCT_NAME_MISMATCH": "Product name mismatch with verified catalog",
+                "LANGUAGE_MISMATCH": "Language script mismatch",
+                "PRICE_MISMATCH": "Price claim not verified against product data",
+                "STOCK_MISMATCH": "Stock claim inconsistent with catalog",
+            }
+            log_message = code_messages.get(diagnostic_code, "Reply validation failed")
+            logger.warning(
+                "ReplyComposer response failed validation (%s); use deterministic reply",
+                log_message,
+            )
             return None
         return reply
 
