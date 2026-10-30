@@ -123,9 +123,16 @@ class ReplyComposer:
             or _UNSUPPORTED_SCRIPT.search(reply)
         )
 
-    def __init__(self, provider: Any, timeout_seconds: float = 4.0) -> None:
+    def __init__(self, provider: Any, timeout_seconds: float | None = None) -> None:
         self.provider = provider
-        self.timeout_seconds = timeout_seconds
+        # Use provided timeout, fall back to configured FREE_LLM_TIMEOUT, then 10s experimental default
+        if timeout_seconds is not None:
+            self.timeout_seconds = float(timeout_seconds)
+        else:
+            # Import here to avoid circular imports at module level
+            from app.core.config import FREE_LLM_TIMEOUT
+            # FREE_LLM_TIMEOUT is int from config; clamp to safe band [10s, 60s]
+            self.timeout_seconds = max(10.0, min(60.0, float(FREE_LLM_TIMEOUT)))
 
     @classmethod
     def is_safe_agent_reply(

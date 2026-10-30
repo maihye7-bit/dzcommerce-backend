@@ -107,7 +107,13 @@ class ConversationEngine:
         self.reply_composer_enabled = os.getenv(
             "DZCOMMERCE_REPLY_COMPOSER_ENABLED", "true"
         ).strip().lower() not in {"0", "false", "no", "off"}
-        self.reply_composer = ReplyComposer(llm_provider) if llm_provider else None
+        # Pass configured FREE_LLM_TIMEOUT to ReplyComposer so its timeout aligns
+        # with the provider's internal timeout, but keep it separate so the reply
+        # composer can return None and let the caller decide without a 60s wait.
+        from app.core.config import FREE_LLM_TIMEOUT as _FLT
+        _ft_val = _FLT if isinstance(_FLT, (int, float)) else 60
+        _ft_val = max(10.0, min(60.0, _ft_val))  # clamp to [10s, 60s] safe band
+        self.reply_composer = ReplyComposer(llm_provider, timeout_seconds=_ft_val) if llm_provider else None
 
     @staticmethod
     def _normalize_current_state(
