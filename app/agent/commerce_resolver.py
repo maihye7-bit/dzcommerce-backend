@@ -50,6 +50,9 @@ class AllowedAction(str, Enum):
     ERROR_NO_DRAFT_YET = "RESPOND:text_only"
     UPDATE_SELECTION = "CALL_SERVICE:update_selection"
     LIST_CANDIDATES = "RESPOND:text_only" # Action to show list
+    HANDLE_OBJECTION = "RESPOND:text_only"
+    ADVANCE_PURCHASE = "RESPOND:text_only"
+    NATURAL_RESPONSE = "RESPOND:text_only"
 
 
 @dataclass
@@ -123,6 +126,39 @@ class CommerceResolver:
                     "Voici quelques produits répertoriés dans la boutique.",
                 ),
             )
+
+        # Handle price objections - acknowledge and offer alternatives or ask budget
+        if intent == "objection_handling" or intent == "OBJECTION_HANDLING":
+            selected_product_id = state.get("selected_product_id")
+            selected_product_name = state.get("selected_product_name") or state.get("last_product_name")
+            selected_variant_id = state.get("selected_variant_id")
+
+            if selected_product_id:
+                # Customer is objecting to a specific product/variant they've seen
+                return ResolutionResult(
+                    allowed_action=AllowedAction.HANDLE_OBJECTION.value,
+                    resolved_entities={
+                        "product_id": selected_product_id,
+                        "product_name": selected_product_name,
+                        "variant_id": selected_variant_id,
+                    },
+                    context_updates={**base_context, "last_objection": "price"},
+                    response_hint=text(
+                        f"فهمت، السعر قد يكون غالي. عندك ميزانية معينة نبحث فيها؟ أو نلاقي بديل؟",
+                        f"Je comprends, le prix est peut-être élevé. Avez-vous un budget précis ou cherchons-nous une alternative ?",
+                    ),
+                )
+            else:
+                # General objection without product context
+                return ResolutionResult(
+                    allowed_action=AllowedAction.HANDLE_OBJECTION.value,
+                    resolved_entities={},
+                    context_updates=base_context,
+                    response_hint=text(
+                        "فهمت، فين تحب نلقاو حاجة تناسبك أكثر؟",
+                        "Je comprends, qu'est-ce qui vous conviendrait mieux ?",
+                    ),
+                )
 
         if (
             intent == "order_create"
@@ -384,7 +420,7 @@ class CommerceResolver:
                         ),
                     )
 
-            elif intent == "order_create":
+            elif intent == "order_create" or intent == "purchase_intent" or intent == "PURCHASE_INTENT":
                 var_id_str = state.get("selected_variant_id")
                 if var_id_str:
                      return self._prepare_draft_creation(store_id, prod_id_str, var_id_str, quantity, base_context)
@@ -428,7 +464,7 @@ class CommerceResolver:
                              "Veuillez d’abord choisir la couleur ou la taille.",
                          ),
                     )
-            
+
             elif intent == "product_search":
                  return ResolutionResult(
                      allowed_action=(
@@ -500,6 +536,21 @@ class CommerceResolver:
                 if not var_id_str:
                     return self._error_result(base_context, "No variant selected.")
                 return self._prepare_draft_creation(store_id, prod_id_str, var_id_str, quantity, base_context)
+
+            # Handle purchase intent when variant is already selected - advance to draft creation
+            if intent == "purchase_intent" or intent == "PURCHASE_INTENT":
+                if var_id_str:
+                    return self._prepare_draft_creation(store_id, prod_id_str, var_id_str, quantity, base_context)
+                else:
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
+                        resolved_entities={"product_id": prod_id_str},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "باش نمشيو للطلب، نحتاج تختار اللون أو المقاس أولاً.",
+                            "Pour passer commande, il faut d'abord choisir la couleur ou la taille.",
+                        ),
+                    )
 
             elif intent == "variant_selection":
                 product_uuid = self._parse_uuid(prod_id_str)
@@ -738,6 +789,46 @@ class CommerceResolver:
                         "Je confirme votre commande.",
                     ),
                 )
+
+            # Handle ambiguous confirmation ("ايه", "نعم", etc.) when there's a pending question
+            if confirmation_phrase and state.get("last_question_type"):
+                last_q = state.get("last_question_type")
+                if last_q == "PRODUCT_DETAILS_OFFER":
+                    # Customer said yes to seeing product details
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
+                        resolved_entities={"product_id": prod_id_str} if prod_id_str else {},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "سأعرض لك التفاصيل والخيارات.",
+                            "Voici les détails et les options.",
+                        ),
+                    )
+                elif last_q == "VARIANT_SELECTION":
+                    # Customer said yes to variant selection - need them to specify which
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+                        resolved_entities={},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "أي خيار تقصد؟ حدد الرقم أو اللون/المقاس من فضلك.",
+                            "Quelle option voulez-vous ? Précisez le numéro ou la couleur/la taille.",
+                        ),
+                    )
+                elif last_q == "ORDER_CREATE_OFFER":
+                    # Customer said yes to creating an order
+                    if var_id_str:
+                        return self._prepare_draft_creation(store_id, prod_id_str, var_id_str, quantity, base_context)
+                    else:
+                        return ResolutionResult(
+                            allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
+                            resolved_entities={"product_id": prod_id_str} if prod_id_str else {},
+                            context_updates=base_context,
+                            response_hint=text(
+                                "باش نبداو للطلب، نحتاج تختار الخيار أولاً.",
+                                "Pour commencer la commande, il faut d'abord choisir l'option.",
+                            ),
+                        )
 
             elif intent == "order_create":
                  return ResolutionResult(

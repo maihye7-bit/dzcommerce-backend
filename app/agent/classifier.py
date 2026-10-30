@@ -335,7 +335,14 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
         # rather than new purchase intent
         normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
         # Strong purchase starters without product re-specification
-        strong_phrases = ["حبيت نكومندي", "نبغي نطلب", "نحب نطلب", "n7ab n7adem", "bghit ncommander"]
+        strong_phrases = [
+            "حبيت نكومندي", "نبغي نطلب", "نحب نطلب", "n7ab n7adem", "bghit ncommander",
+            # Also include the common purchase phrases
+            "حبيت نشري", "نحب نشري", "حب نشري", "حبيتش نشري", "حبيتش نشري هذا",
+            "حبيت اطلب", "أريد اطلب", "أريد شراء",
+            "n7ab nechri", "bghit nechri", "7ab nechri", "n7ab n7dem", "bghit n7dem",
+            "حبيت نكوموني", "نحب نكوموني", "حب نكوموني",
+        ]
         for phrase in strong_phrases:
             if re.search(re.escape(phrase), normalized):
                 return True
@@ -413,6 +420,15 @@ def _is_objection_handling(message: str) -> bool:
         r"منتج\s+عيب",       # "product defective"
         r"هذا\s+عيب",         # "this is defective"
         r"مش\s+حلو",          # "not good/nice"
+        # Price objections
+        r"غالي",         # "expensive"
+        r"السعر\s+غالي",  # "price is expensive"
+        r"باهظ",         # "pricey"
+        r"مش\s+غالي",     # "not expensive" (could be positive)
+        r"too\s+expensive",
+        r"price\s+high",
+        r"co[ûu]te\s+cher",
+        r"trop\s+cher",
     ]
     for pattern in objection_patterns:
         if re.search(pattern, normalized):
@@ -733,7 +749,6 @@ class ConversationClassifier:
     _NON_COMMERCIAL_INTENTS = frozenset(
         {
             INTENT_GENERAL_CHAT,
-            INTENT_OBJECTION_HANDLING,
             INTENT_TOPIC_CHANGE,
             INTENT_AMBIGUOUS,
             INTENT_UNSUPPORTED_OR_RESTRICTED,
@@ -909,6 +924,9 @@ class ConversationClassifier:
         # Purchase intent without product context: low confidence (needs clarification)
         if intent == INTENT_PURCHASE_INTENT and not entities.get("product_mention"):
             base = 0.40
+        # Purchase intent with product context: high confidence
+        if intent == INTENT_PURCHASE_INTENT and entities.get("product_mention"):
+            base = 0.90
 
         # Ambiguous: low confidence
         if intent == INTENT_AMBIGUOUS:
@@ -1078,7 +1096,7 @@ class ConversationClassifier:
             )
 
     @classmethod
-    def is_non_commercial_message(cls, message: str) -> bool:
+    def is_non_commercial_message(cls, message: str, commerce_stage: str = None, selected_product_id: str = None, selected_product_name: str = None) -> bool:
         """Check if a message is non-commercial (should bypass the agent loop).
 
         This method is used by ConversationEngine to determine if a message
@@ -1087,10 +1105,18 @@ class ConversationClassifier:
 
         Args:
             message: The user message to check.
+            commerce_stage: Current commerce stage from conversation state.
+            selected_product_id: Selected product ID, when applicable.
+            selected_product_name: Selected product name, when applicable.
 
         Returns:
-            True if the message is non-commercial (GENERAL_CHAT, OBJECTION_HANDLING,
-            TOPIC_CHANGE, AMBIGUOUS, or UNSUPPORTED_OR_RESTRICTED).
+            True if the message is non-commercial (GENERAL_CHAT, TOPIC_CHANGE,
+            AMBIGUOUS, or UNSUPPORTED_OR_RESTRICTED).
         """
-        result = cls.quick_classify(message)
+        result = cls.classify(
+            message,
+            commerce_stage=commerce_stage,
+            selected_product_id=selected_product_id,
+            selected_product_name=selected_product_name,
+        )
         return result.intent in cls._NON_COMMERCIAL_INTENTS

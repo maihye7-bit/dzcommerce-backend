@@ -2156,7 +2156,12 @@ class ConversationEngine:
             # Qwen agent can generate a natural conversational response without
             # forcing unnecessary commerce tool calls. The classifier determines
             # whether the message is commercial or purely conversational.
-            and not ConversationClassifier.is_non_commercial_message(user_message)
+            and not ConversationClassifier.is_non_commercial_message(
+                user_message,
+                commerce_stage=current_state.get("commerce_stage"),
+                selected_product_id=current_state.get("selected_product_id"),
+                selected_product_name=current_state.get("selected_product_name"),
+            )
             and
             self.agent_tool_loop_enabled
             and self.llm is not None
