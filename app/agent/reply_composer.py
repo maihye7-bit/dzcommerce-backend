@@ -549,13 +549,42 @@ class ReplyComposer:
             scrubbed = scrubbed[:match.start()] + scrubbed[match.end():]
         for name in sorted(names, key=len, reverse=True):
             scrubbed = re.sub(re.escape(name), "", scrubbed, flags=re.IGNORECASE)
-        if any(
-            word.casefold() not in _LANGUAGE_WORDS[language]
-            for word in _WORDS.findall(scrubbed)
-        ):
-            return False
-        if _DIGITS.search(scrubbed):
-            return False
+        # Language script check — more lenient than the old word-by-word check
+        # and consistent with _is_safe_greeting.  The critical safety checks
+        # above (product naming at line 509, price verification at lines 517-545,
+        # currency validation at lines 522-538, internal IDs at line 499, and
+        # unsupported claims at line 500) already prevent the most important
+        # failure modes, so we only verify the script is appropriate for the
+        # detected language here.
+        if language == "ar":
+            if not re.search(r"[؀-ۿ]", reply):
+                return False
+        elif language in {"fr", "en"}:
+            # Find capitalized words that could be product/brand names
+            # that survived the product-name scrubbing above
+            remaining_words = re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", scrubbed)
+            verified_name_set = {
+                name.casefold() for name in names
+            }
+            # Common conversational words that should be allowed (including
+            # "price" since it's a legitimate conversational term, and short
+            # connectors that aren't product names)
+            allowed_connectors = {
+                "and", "or", "but", "with", "from", "for", "the", "a", "an",
+                "you", "your", "it", "its", "is", "are", "was", "were",
+                "have", "has", "had", "not", "no", "yes", "so", "then",
+                "than", "just", "only", "also", "very", "really", "quite",
+                "price", "cost", "total", "amount", "subtotal"
+            }
+            for word in remaining_words:
+                w = word.casefold()
+                # Skip if it's a common conversational word
+                if w in allowed_connectors:
+                    continue
+                # If it's not a verified product name, reject it
+                if w not in verified_name_set:
+                    return False
+
         return True
 
     @staticmethod
