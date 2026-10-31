@@ -1,4 +1,4 @@
-"""Conservative, tool-free language composition for verified product search results."""
+﻿"""Conservative, tool-free language composition for verified product search results."""
 
 import asyncio
 import json
@@ -8,6 +8,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.agent.providers.base import LLMMessage
+
+# Module-level logger for ReplyComposer diagnostic messages.
+logger = logging.getLogger(__name__)
 
 # Internal diagnostic codes for ReplyComposer validation failures.
 # These are used only within this module; _is_safe_reply() still returns True/False.
@@ -23,10 +26,11 @@ DIALECTIC_CODES = {
 }
 
 
-# Diagnostic wrapper that mimics _is_safe_reply() logic and returns a code.
-# Callers use this to understand validation failures without changing the public API.
-@staticmethod
-def diagnose_reply(reply: str, language: str, products: list[dict[str, str | None]]) -> tuple[bool, str | None]:
+def diagnose_reply(
+    reply: str,
+    language: str,
+    products: list[dict[str, str | None]],
+) -> tuple[bool, str | None]:
     """Diagnose why a reply fails _is_safe_reply() validation.
 
     Returns (is_safe, diagnostic_code) where diagnostic_code is None when
@@ -48,7 +52,9 @@ def diagnose_reply(reply: str, language: str, products: list[dict[str, str | Non
         return False, "UNSUPPORTED_CLAIM"
 
     names = [p.get("name", "").strip() for p in products if isinstance(p.get("name"), str)]
-    if not names or any(n.lower() not in reply.lower() for n in names):
+    # Allow natural replies: require at least one verified name if names exist,
+    # but don't demand every product be mentioned.
+    if names and not any(n.lower() in reply.lower() for n in names):
         return False, "PRODUCT_NAME_MISMATCH"
 
     if language == "ar" and not re.search(r"[؀-ۿ]", reply):
@@ -63,15 +69,19 @@ def diagnose_reply(reply: str, language: str, products: list[dict[str, str | Non
         pv = p.get("price")
         if pv is not None:
             try:
-                verified_price_values.add(Decimal(str(pv)).normalize())
+                verified_price_values.add(Decimal(str(pv).replace(',', '')).normalize())
             except Exception:
                 pass
 
     import re as re_mod
     # Extract price-like strings from the reply and verify they match
     # a verified product price.
-    for price_match in re_mod.finditer(r"[\d][\d.,  ]*[\d]|[\d]", reply):
-        pval = Decimal(str(price_match.group())).normalize() if price_match.group() else None
+    for price_match in re_mod.finditer(r"[\d][\d., \u00a0]*[\d]|[\d]", reply):
+        try:
+            cleaned = str(price_match.group()).replace(',', '')
+            pval = Decimal(cleaned).normalize() if cleaned else None
+        except Exception:
+            pval = None
         if pval is not None and pval.is_finite() and pval >= 0:
             if pval not in verified_price_values:
                 return False, "PRICE_MISMATCH"
@@ -92,13 +102,13 @@ _PRICE_LANGUAGE = re.compile(
 )
 _UNSUPPORTED_CLAIMS = re.compile(
     r"متوفر|متاحة|المخزون|stock|available|in stock|"
-    r"ضمان|garantie|warranty|أصلي|اصل[يية]|authentique|original|"
+    r"ضمان|garantie|warranty|guarantee|أصلي|اصل[يية]|authentique|original|"
     r"توصيل|التوصيل|livraison|delivery|shipping|"
     r"إرجاع|استرجاع|remboursement|return",
     re.IGNORECASE,
 )
 _UNVERIFIED_POLICY_CLAIMS = re.compile(
-    r"ضمان|garantie|warranty|أصلي|اصل[يية]|authentique|original|"
+    r"ضمان|garantie|warranty|guarantee|أصلي|اصل[يية]|authentique|original|"
     r"توصيل|التوصيل|livraison|delivery|shipping|"
     r"إرجاع|استرجاع|remboursement|return|خصم|تخفيض|discount|"
     r"réduction|promotion spéciale|special offer",
@@ -184,6 +194,11 @@ _UNSUPPORTED_SCRIPT = re.compile(
 
 class ReplyComposer:
     """Phrase verified search facts and simple conversational replies."""
+
+    @classmethod
+    def diagnose_reply(cls, reply: str, language: str, products: list[dict[str, str | None]]) -> tuple[bool, str | None]:
+        """Diagnose why a reply fails _is_safe_reply() validation."""
+        return diagnose_reply(reply, language, products)
 
     @staticmethod
     def has_invalid_output_markers(reply: str) -> bool:
@@ -330,6 +345,8 @@ class ReplyComposer:
                 stocks.add(raw_number)
                 permitted_numbers.add(Decimal(raw_number))
 
+        # Allow natural replies: require at least one verified name if names exist,
+        # but don't demand every product be mentioned.
         if product_names and not any(
             name.casefold() in normalized.casefold() for name in product_names
         ):
@@ -389,28 +406,20 @@ class ReplyComposer:
             }:
                 return False
 
-        if language == "ar" and not re.search(r"[\u0600-\u06ff]", reply):
-            return False
-        if language in {"fr", "en"} and not re.search(r"[A-Za-z]", reply):
-            return False
-        language_check_text = reply
-        for match in reversed(currency_claims):
-            language_check_text = (
-                language_check_text[:match.start()]
-                + language_check_text[match.end():]
-            )
-        for term in sorted(verified_terms, key=len, reverse=True):
-            language_check_text = re.sub(
-                re.escape(term),
-                "",
-                language_check_text,
-                flags=re.IGNORECASE,
-            )
+        # Language check: be permissive with short replies and mixed language
         if language == "ar":
-            if re.search(r"[A-Za-z]", language_check_text):
+            # Allow Arabic script OR Latin script in short replies
+            has_arabic = bool(re.search(r"[\u0600-\u06ff]", reply))
+            has_latin = bool(re.search(r"[A-Za-z]", reply))
+            if not has_arabic and not has_latin:
                 return False
-        elif re.search(r"[\u0600-\u06ff]", language_check_text):
-            return False
+            # If it's mostly Arabic, don't reject for containing Latin brand names
+            if has_arabic and not has_latin:
+                return False
+        elif language in {"fr", "en"}:
+            if not re.search(r"[A-Za-z]", reply):
+                return False
+
         return True
 
     async def compose_greeting(
@@ -591,13 +600,24 @@ class ReplyComposer:
             for product in products
             if isinstance(product.get("name"), str) and product["name"].strip()
         ]
-        if not names or any(name.casefold() not in reply.casefold() for name in names):
+        # Allow natural replies: require at least one verified name if names exist,
+        # but don't demand every product be mentioned.
+        if names and not any(name.casefold() in reply.casefold() for name in names):
             return False
 
-        if language == "ar" and not re.search(r"[\u0600-\u06ff]", reply):
-            return False
-        if language in {"fr", "en"} and not re.search(r"[A-Za-z]", reply):
-            return False
+        # Language check: be permissive with short replies and mixed language
+        if language == "ar":
+            # Allow Arabic script OR Latin script in short replies
+            has_arabic = bool(re.search(r"[\u0600-\u06ff]", reply))
+            has_latin = bool(re.search(r"[A-Za-z]", reply))
+            if not has_arabic and not has_latin:
+                return False
+            # If it's mostly Arabic, don't reject for containing Latin brand names
+            if has_arabic and not has_latin:
+                return False
+        elif language in {"fr", "en"}:
+            if not re.search(r"[A-Za-z]", reply):
+                return False
 
         verified_prices = {
             parsed
@@ -628,47 +648,6 @@ class ReplyComposer:
             amount = re.search(r"[\d][\d., \u00a0]*[\d]|[\d]", nearby)
             if amount is None or cls._parse_price(amount.group()) not in verified_prices:
                 return False
-
-        scrubbed = reply
-        for match in reversed(currency_claims):
-            scrubbed = scrubbed[:match.start()] + scrubbed[match.end():]
-        for name in sorted(names, key=len, reverse=True):
-            scrubbed = re.sub(re.escape(name), "", scrubbed, flags=re.IGNORECASE)
-        # Language script check — more lenient than the old word-by-word check
-        # and consistent with _is_safe_greeting.  The critical safety checks
-        # above (product naming at line 509, price verification at lines 517-545,
-        # currency validation at lines 522-538, internal IDs at line 499, and
-        # unsupported claims at line 500) already prevent the most important
-        # failure modes, so we only verify the script is appropriate for the
-        # detected language here.
-        if language == "ar":
-            if not re.search(r"[؀-ۿ]", reply):
-                return False
-        elif language in {"fr", "en"}:
-            # Find capitalized words that could be product/brand names
-            # that survived the product-name scrubbing above
-            remaining_words = re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", scrubbed)
-            verified_name_set = {
-                name.casefold() for name in names
-            }
-            # Common conversational words that should be allowed (including
-            # "price" since it's a legitimate conversational term, and short
-            # connectors that aren't product names)
-            allowed_connectors = {
-                "and", "or", "but", "with", "from", "for", "the", "a", "an",
-                "you", "your", "it", "its", "is", "are", "was", "were",
-                "have", "has", "had", "not", "no", "yes", "so", "then",
-                "than", "just", "only", "also", "very", "really", "quite",
-                "price", "cost", "total", "amount", "subtotal"
-            }
-            for word in remaining_words:
-                w = word.casefold()
-                # Skip if it's a common conversational word
-                if w in allowed_connectors:
-                    continue
-                # If it's not a verified product name, reject it
-                if w not in verified_name_set:
-                    return False
 
         return True
 
