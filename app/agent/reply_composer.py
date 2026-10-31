@@ -75,10 +75,16 @@ def diagnose_reply(
 
     import re as re_mod
     # Extract price-like strings from the reply and verify they match
-    # a verified product price.
-    for price_match in re_mod.finditer(r"[\d][\d., \u00a0]*[\d]|[\d]", reply):
+    # a verified product price. Only match prices with currency units
+    # (consistent with _is_safe_reply's _CURRENCY_AMOUNT convention), so
+    # that model identifiers such as "A54" are not interpreted as price claims.
+    for price_match in re_mod.finditer(
+        r"(?<![\w])([\d][\d., \u00a0]*[\d]|[\d])\s*(dzd|da|eur|usd|\u20ac|\$)",
+        reply,
+        re.IGNORECASE,
+    ):
         try:
-            cleaned = str(price_match.group()).replace(',', '')
+            cleaned = str(price_match.group(1)).replace(',', '')
             pval = Decimal(cleaned).normalize() if cleaned else None
         except Exception:
             pval = None
