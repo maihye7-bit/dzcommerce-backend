@@ -382,6 +382,23 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
         r"حبيتش نشري هذا",
         r"حبيت نشري",
         r"نحب نشري",
+        # Additional Algerian Darija / common user phrases
+        r"حبيت نطلب",           # "I want to order"
+        r"حبيت نطلب واحد",      # "I want to order one"
+        r"حاب نطلب",            # "I want to order" (Algerian)
+        r"كيفاش نأكد",          # "How do I confirm"
+        r"كيف ناكد",            # "How to confirm"
+        r"ناكد الطلب",          # "Confirm the order"
+        r"كيف نؤكد",            # "How to confirm" (MSA)
+        r"تأكيد الطلب",         # "Order confirmation"
+        r"أكيد الطلب",          # "Confirm the order"
+        r"نأكد الطلب",          # "I confirm the order"
+        r"أكيد طلبي",          # "Confirm my order"
+        r"نكومندي",            # "I order" (short)
+        r"نطلب",               # "We/I order"
+        r"نكوموني",            # "I order" (variant)
+        r"نشرى",               # "We/I buy"
+        r"نشرى واحد",          # "Buy one"
     ]
     for phrase_pattern in strong_purchase_phrases:
         if re.search(phrase_pattern, normalized):

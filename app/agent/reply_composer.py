@@ -213,6 +213,64 @@ class ReplyComposer:
             or _UNSUPPORTED_SCRIPT.search(reply)
         )
 
+    @staticmethod
+    def _extract_json_from_response(response_text: str) -> dict | None:
+        """
+        Robustly extract JSON from LLM response text.
+
+        Handles:
+        - Plain JSON: {"reply": "..."}
+        - Markdown code fences: ```json {"reply": "..."} ```
+        - Extra conversational text before/after JSON
+        - Multiple JSON objects (returns first valid one with "reply" key)
+        """
+        if not response_text:
+            return None
+
+        text = response_text.strip()
+
+        # First try: direct JSON parse
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and "reply" in parsed:
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Second try: extract from markdown code fences
+        # Pattern: ```json ... ``` or ``` ... ```
+        fence_pattern = re.compile(r'```(?:json)?\s*(\{.*?\})\s*```', re.DOTALL | re.IGNORECASE)
+        for match in fence_pattern.finditer(text):
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict) and "reply" in parsed:
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Third try: find any JSON-like object with "reply" key
+        # Look for {...} containing "reply"
+        json_pattern = re.compile(r'(\{.*?"reply"\s*:\s*".*?".*?\})', re.DOTALL)
+        for match in json_pattern.finditer(text):
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict) and "reply" in parsed:
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Fourth try: Look for any valid JSON object, then check for reply key
+        brace_pattern = re.compile(r'(\{.*?\})', re.DOTALL)
+        for match in brace_pattern.finditer(text):
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict) and "reply" in parsed:
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return None
+
     def __init__(self, provider: Any, timeout_seconds: float | None = None) -> None:
         self.provider = provider
         # Use provided timeout, fall back to configured FREE_LLM_TIMEOUT, then 10s experimental default
@@ -476,11 +534,14 @@ class ReplyComposer:
             response, "finish_reason", None
         ) == "error":
             return None
-        try:
-            parsed = json.loads((response.content or "").strip())
-        except (json.JSONDecodeError, TypeError):
+
+        # Use robust JSON extraction
+        parsed = self._extract_json_from_response(response.content or "")
+        if not parsed:
+            logger.warning("Greeting composition failed to extract JSON; use deterministic reply")
             return None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("reply"), str):
+            logger.warning("Greeting response invalid shape; use deterministic reply")
             return None
 
         reply = parsed["reply"].strip()
@@ -551,9 +612,9 @@ class ReplyComposer:
             logger.warning("ReplyComposer provider reported an error; use deterministic reply")
             return None
 
-        try:
-            parsed = json.loads((response.content or "").strip())
-        except (json.JSONDecodeError, TypeError):
+        # Use robust JSON extraction
+        parsed = self._extract_json_from_response(response.content or "")
+        if not parsed:
             logger.warning("ReplyComposer returned invalid JSON; use deterministic reply")
             return None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("reply"), str):
