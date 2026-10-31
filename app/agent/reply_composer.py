@@ -57,7 +57,7 @@ def diagnose_reply(
     if names and not any(n.lower() in reply.lower() for n in names):
         return False, "PRODUCT_NAME_MISMATCH"
 
-    if language == "ar" and not re.search(r"[Ø€-Û¿]", reply):
+    if language == "ar" and not re.search(r"[؀-ۿ]", reply):
         return False, "LANGUAGE_MISMATCH"
     if language in ("fr", "en") and not re.search(r"[A-Za-z]", reply):
         return False, "LANGUAGE_MISMATCH"
