@@ -1,4 +1,4 @@
-﻿"""Conservative, tool-free language composition for verified product search results."""
+"""Conservative, tool-free language composition for verified product search results."""
 
 import asyncio
 import json
@@ -48,7 +48,7 @@ def diagnose_reply(
         return False, "INTERNAL_IDENTIFIER"
     if re.search(r"\b(?:product_id|variant_id|order_id|store_id|customer_id|conversation_id|sku)\b", reply, re.IGNORECASE):
         return False, "INTERNAL_IDENTIFIER"
-    if re.search(r"(?i)(?:ضمان|warranty|توصيل|delivery|إرجاع|return|خصم|discount)", reply):
+    if re.search(r"(?i)(?:ضمانة|warranty|توصيل|delivery|إرجاع|return|خصم|discount)", reply):
         return False, "UNSUPPORTED_CLAIM"
 
     names = [p.get("name", "").strip() for p in products if isinstance(p.get("name"), str)]
