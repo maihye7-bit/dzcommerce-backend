@@ -2051,7 +2051,7 @@ class ConversationEngine:
             and current_state.get("last_question_type") == "ORDER_CONFIRMATION"
             and local_message_nlu.get("intent") == "order_confirm"
             and local_message_nlu.get("confirmation_phrase") is True
-            and not self._is_bare_affirmative(user_message)
+            
         )
         post_confirmation_response = None
         post_confirmation_nlu = None
