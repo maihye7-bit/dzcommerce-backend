@@ -2313,7 +2313,20 @@ class ConversationEngine:
         # ---------------------------------------------------------
         # STEP 3: RESOLVE BUSINESS DECISION VIA BACKEND
         # ---------------------------------------------------------
-        if not agent_loop_accepted:
+        # If the message was classified as a conversational bypass, skip the
+        # CommerceResolver entirely. The NLU output already has the intent and
+        # entities needed to generate an appropriate conversational response,
+        # and we must preserve the current commerce state without modifications.
+        if not agent_loop_accepted and current_state.get("_bypass_conversational"):
+            # Bypassed for conversational reasons: skip CommerceResolver,
+            # preserve commerce state, set decision to RESPOND:text_only
+            decision = ResolutionResult(
+                allowed_action="RESPOND:text_only",
+                resolved_entities={},
+                context_updates={},
+                response_hint=nlu_output.get("response_hint", ""),
+            )
+        elif not agent_loop_accepted:
             resolver = CommerceResolver(db=db)
             decision = resolver.resolve(
                 nlu_output=nlu_output,
