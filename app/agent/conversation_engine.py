@@ -128,7 +128,10 @@ class ConversationEngine:
         candidate_product_ids = metadata.get("candidate_product_ids") or []
         selected_product_id = metadata.get("selected_product_id")
         selected_product_name = metadata.get("selected_product_name")
-        if candidate_product_ids:
+        # Only clear selected_product_id if no explicit selection exists yet.
+        # Preserve it if the customer has already selected a product,
+        # even when new search candidates appear.
+        if candidate_product_ids and not selected_product_id:
             selected_product_id = None
             selected_product_name = None
         if not selected_product_id and not candidate_product_ids:
@@ -4240,14 +4243,21 @@ Rules:
         )
         catalog_question = bool(
             re.search(
-                r"(?:وش|واش|ماذا|ما)\s+(?:عندكم|لديكم|يوجد)?\s*"
+                r"(?:وش|واش|ماذا|ما|شنو|شنو)\s+(?:عندكم|لديكم|يوجد)?\s*"
                 r"(?:من\s+)?(?:ال)?منتج(?:ات)?|"
                 r"(?:عندكم|لديكم)\s+(?:ال)?منتجات|"
+                r"(?:عندكم|لديكم)\s+(?:شنو|شنو)\s*(?:[\?\؟]|$)|"
+                r"(?:وش|واش|شنو|شنو|ما)\s+(?:عندكم|لديكم)\s*(?:[\?\؟]|$)|"
                 r"(?<!\w)(?:wach|chno|wech)\s+"
                 r"(?:3andkom|3andkum)\s+(?:had\s+)?produits?(?!\w)|"
                 r"(?:what|which|show|list)\b.{0,40}\b(?:products?|catalogue?|catalog)\b|"
                 r"\b(?:products?|catalogue?|catalog)\b.{0,40}\b(?:have|sell|available)\b|"
-                r"(?:quels?|quelles?|montrez|listez)\b.{0,40}\bproduits?\b",
+                r"(?:quels?|quelles?|montrez|listeز)\b.{0,40}\bproduits?\b|"
+                # Statement forms: "I want to see products", "show me products"
+                r"(?:أريد|اريد|أحب|احب|نحب|عايز|أرغب|ارغب)\s+(?:أرى|ارى|أشوف|اشوف|رؤية|رؤية|أرى|أرى)\s+(?:ال)?منتجات?|"
+                r"(?:أريد|اريد|أحب|احب|نحب|عايز|أرغب|ارغب)\s+(?:أرى|أشوف|رؤية|رؤية)\s+(?:ال)?منتجات?|"
+                r"(?:أحب|احب|نحب|أرغب|ارغب)\s+(?:أرى|أشوف|رؤية|رؤية)\s+(?:ما\s+)?عندكم|"
+                r"(?:show|see|view|browse)\s+(?:me\s+)?(?:the\s+)?(?:products?|catalog)",
                 normalized,
             )
         )
