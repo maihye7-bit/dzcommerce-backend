@@ -346,10 +346,12 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
         for phrase in strong_phrases:
             if re.search(re.escape(phrase), normalized):
                 return True
-        # If they mention the selected product name, it's a follow-up, not new purchase
+        # If they mention the selected product name WITHOUT a strong purchase phrase,
+        # it's a follow-up about the existing selection, not a new purchase
         selected_name = state.get("selected_product_name", "")
         if selected_name and selected_name.lower() in normalized:
             return False
+        # If no strong purchase phrase and product name not mentioned, it's not purchase intent
         return False
 
     # Without selected product, check for strong purchase phrases
