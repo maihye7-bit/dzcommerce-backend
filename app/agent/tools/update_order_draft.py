@@ -96,6 +96,7 @@ class UpdateOrderDraftTool(BaseTool):
                         store_id=store_id,
                         item_index=item_index,
                         variant_id=uuid.UUID(str(variant_id_str)),
+                        replacement_quantity=args.get("quantity"),
                     )
                 except (NotFoundError, ValidationError, ValueError) as exc:
                     return ToolResult(
@@ -124,8 +125,16 @@ class UpdateOrderDraftTool(BaseTool):
             if not current_draft:
                 return ToolResult(success=False, error="No active draft found to update.")
 
-            # Convert items list to mutable structure
-            items_list = current_draft.get("items", [])
+            raw_items = current_draft.get("items")
+            if not isinstance(raw_items, list) or not all(
+                isinstance(item, dict) for item in raw_items
+            ):
+                return ToolResult(
+                    success=False,
+                    error="The active draft contains invalid items.",
+                    error_code="VALIDATION_ERROR",
+                )
+            items_list = [dict(item) for item in raw_items]
             
             # Helper to find index
             def find_idx(v_id):

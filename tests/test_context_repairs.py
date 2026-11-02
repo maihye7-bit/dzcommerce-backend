@@ -158,6 +158,10 @@ def test_product_search_normalization_is_unicode_and_digit_conservative():
     assert normalize_product_search_text("Samsung") == "سامسونغ"
     assert normalize_product_search_text("سامسونج") == "سامسونغ"
     assert normalize_product_search_text("مقاس ة") == "مقاس ه"
+    assert normalize_product_search_text("الأحذية") == "حذاء"
+    assert normalize_product_search_text("حذاء") == normalize_product_search_text(
+        "احذيه"
+    )
 
 
 def test_recent_dialogue_context_is_bounded_and_excludes_current_turn(db_session):
@@ -853,6 +857,87 @@ async def test_catalog_browse_lists_only_active_products_from_the_current_store(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_intent", "expected_action"),
+    [
+        (
+            "الاحذية",
+            "catalog_browse",
+            "EXECUTE_TOOL:list_catalog_products",
+        ),
+        (
+            "عندكم أحذية؟",
+            "catalog_browse",
+            "EXECUTE_TOOL:list_catalog_products",
+        ),
+        (
+            "نحب نشوف الأحذية",
+            "catalog_browse",
+            "EXECUTE_TOOL:list_catalog_products",
+        ),
+        (
+            "حذاء Nike رياضي",
+            "product_search",
+            "EXECUTE_TOOL:search_products",
+        ),
+    ],
+)
+async def test_arabic_category_browse_is_distinct_from_specific_product_search(
+    db_session,
+    message,
+    expected_intent,
+    expected_action,
+):
+    conversation = make_conversation(db_session)
+    product, _, _ = add_product_inventory(db_session, conversation.store_id)
+    product.name = "حذاء Nike رياضي"
+    db_session.commit()
+
+    registry = ToolRegistry()
+    registry.register(ListCatalogProductsTool())
+    registry.register(SearchProductsTool())
+    registry.aexecute = AsyncMock(wraps=registry.aexecute)
+    engine = ConversationEngine(llm_provider=None, tool_registry=registry)
+    engine.reply_composer_enabled = False
+
+    async def local_nlu(user_message, state, **_kwargs):
+        return engine._heuristic_nlu(user_message, state)
+
+    engine._extract_nlu_via_qwen = local_nlu
+    result = await process(engine, db_session, conversation, message)
+
+    assert result["turn_diagnostics"]["intent"] == expected_intent
+    assert result["turn_diagnostics"]["resolver_action"] == expected_action
+    assert registry.aexecute.await_args.kwargs["tool_name"] == (
+        expected_action.split(":", 1)[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_arabic_specific_search_no_results_does_not_invent_product_name(
+    db_session,
+):
+    conversation = make_conversation(db_session)
+    registry = ToolRegistry()
+    registry.register(SearchProductsTool())
+    engine = ConversationEngine(llm_provider=None, tool_registry=registry)
+    engine.reply_composer_enabled = False
+
+    async def local_nlu(user_message, state, **_kwargs):
+        return engine._heuristic_nlu(user_message, state)
+
+    engine._extract_nlu_via_qwen = local_nlu
+    result = await process(engine, db_session, conversation, "حذاء Nike رياضي")
+
+    assert result["turn_diagnostics"]["intent"] == "product_search"
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:search_products"
+    )
+    assert "Nike" not in result["response"]
+    assert "لم أجد" in result["response"]
+
+
+@pytest.mark.asyncio
 async def test_qwen_tool_loop_may_recover_no_match_with_resolver_gated_catalog(
     db_session,
 ):
@@ -1337,7 +1422,7 @@ async def test_unknown_message_preserves_variant_question_for_next_numeric_choic
     selection_result = await process(engine, db_session, conversation, "1")
 
     assert conversation.metadata_json["selected_variant_id"] == str(first_variant.id)
-    assert "وجدت الاختيار المطلوب" in selection_result["response"]
+    assert f"تم اختيار {first_variant.name}." in selection_result["response"]
     assert conversation.metadata_json["last_question_type"] == "ORDER_CREATE_OFFER"
 
 

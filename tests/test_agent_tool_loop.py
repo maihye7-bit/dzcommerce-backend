@@ -1115,7 +1115,7 @@ async def test_explicit_variant_selection_updates_only_after_stock_verification(
 
     result = await run_turn(engine, db_session, conversation, "خليه أسود")
 
-    assert "الاختيار المطلوب" in result["response"]
+    assert f"تم اختيار {variant.name}." in result["response"]
     assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
     assert conversation.metadata_json["commerce_stage"] == "VARIANT_SELECTED"
 
@@ -2086,6 +2086,423 @@ async def test_messenger_first_purchase_saves_draft_without_confirming(db_sessio
         == 0
     )
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compound_variant_selection_and_delivery_question_preserve_selection(
+    db_session,
+):
+    store, _, conversation, product, variant = make_fixture(db_session)
+    store.delivery_policy_text = "التوصيل متاح إلى الولايات المسجلة."
+    store.served_wilayas = "وهران، الجزائر"
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "variant_index_map": {"1": str(variant.id)},
+        "variant_index_map_product_id": str(product.id),
+        "last_question_type": "VARIANT_SELECTION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "نختار الخيار رقم 01، وبالمناسبة قداش التوصيل؟",
+    )
+
+    assert result["turn_diagnostics"]["intent"] == "variant_selection"
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "CALL_SERVICE:resolve_variant"
+    )
+    assert result["turn_diagnostics"]["turn_plan"]["information_requests"] == [
+        "delivery"
+    ]
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+    assert variant.name in result["response"]
+    assert "100" in result["response"]
+    assert store.delivery_policy_text in result["response"]
+    assert "وهران، الجزائر" in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_compound_turn_keeps_selection_when_delivery_lookup_fails(db_session):
+    store, _, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "variant_index_map": {"1": str(variant.id)},
+        "variant_index_map_product_id": str(product.id),
+        "last_question_type": "VARIANT_SELECTION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+    engine.registry.get("store_info").execute = AsyncMock(
+        side_effect=RuntimeError("local store info mock failure")
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "نختار الخيار رقم 01، وقداش التوصيل؟",
+    )
+
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+    assert variant.name in result["response"]
+    assert "ما عنديش معلومة موثقة" in result["response"]
+    assert "هذا الإجراء غير متاح حاليًا" not in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_compound_variant_selection_and_quantity_creates_draft(db_session):
+    store, _, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "variant_index_map": {"1": str(variant.id)},
+        "variant_index_map_product_id": str(product.id),
+        "last_question_type": "VARIANT_SELECTION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "نختار الخيار رقم 01 وخلي الكمية 2",
+    )
+
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "CALL_SERVICE:create_draft"
+    )
+    assert conversation.active_draft_json is not None, result
+    assert conversation.active_draft_json["items"] == [
+        {
+            "variant_id": str(variant.id),
+            "product_name": product.name,
+            "variant_name": variant.name,
+            "unit_price": 100.0,
+            "quantity": 2,
+            "line_total": 200.0,
+            "available_stock": 5,
+        }
+    ]
+    assert conversation.active_draft_json["total_price"] == 200.0
+    assert (
+        db_session.query(Order)
+        .filter(Order.conversation_id == conversation.id)
+        .count()
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_variant_correction_replaces_draft_item(db_session):
+    store, _, conversation, product, first_variant = make_fixture(db_session)
+    second_variant = ProductVariant(
+        product_id=product.id,
+        name="Premium",
+        price_adjustment=Decimal("25"),
+        attributes_json={"style": "premium"},
+    )
+    db_session.add(second_variant)
+    db_session.flush()
+    db_session.add(
+        InventoryItem(
+            store_id=store.id,
+            variant_id=second_variant.id,
+            quantity=4,
+        )
+    )
+    conversation.active_draft_json = {
+        "items": [
+            {
+                "variant_id": str(first_variant.id),
+                "product_name": product.name,
+                "variant_name": first_variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "available_stock": 5,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(first_variant.id),
+        "variant_index_map": {
+            "1": str(first_variant.id),
+            "2": str(second_variant.id),
+        },
+        "variant_index_map_product_id": str(product.id),
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "لا، أقصد الخيار 02",
+    )
+
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:update_order_draft"
+    )
+    assert conversation.active_draft_json["items"][0]["variant_id"] == str(
+        second_variant.id
+    )
+    assert conversation.active_draft_json["items"][0]["variant_name"] == "Premium"
+    assert conversation.active_draft_json["items"][0]["quantity"] == 1
+    assert conversation.active_draft_json["total_price"] == 125.0
+
+
+@pytest.mark.asyncio
+async def test_failed_draft_update_preserves_corrected_selection(db_session):
+    store, _, conversation, product, first_variant = make_fixture(db_session)
+    second_variant = ProductVariant(
+        product_id=product.id,
+        name="Premium",
+        price_adjustment=Decimal("25"),
+        attributes_json={"style": "premium"},
+    )
+    db_session.add(second_variant)
+    db_session.flush()
+    db_session.add(
+        InventoryItem(
+            store_id=store.id,
+            variant_id=second_variant.id,
+            quantity=4,
+        )
+    )
+    original_draft = {
+        "items": [
+            {
+                "variant_id": str(first_variant.id),
+                "product_name": product.name,
+                "variant_name": first_variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "available_stock": 5,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    conversation.active_draft_json = original_draft
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(first_variant.id),
+        "variant_index_map": {
+            "1": str(first_variant.id),
+            "2": str(second_variant.id),
+        },
+        "variant_index_map_product_id": str(product.id),
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+    engine.registry.aexecute = AsyncMock(
+        side_effect=RuntimeError("local draft update mock failure")
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "لا، أقصد الخيار 02",
+    )
+
+    assert conversation.metadata_json["selected_variant_id"] == str(second_variant.id)
+    assert conversation.active_draft_json == original_draft
+    assert "تم حفظ اختيارك" in result["response"]
+    assert "هذا الإجراء غير متاح حاليًا" not in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_selection_and_add_product_request_keeps_selection_and_clarifies(
+    db_session,
+):
+    _, _, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "variant_index_map": {"1": str(variant.id)},
+        "variant_index_map_product_id": str(product.id),
+        "last_question_type": "VARIANT_SELECTION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "نختار الخيار 01 ونحب نزيد منتج آخر",
+    )
+
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+    assert "ما المنتج الآخر الذي تريد إضافته؟" in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_quantity_update_changes_only_requested_draft_item(db_session):
+    _, _, conversation, product, variant = make_fixture(db_session)
+    draft = {
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "available_stock": 5,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    conversation.active_draft_json = draft
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "خلي الكمية 2",
+    )
+
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:update_order_draft"
+    )
+    assert conversation.active_draft_json["items"][0]["quantity"] == 2
+    assert conversation.active_draft_json["total_price"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_order_change_question_does_not_mutate_draft(db_session):
+    _, _, conversation, product, variant = make_fixture(db_session)
+    draft = {
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "available_stock": 5,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    conversation.active_draft_json = draft
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+
+    registry = make_registry()
+    registry.aexecute = AsyncMock(wraps=registry.aexecute)
+    engine = ConversationEngine(ScriptedToolProvider([]), registry)
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(engine, db_session, conversation, "كيفاش نعدل طلبي؟")
+
+    assert conversation.active_draft_json == draft
+    registry.aexecute.assert_not_awaited()
+    assert "ما عنديش سياسة موثقة" in result["response"]
 
 
 @pytest.mark.asyncio

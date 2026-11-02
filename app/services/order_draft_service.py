@@ -34,6 +34,7 @@ def replace_draft_item_variant(
     store_id: uuid.UUID,
     item_index: int,
     variant_id: uuid.UUID,
+    replacement_quantity: int | None = None,
 ) -> dict:
     """Replace one draft item's variant after revalidating the complete draft."""
     conversation = (
@@ -56,6 +57,12 @@ def replace_draft_item_variant(
         raise ValidationError("Draft item position must be an integer.")
     if item_index < 1 or item_index > len(items):
         raise ValidationError("Draft item position is outside the current draft.")
+    if replacement_quantity is not None and (
+        isinstance(replacement_quantity, bool)
+        or not isinstance(replacement_quantity, int)
+        or replacement_quantity <= 0
+    ):
+        raise ValidationError("Replacement quantity must be a positive integer.")
 
     target_variant = (
         db.query(ProductVariant)
@@ -124,7 +131,11 @@ def replace_draft_item_variant(
         if variant is None:
             raise ValidationError("A draft item is no longer available in this store.")
 
-        quantity = raw_item.get("quantity")
+        quantity = (
+            replacement_quantity
+            if position == item_index - 1 and replacement_quantity is not None
+            else raw_item.get("quantity")
+        )
         if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
             raise ValidationError("A draft item has an invalid quantity.")
         inventory = (

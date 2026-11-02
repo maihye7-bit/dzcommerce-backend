@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.agent.providers.base import LLMMessage
 from app.agent.tools.base import ToolResult
 from app.agent.tools.registry import ToolRegistry
+from app.agent.tools.search_products import normalize_product_search_text
 from app.agent.tools.store_info import StoreInfoTool
 from app.agent.commerce_resolver import CommerceResolver, ResolutionResult, AllowedAction
 from app.agent.reply_composer import ReplyComposer
@@ -1969,7 +1970,7 @@ class ConversationEngine:
                 user_message=user_message,
             )
         except Exception as exc:
-            logger.error(
+            logger.exception(
                 "Conversation processing failed (error_type=%s)",
                 type(exc).__name__,
             )
@@ -2037,16 +2038,46 @@ class ConversationEngine:
             has_confirmed_order=has_confirmed_order,
         )
         local_message_nlu = self._heuristic_nlu(user_message, current_state)
+        turn_plan = self._extract_turn_plan(user_message, current_state)
+        if turn_plan["selection"] is not None:
+            local_message_nlu = {
+                **local_message_nlu,
+                "intent": "variant_selection",
+                "intent_guess": "variant_selection",
+                "product_mention": None,
+                "attributes": {},
+                "variant_index": turn_plan["selection"]["index"],
+                "quantity": turn_plan["order_changes"].get("quantity"),
+            }
+        elif "quantity" in turn_plan["order_changes"]:
+            local_message_nlu = {
+                **local_message_nlu,
+                "intent": "order_create",
+                "intent_guess": "order_create",
+                "product_mention": None,
+                "draft_action": "set",
+                "quantity": turn_plan["order_changes"]["quantity"],
+            }
         unsupported_policy_topic = self._detect_unsupported_store_policy(
             user_message,
             current_state,
             local_message_nlu,
         )
+        if turn_plan["selection"] is not None:
+            unsupported_policy_topic = None
+        elif turn_plan["information_requests"]:
+            unsupported_policy_topic = (
+                "delivery"
+                if "delivery" in turn_plan["information_requests"]
+                else "returns"
+            )
         variant_availability_query = self._is_variant_availability_question(
             user_message,
             current_state,
             local_message_nlu,
         )
+        if turn_plan["selection"] is not None:
+            variant_availability_query = False
         read_only_information_turn = bool(
             unsupported_policy_topic or variant_availability_query
         )
@@ -2153,7 +2184,9 @@ class ConversationEngine:
         agent_loop_accepted = False
         agent_loop_result = None
         fallback_nlu = post_confirmation_nlu or (
-            local_message_nlu if confirmation_pending else None
+            local_message_nlu
+            if confirmation_pending or turn_plan["has_actions"]
+            else None
         )
         agent_loop_fallback = False
         if (
@@ -2178,6 +2211,7 @@ class ConversationEngine:
             and not unsupported_policy_topic
             and not variant_availability_query
             and not self._contains_sensitive_nlu_content(user_message)
+            and not turn_plan["has_actions"]
         ):
             # Run classifier for logging/routing information (but only if we
             # are actually going to enter the agent loop; if the bypass above
@@ -2283,6 +2317,15 @@ class ConversationEngine:
                 user_message,
                 current_state,
             )
+        if turn_plan["selection"] is not None and not has_confirmed_order:
+            nlu_output.update(
+                intent="variant_selection",
+                intent_guess="variant_selection",
+                product_mention=None,
+                attributes={},
+                variant_index=turn_plan["selection"]["index"],
+                quantity=turn_plan["order_changes"].get("quantity"),
+            )
         if unsupported_policy_topic:
             nlu_output["intent"] = "unknown"
             nlu_output["intent_guess"] = "unknown"
@@ -2347,6 +2390,13 @@ class ConversationEngine:
                 context_updates={},
                 response_hint=SAFE_FALLBACK_RESPONSE,
             )
+        decision = self._apply_turn_plan_to_decision(
+            decision,
+            turn_plan,
+            current_state,
+            db,
+            store_id,
+        )
 
         # ---------------------------------------------------------
         # STEP 4: EXECUTE ACTION BASED ON DECISION
@@ -2366,17 +2416,39 @@ class ConversationEngine:
             tool_args = self._prepare_safe_tool_args(tool_name, decision.resolved_entities, nlu_output)
             
             # Execute Tool
-            tool_result = await self.registry.aexecute(
-                tool_name=tool_name,
-                arguments=tool_args,
-                context={
-                    "db": db,
-                    "store_id": store_id,
-                    "customer_id": customer_id,
-                    "conversation_id": conv_id,
-                    "channel": channel,
-                },
-            )
+            tool_context = {
+                "db": db,
+                "store_id": store_id,
+                "customer_id": customer_id,
+                "conversation_id": conv_id,
+                "channel": channel,
+            }
+            if (
+                tool_name == "update_order_draft"
+                and turn_plan["selection"] is not None
+            ):
+                try:
+                    with db.begin_nested():
+                        tool_result = await self.registry.aexecute(
+                            tool_name=tool_name,
+                            arguments=tool_args,
+                            context=tool_context,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Draft change failed after a variant was selected"
+                    )
+                    tool_result = ToolResult(
+                        success=False,
+                        error="The draft could not be updated; the selected option is saved.",
+                        error_code="TOOL_ERROR",
+                    )
+            else:
+                tool_result = await self.registry.aexecute(
+                    tool_name=tool_name,
+                    arguments=tool_args,
+                    context=tool_context,
+                )
 
             if (
                 tool_name == "get_product_details"
@@ -2459,12 +2531,33 @@ class ConversationEngine:
                         language=nlu_output.get("language", "ar"),
                     )
                 else:
-                    final_response_content = self._tool_error_response(
-                        tool_name,
-                        error_code,
-                        tool_args,
-                        nlu_output.get("language", "ar"),
-                    )
+                    if (
+                        tool_name == "update_order_draft"
+                        and turn_plan["selection"] is not None
+                    ):
+                        language = nlu_output.get("language", "ar")
+                        if language == "ar":
+                            final_response_content = (
+                                "تم حفظ اختيارك، لكن تعذر تحديث مسودة الطلب. "
+                                "بقيت المسودة كما كانت."
+                            )
+                        elif language == "fr":
+                            final_response_content = (
+                                "Votre choix est enregistré, mais le brouillon "
+                                "n’a pas pu être mis à jour. Il reste inchangé."
+                            )
+                        else:
+                            final_response_content = (
+                                "Your selection is saved, but the order draft "
+                                "could not be updated. The draft is unchanged."
+                            )
+                    else:
+                        final_response_content = self._tool_error_response(
+                            tool_name,
+                            error_code,
+                            tool_args,
+                            nlu_output.get("language", "ar"),
+                        )
                     if (
                         tool_name == "search_products"
                         and error_code == "NO_RESULTS"
@@ -2583,6 +2676,56 @@ class ConversationEngine:
                     unsupported_policy_topic,
                     nlu_output.get("language", "ar"),
                 )
+            )
+        elif turn_plan["selection"] is not None:
+            response_parts = [final_response_content]
+            store_info_tool = self.registry.get("store_info")
+            for topic in turn_plan["information_requests"]:
+                try:
+                    with db.begin_nested():
+                        store_info_result = await store_info_tool.execute(
+                            store_id=store_id,
+                            arguments={},
+                            context={"db": db},
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not load store policy for a compound customer turn"
+                    )
+                    store_info_result = None
+
+                if store_info_result is not None and store_info_result.success:
+                    response_parts.append(
+                        self._store_policy_response(
+                            "delivery" if topic == "delivery" else "returns",
+                            nlu_output.get("language", "ar"),
+                            store_info_result.data,
+                        )
+                    )
+                else:
+                    if store_info_result is not None:
+                        logger.warning(
+                            "Store policy lookup failed for topic %s [%s]",
+                            topic,
+                            store_info_result.error_code or "TOOL_ERROR",
+                        )
+                    response_parts.append(
+                        self._unsupported_policy_response(
+                            "delivery" if topic == "delivery" else "returns",
+                            nlu_output.get("language", "ar"),
+                        )
+                    )
+
+            if turn_plan["order_changes"].get("clarify_product"):
+                response_parts.append(
+                    "ما المنتج الآخر الذي تريد إضافته؟"
+                    if nlu_output.get("language", "ar") == "ar"
+                    else "Quel autre produit souhaitez-vous ajouter ?"
+                    if nlu_output.get("language") == "fr"
+                    else "Which other product would you like to add?"
+                )
+            final_response_content = "\n".join(
+                part for part in response_parts if part
             )
         elif nlu_output.get("intent") == "unknown" and not agent_loop_accepted:
             final_response_content = (
@@ -2764,6 +2907,7 @@ class ConversationEngine:
                 "turn_id": turn_id,
                 "intent": nlu_output.get("intent", "unknown"),
                 "resolver_action": decision.allowed_action,
+                "turn_plan": turn_plan if turn_plan["has_actions"] else None,
                 "response_candidates": len(response_candidates),
                 "responses_returned": returned_response_count,
             },
@@ -4275,7 +4419,7 @@ Rules:
 
         if delivery_request and asks_price:
             return "unknown", 0.95
-        if catalog_question:
+        if catalog_question or self._is_generic_category_browse(normalized):
             return "catalog_browse", 0.95
         if purchase_construction:
             if attributes and selected_product_id:
@@ -4321,6 +4465,8 @@ Rules:
             if selected_product_id:
                 return "product_details", 0.9
             return "unknown", 0.95
+        if self._contains_product_category(normalized):
+            return "product_search", 0.85
         if availability_request:
             return (
                 ("product_search", 0.85)
@@ -4580,6 +4726,8 @@ Rules:
         if self._is_bare_affirmative(msg):
             intent = "order_confirm"
             return {"intent": intent, "intent_guess": intent, "product_mention": None, "attributes": {}, "quantity": None, "confirmation_phrase": True, "language": language, "confidence": 0.9}
+        elif self._is_generic_category_browse(msg):
+            intent, confidence = "catalog_browse", 0.95
         else:
             intent, confidence = self._understand_intent_from_context(
                 msg,
@@ -4613,6 +4761,253 @@ Rules:
             "confidence": confidence if intent != "unknown" else 0.0,
         }
 
+    @staticmethod
+    def _contains_product_category(message: str) -> bool:
+        normalized = normalize_product_search_text(
+            re.sub(r"[^\w\s]", " ", message)
+        )
+        tokens = re.findall(r"\w+", normalized)
+        return bool(
+            {
+                "حذاء",
+                "ملابس",
+                "هاتف",
+                "حقيبه",
+                "ساعه",
+            }.intersection(tokens)
+        )
+
+    @staticmethod
+    def _is_generic_category_browse(message: str) -> bool:
+        normalized = normalize_product_search_text(
+            re.sub(r"[^\w\s]", " ", message)
+        )
+        tokens = re.findall(r"\w+", normalized)
+        categories = {
+            "حذاء",
+            "ملابس",
+            "هاتف",
+            "حقيبه",
+            "ساعه",
+        }
+        if not categories.intersection(tokens):
+            return False
+        request_words = {
+            "عندكم",
+            "لديكم",
+            "هل",
+            "نحب",
+            "حاب",
+            "اريد",
+            "اشوف",
+            "نشوف",
+            "شوف",
+            "عرض",
+            "اعرض",
+            "وريني",
+            "من",
+            "فضلك",
+            "لو",
+        }
+        return all(token in categories or token in request_words for token in tokens)
+
+    @staticmethod
+    def _extract_turn_plan(
+        message: str,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
+        normalized = normalized.translate(
+            str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+        )
+        correction_match = re.search(
+            r"(?:لا\s*[,،]?\s*(?:أقصد|اقصد)|أقصد|اقصد|قصدي|"
+            r"بدل(?:ها|ه)?(?:\s+إلى|\s+الى|\s+ل)?|"
+            r"instead|no\s+i\s+meant)\s*"
+            r"(?:الخيار\s*)?(?:رقم\s*)?#?\s*(\d{1,2})(?!\d)",
+            normalized,
+        )
+        selection_match = re.search(
+            r"(?:نختار|اختار|اختاري|اختر|اختيار|الخيار|option|choice)\s*"
+            r"(?:الخيار\s*)?(?:رقم\s*)?#?\s*(\d{1,2})(?!\d)",
+            normalized,
+        )
+        selection = None
+        if selection_match or correction_match:
+            match = correction_match or selection_match
+            selection = {
+                "type": "variant",
+                "reference": match.group(1),
+                "index": int(match.group(1)),
+                "correction": correction_match is not None,
+            }
+
+        information_requests: list[str] = []
+        if re.search(
+            r"توصيل|الشحن|مصاريف التوصيل|تكلفة التوصيل|سعر التوصيل|"
+            r"delivery|shipping|livraison",
+            normalized,
+        ):
+            information_requests.append("delivery")
+        if re.search(
+            r"(?:نقدر|هل يمكن|ممكن|can\s+i|is\s+it\s+possible).{0,30}"
+            r"(?:نغير|نبدل|نعدل|change|modify)|"
+            r"(?:كيفاش|كيف|how\s+(?:do|can)\s+i).{0,30}"
+            r"(?:نعدل|نغير|نبدل|تعديل|تغيير|modify|change)",
+            normalized,
+        ):
+            information_requests.append("order_change_policy")
+
+        order_changes: dict[str, Any] = {}
+        quantity_match = re.search(
+            r"(?:خلي|اجعل|حدد|غير|غيّر|set|change)\s*"
+            r"(?:ال)?كمية\s*(?:إلى|الى|ل|ب|=)?\s*(\d{1,3})(?!\d)",
+            normalized,
+        )
+        if quantity_match and int(quantity_match.group(1)) > 0:
+            order_changes["quantity"] = int(quantity_match.group(1))
+
+        if re.search(
+            r"(?:نزيد|أضيف|اضيف|زيدلي|أضف|اضف).{0,30}"
+            r"(?:منتج(?:\s+آخر)?|product|item)|"
+            r"add\s+(?:another|one\s+more)\s+(?:product|item)",
+            normalized,
+        ):
+            order_changes["add_product"] = True
+            if re.search(
+                r"(?:نزيد|أضيف|اضيف|زيدلي|أضف|اضف)\s+(?:لي\s+)?"
+                r"(?:ال)?منتج(?:\s+آخر|\s+ثاني)?(?:\s|$|[،,.؟?!])|"
+                r"add\s+(?:another|one\s+more)\s+(?:product|item)",
+                normalized,
+            ):
+                order_changes["clarify_product"] = True
+
+        has_actions = bool(selection or information_requests or order_changes)
+        return {
+            "selection": selection,
+            "information_requests": information_requests,
+            "order_changes": order_changes,
+            "requires_clarification": bool(
+                order_changes.get("clarify_product")
+            ),
+            "has_actions": has_actions,
+        }
+
+    def _apply_turn_plan_to_decision(
+        self,
+        decision: ResolutionResult,
+        turn_plan: dict[str, Any],
+        state: dict[str, Any],
+        db: Session,
+        store_id: uuid.UUID,
+    ) -> ResolutionResult:
+        changes = turn_plan["order_changes"]
+        selection = turn_plan["selection"]
+        resolved = dict(decision.resolved_entities)
+        context_updates = dict(decision.context_updates)
+        draft = state.get("active_draft_json") or {}
+        draft_items = draft.get("items") if isinstance(draft, dict) else None
+        has_draft = isinstance(draft_items, list) and bool(draft_items)
+
+        if selection and decision.allowed_action == AllowedAction.RESOLVE_VARIANT.value:
+            variant_id = resolved.get("variant_id")
+            variant_uuid = CommerceResolver._parse_uuid(variant_id)
+            variant = (
+                db.query(ProductVariant)
+                .join(Product)
+                .filter(
+                    ProductVariant.id == variant_uuid,
+                    Product.store_id == store_id,
+                    Product.is_active.is_(True),
+                )
+                .one_or_none()
+                if variant_uuid is not None
+                else None
+            )
+            if variant is not None:
+                context_updates.update(
+                    selected_variant_id=str(variant.id),
+                    selected_attributes=(
+                        variant.attributes_json
+                        if isinstance(variant.attributes_json, dict)
+                        else {}
+                    ),
+                    commerce_stage=(
+                        "DRAFT_PENDING" if has_draft else "VARIANT_SELECTED"
+                    ),
+                )
+
+                quantity = changes.get("quantity")
+                if has_draft and selection.get("correction"):
+                    product_id = str(variant.product_id)
+                    item_index = None
+                    for index, item in enumerate(draft_items, start=1):
+                        if not isinstance(item, dict):
+                            continue
+                        existing_variant_id = CommerceResolver._parse_uuid(
+                            item.get("variant_id")
+                        )
+                        existing_variant = (
+                            db.query(ProductVariant)
+                            .filter(ProductVariant.id == existing_variant_id)
+                            .one_or_none()
+                            if existing_variant_id is not None
+                            else None
+                        )
+                        if (
+                            existing_variant is not None
+                            and str(existing_variant.product_id) == product_id
+                        ):
+                            item_index = index
+                            break
+                    if item_index is not None:
+                        decision.allowed_action = (
+                            AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value
+                        )
+                        resolved.update(
+                            action="replace",
+                            variant_id=str(variant.id),
+                            item_index=item_index,
+                        )
+                        if quantity is not None:
+                            resolved["quantity"] = quantity
+                        decision.response_hint = "سأحدّث اختيار الخيار في مسودة الطلب."
+                elif quantity is not None and not has_draft:
+                    decision.allowed_action = AllowedAction.CREATE_DRAFT.value
+                    resolved["quantity"] = quantity
+                    resolved["unit_price"] = resolved.get("price")
+                    resolved["total_price"] = (
+                        float(resolved["price"]) * quantity
+                        if resolved.get("price") is not None
+                        else None
+                    )
+                    context_updates.pop("commerce_stage", None)
+                    decision.response_hint = "سأحفظ الخيار والكمية في مسودة طلب."
+
+        elif "quantity" in changes and has_draft:
+            selected_variant_id = state.get("selected_variant_id")
+            if not selected_variant_id:
+                first_item = draft_items[0]
+                selected_variant_id = (
+                    first_item.get("variant_id")
+                    if isinstance(first_item, dict)
+                    else None
+                )
+            if (
+                selected_variant_id
+                and decision.allowed_action
+                == AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value
+            ):
+                resolved.update(
+                    action="set",
+                    variant_id=str(selected_variant_id),
+                    quantity=changes["quantity"],
+                )
+
+        decision.resolved_entities = resolved
+        decision.context_updates = context_updates
+        return decision
+
     def _prepare_safe_tool_args(self, tool_name: str, resolved_data: dict, nlu_output: dict) -> dict:
         """
         Constructs arguments strictly from DB-validated data.
@@ -4645,18 +5040,39 @@ Rules:
             action = resolved_data.get("action")
             variant_id = resolved_data.get("variant_id")
             quantity = resolved_data.get("quantity")
-            if (
-                action == "add"
-                and variant_id
-                and isinstance(quantity, int)
-                and not isinstance(quantity, bool)
-                and quantity > 0
-            ):
+            item_index = resolved_data.get("item_index")
+            if action in {"add", "set", "remove", "replace"} and variant_id:
                 args = {
                     "action": action,
                     "variant_id": str(variant_id),
-                    "quantity": quantity,
                 }
+                if action in {"add", "set"}:
+                    if (
+                        isinstance(quantity, int)
+                        and not isinstance(quantity, bool)
+                        and quantity > 0
+                    ):
+                        args["quantity"] = quantity
+                    else:
+                        return {}
+                if action == "replace":
+                    if (
+                        isinstance(item_index, int)
+                        and not isinstance(item_index, bool)
+                        and item_index > 0
+                    ):
+                        args["item_index"] = item_index
+                    else:
+                        return {}
+                    if quantity is not None:
+                        if (
+                            isinstance(quantity, int)
+                            and not isinstance(quantity, bool)
+                            and quantity > 0
+                        ):
+                            args["quantity"] = quantity
+                        else:
+                            return {}
 
         return args
 
@@ -5014,7 +5430,6 @@ Rules:
         """
         is_french = language == "fr"
         if service_name == "create_draft":
-            from app.models.product import Product, ProductVariant
             from app.services.exceptions import NotFoundError, ValidationError
             from app.services.order_draft_service import save_draft
 
@@ -5119,6 +5534,10 @@ Rules:
                     language=language,
                 )
 
+            metadata = dict(conversation.metadata_json or {})
+            metadata["commerce_stage"] = "DRAFT_PENDING"
+            conversation.metadata_json = metadata
+
             if is_french:
                 return (
                     f"Votre commande provisoire est enregistrée. Total : "
@@ -5129,6 +5548,25 @@ Rules:
         elif service_name == "resolve_variant":
             price = data.get("price")
             stock = data.get("stock")
+            variant_uuid = CommerceResolver._parse_uuid(data.get("variant_id"))
+            conversation_store_id = (
+                db.query(Conversation.store_id)
+                .filter(Conversation.id == conv_id)
+                .scalar()
+            )
+            variant = (
+                db.query(ProductVariant)
+                .join(Product)
+                .filter(
+                    ProductVariant.id == variant_uuid,
+                    Product.store_id == conversation_store_id,
+                    Product.is_active.is_(True),
+                )
+                .one_or_none()
+                if variant_uuid is not None and conversation_store_id is not None
+                else None
+            )
+            variant_name = variant.name if variant is not None else None
 
             if is_french:
                 stock_text = (
@@ -5137,7 +5575,12 @@ Rules:
                     else f"Quantité disponible : {stock}"
                 )
                 return (
-                    "J’ai trouvé l’option demandée.\n"
+                    (
+                        f"Option choisie : {variant_name}.\n"
+                        if variant_name
+                        else "J’ai trouvé l’option demandée.\n"
+                    )
+                    +
                     f"Prix : {price} DZD\n"
                     f"{stock_text}\n"
                     "Dites « commander » pour l’ajouter à votre panier."
@@ -5148,7 +5591,12 @@ Rules:
                 else f"الكمية المتوفرة: {stock}"
             )
             return (
-                "وجدت الاختيار المطلوب.\n"
+                (
+                    f"تم اختيار {variant_name}.\n"
+                    if variant_name
+                    else "وجدت الاختيار المطلوب.\n"
+                )
+                +
                 f"السعر: {price} دج\n"
                 f"{stock_text}\n"
                 "قل 'ديرلي طلب' لإضافة المنتج للسلة."

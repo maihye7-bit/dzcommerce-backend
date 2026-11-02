@@ -28,6 +28,19 @@ _ARABIC_LETTERS = str.maketrans(
     }
 )
 _SAMSUNG_VARIANTS = re.compile(r"(?<!\w)(?:samsung|سامسونغ|سامسونج)(?!\w)", re.IGNORECASE)
+_ARABIC_CATEGORY_FORMS = {
+    "احذيه": "حذاء",
+    "احذاء": "حذاء",
+    "حذاء": "حذاء",
+    "ملابس": "ملابس",
+    "لباس": "ملابس",
+    "هواتف": "هاتف",
+    "هاتف": "هاتف",
+    "حقائب": "حقيبه",
+    "حقيبه": "حقيبه",
+    "ساعات": "ساعه",
+    "ساعه": "ساعه",
+}
 
 
 def normalize_product_search_text(value: str | None) -> str:
@@ -42,7 +55,12 @@ def normalize_product_search_text(value: str | None) -> str:
     )
     normalized = normalized.translate(_ARABIC_DIGITS).translate(_ARABIC_LETTERS)
     normalized = _SAMSUNG_VARIANTS.sub("سامسونغ", normalized)
-    return re.sub(r"\s+", " ", normalized.casefold()).strip()
+    tokens = []
+    for token in re.sub(r"\s+", " ", normalized.casefold()).strip().split():
+        if token.startswith("ال") and len(token) > 4:
+            token = token[2:]
+        tokens.append(_ARABIC_CATEGORY_FORMS.get(token, token))
+    return " ".join(tokens)
 
 
 class SearchProductsTool(BaseTool):
