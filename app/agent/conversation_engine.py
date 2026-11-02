@@ -1493,7 +1493,8 @@ class ConversationEngine:
                 )
             else:
                 nlu.update(intent="order_create", intent_guess="order_create")
-            expected_action = AllowedAction.UPDATE_DRAFT.value
+            nlu["draft_action"] = arguments.get("action")
+            expected_action = AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value
         elif tool_name == "confirm_order":
             nlu.update(
                 intent="order_confirm",
@@ -4282,13 +4283,34 @@ Rules:
             return "order_create", 0.95
         if asks_price:
             if product_mention:
+                price_subject = product_mention.casefold()
+                for phrase in (
+                    "قداش",
+                    "بشحال",
+                    "بقداه",
+                    "شحال",
+                    "السعر",
+                    "سعر",
+                    "السومة",
+                    "سومة",
+                    "ثمن",
+                    "يسوى",
+                    "يسوا",
+                ):
+                    price_subject = price_subject.replace(phrase, " ")
+                price_subject = " ".join(price_subject.split())
+                selected_name = (selected_product_name or "").casefold()
                 same_selected_product = (
                     selected_product_id
-                    and isinstance(selected_product_name, str)
                     and (
-                        product_mention.casefold() in selected_product_name.casefold()
-                        or selected_product_name.casefold() in product_mention.casefold()
-                        or product_mention.isascii() != selected_product_name.isascii()
+                        not price_subject
+                        or bool(
+                            selected_name
+                            and (
+                                price_subject in selected_name
+                                or selected_name in price_subject
+                            )
+                        )
                     )
                 )
                 return (
@@ -4618,7 +4640,24 @@ Rules:
         elif tool_name == "confirm_order":
             # No args needed, reads from active_draft_json in DB
             args = {}
-            
+
+        elif tool_name == "update_order_draft":
+            action = resolved_data.get("action")
+            variant_id = resolved_data.get("variant_id")
+            quantity = resolved_data.get("quantity")
+            if (
+                action == "add"
+                and variant_id
+                and isinstance(quantity, int)
+                and not isinstance(quantity, bool)
+                and quantity > 0
+            ):
+                args = {
+                    "action": action,
+                    "variant_id": str(variant_id),
+                    "quantity": quantity,
+                }
+
         return args
 
     async def _generate_localized_final_text(
@@ -4929,6 +4968,20 @@ Rules:
                 f"Votre commande provisoire est enregistrée. Total : {total} DZD. Dites « confirmer » pour continuer."
                 if is_french
                 else f"تم حفظ مسودة الطلب. المجموع: {total} دج. قل 'أكد' للمتابعة."
+            )
+
+        if "item_count" in tool_result_data and "total_price" in tool_result_data:
+            total = self._format_verified_price(tool_result_data.get("total_price"))
+            if total is None:
+                return (
+                    "Votre commande provisoire a été mise à jour."
+                    if is_french
+                    else "تم تحديث مسودة الطلب."
+                )
+            return (
+                f"Votre commande provisoire a été mise à jour. Total : {total} DZD. Dites « confirmer » pour continuer."
+                if is_french
+                else f"تم تحديث مسودة الطلب. المجموع: {total} دج. قل 'أكد' للمتابعة."
             )
 
         if tool_result_data.get("already_confirmed") is True:

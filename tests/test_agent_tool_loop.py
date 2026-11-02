@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -1942,3 +1943,196 @@ def test_agent_reply_validator_rejects_unverified_price_and_policy():
         "en",
         facts,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["حبيت نشري الحذاء", "حبيت ندير طلب"],
+)
+async def test_messenger_order_intent_updates_existing_draft(
+    db_session,
+    message,
+):
+    _, _, conversation, product, variant = make_fixture(db_session)
+    product.name = "الحذاء"
+    conversation.active_draft_json = {
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100,
+                "line_total": 100,
+                "available_stock": 5,
+            }
+        ],
+        "total_price": 100,
+        "shipping_info": {},
+    }
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "selected_attributes": {"color": "black"},
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider([])
+    registry = make_registry()
+    registry.aexecute = AsyncMock(wraps=registry.aexecute)
+    engine = ConversationEngine(provider, registry)
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+
+    async def local_nlu(user_message, state, **_kwargs):
+        return engine._heuristic_nlu(user_message, state)
+
+    engine._extract_nlu_via_qwen = local_nlu
+    result = await engine.process_message(
+        db=db_session,
+        store_id=conversation.store_id,
+        customer_id=conversation.customer_id,
+        conversation_id=conversation.id,
+        channel="messenger",
+        user_message=message,
+    )
+
+    assert result["turn_diagnostics"]["intent"] == "order_create"
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:update_order_draft"
+    )
+    assert result["response"].startswith("تم تحديث مسودة الطلب.")
+    assert conversation.active_draft_json["items"][0]["quantity"] == 2
+    assert conversation.active_draft_json["total_price"] == 200
+    assert provider.calls == []
+    registry.aexecute.assert_awaited_once()
+    tool_call = registry.aexecute.await_args.kwargs
+    assert tool_call["tool_name"] == "update_order_draft"
+    assert tool_call["arguments"] == {
+        "action": "add",
+        "variant_id": str(variant.id),
+        "quantity": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_messenger_first_purchase_saves_draft_without_confirming(db_session):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    product.name = "الحذاء"
+    product.base_price = Decimal("137.50")
+    variant.price_adjustment = Decimal("12.50")
+    inventory = (
+        db_session.query(InventoryItem)
+        .filter(InventoryItem.variant_id == variant.id)
+        .one()
+    )
+    inventory.quantity = 3
+    conversation.active_draft_json = None
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "selected_attributes": {"color": "black"},
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider([])
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+
+    async def local_nlu(user_message, state, **_kwargs):
+        return engine._heuristic_nlu(user_message, state)
+
+    engine._extract_nlu_via_qwen = local_nlu
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="messenger",
+        user_message="حبيت نشري الحذاء",
+    )
+
+    db_session.refresh(conversation)
+    draft = conversation.active_draft_json
+
+    assert result["turn_diagnostics"]["intent"] == "order_create"
+    assert result["turn_diagnostics"]["resolver_action"] == "CALL_SERVICE:create_draft"
+    assert "هذا الإجراء غير متاح حاليًا" not in result["response"]
+    assert "تم حفظ مسودة الطلب" in result["response"]
+    assert draft is not None
+    assert len(draft["items"]) == 1
+    assert draft["items"][0] == {
+        "variant_id": str(variant.id),
+        "product_name": "الحذاء",
+        "variant_name": variant.name,
+        "unit_price": 150.0,
+        "quantity": 1,
+        "line_total": 150.0,
+        "available_stock": 3,
+    }
+    assert draft["total_price"] == 150.0
+    assert conversation.metadata_json["commerce_stage"] == "DRAFT_PENDING"
+    assert (
+        db_session.query(Order)
+        .filter(Order.conversation_id == conversation.id)
+        .count()
+        == 0
+    )
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["قداش سعر الحذاء؟", "شحال يسوى؟"],
+)
+async def test_messenger_price_followup_uses_selected_product_id(
+    db_session,
+    message,
+):
+    _, _, conversation, product, _ = make_fixture(db_session)
+    product.name = "الحذاء"
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider([])
+    registry = make_registry()
+    registry.aexecute = AsyncMock(wraps=registry.aexecute)
+    engine = ConversationEngine(provider, registry)
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+
+    async def local_nlu(user_message, state, **_kwargs):
+        return engine._heuristic_nlu(user_message, state)
+
+    engine._extract_nlu_via_qwen = local_nlu
+    result = await engine.process_message(
+        db=db_session,
+        store_id=conversation.store_id,
+        customer_id=conversation.customer_id,
+        conversation_id=conversation.id,
+        channel="messenger",
+        user_message=message,
+    )
+
+    assert result["turn_diagnostics"]["intent"] == "product_details"
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:get_product_details"
+    )
+    assert "100" in result["response"]
+    assert provider.calls == []
+    registry.aexecute.assert_awaited_once()
+    tool_call = registry.aexecute.await_args.kwargs
+    assert tool_call["tool_name"] == "get_product_details"
+    assert tool_call["arguments"] == {"product_id": str(product.id)}

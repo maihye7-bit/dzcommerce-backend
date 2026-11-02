@@ -9,7 +9,7 @@ from app.services.exceptions import NotFoundError, ValidationError
 from app.services.order_draft_service import (
     get_current_draft,
     replace_draft_item_variant,
-    save_draft,
+    update_draft_items,
 )
 
 
@@ -161,9 +161,10 @@ class UpdateOrderDraftTool(BaseTool):
             # Note: save_draft expects raw input format [{"variant_id":..., "quantity":...}]
             raw_items = [{"variant_id": it["variant_id"], "quantity": it["quantity"]} for it in items_list]
             
-            new_draft = save_draft(
+            new_draft = update_draft_items(
                 db=db,
                 conversation_id=conversation_id,
+                store_id=store_id,
                 items=raw_items,
                 shipping_info=current_draft.get("shipping_info")
             )

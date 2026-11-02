@@ -39,6 +39,7 @@ class AllowedAction(str, Enum):
     LIST_CATALOG_PRODUCTS = "EXECUTE_TOOL:list_catalog_products"
     GET_PRODUCT_DETAILS = "EXECUTE_TOOL:get_product_details"
     CREATE_ORDER_DRAFT_TOOL = "EXECUTE_TOOL:create_order_draft"
+    UPDATE_ORDER_DRAFT_TOOL = "EXECUTE_TOOL:update_order_draft"
     CREATE_DRAFT = "CALL_SERVICE:create_draft"
     UPDATE_DRAFT = "CALL_SERVICE:update_draft"
     CONFIRM_ORDER = "EXECUTE_TOOL:confirm_order"
@@ -629,6 +630,100 @@ class CommerceResolver:
                 draft_product = self._get_draft_product(store_id, state)
                 if draft_product is not None:
                     draft_product_id = str(draft_product.id)
+
+            if intent == "order_create":
+                draft_action = nlu_output.get("draft_action")
+                if draft_action in {"remove", "set", "replace"}:
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value,
+                        resolved_entities={},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "سأحدّث مسودة الطلب.",
+                            "Je vais mettre à jour votre commande provisoire.",
+                        ),
+                    )
+
+                product_uuid = self._parse_uuid(draft_product_id)
+                if product_uuid is None:
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+                        resolved_entities={},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "حدد المنتج والخيار الذي تريد إضافته إلى الطلب.",
+                            "Indiquez le produit et l’option à ajouter à la commande.",
+                        ),
+                    )
+
+                if product_mention:
+                    product = (
+                        self.db.query(Product)
+                        .filter(
+                            Product.id == product_uuid,
+                            Product.store_id == store_id,
+                            Product.is_active.is_(True),
+                        )
+                        .one_or_none()
+                    )
+                    mention = normalize_product_search_text(product_mention)
+                    selected_name = normalize_product_search_text(
+                        product.name if product is not None else None
+                    )
+                    if (
+                        product is None
+                        or not mention
+                        or mention not in selected_name
+                        and selected_name not in mention
+                    ):
+                        return ResolutionResult(
+                            allowed_action=AllowedAction.SEARCH_PRODUCTS.value,
+                            resolved_entities={"query": product_mention},
+                            context_updates=base_context,
+                            response_hint=text(
+                                "سأبحث عن المنتج الذي ذكرته دون تغيير مسودة طلبك.",
+                                "Je recherche le produit mentionné sans modifier votre commande provisoire.",
+                            ),
+                        )
+
+                variant_uuid = self._parse_uuid(state.get("selected_variant_id"))
+                variant = (
+                    self.db.query(ProductVariant)
+                    .join(Product)
+                    .filter(
+                        ProductVariant.id == variant_uuid,
+                        ProductVariant.product_id == product_uuid,
+                        Product.store_id == store_id,
+                        Product.is_active.is_(True),
+                    )
+                    .one_or_none()
+                    if variant_uuid is not None
+                    else None
+                )
+                if variant is None:
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
+                        resolved_entities={"product_id": str(product_uuid)},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "اختر خيارًا من المنتج قبل إضافته إلى مسودة الطلب.",
+                            "Choisissez une option du produit avant de l’ajouter à la commande.",
+                        ),
+                    )
+
+                return ResolutionResult(
+                    allowed_action=AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value,
+                    resolved_entities={
+                        "action": "add",
+                        "variant_id": str(variant.id),
+                        "quantity": quantity,
+                    },
+                    context_updates=base_context,
+                    response_hint=text(
+                        "توجد مسودة للطلب. سأضيف المنتج إليها.",
+                        "Une commande provisoire existe déjà. Je vais y ajouter le produit.",
+                    ),
+                )
 
             if intent == "product_search" and product_mention:
                 return ResolutionResult(

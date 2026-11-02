@@ -169,6 +169,107 @@ def replace_draft_item_variant(
     return updated_draft
 
 
+def update_draft_items(
+    db: Session,
+    conversation_id: uuid.UUID,
+    store_id: uuid.UUID,
+    items: list[dict[str, Any]],
+    shipping_info: dict | None = None,
+) -> dict:
+    """Persist an explicit draft update from server-resolved variant IDs."""
+    conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.store_id == store_id,
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if conversation is None:
+        raise NotFoundError("Conversation not found in this store.")
+
+    current_draft = conversation.active_draft_json
+    if not isinstance(current_draft, dict) or not current_draft.get("items"):
+        raise ValidationError("No active draft found to update.")
+    if not items:
+        raise ValidationError("A draft must contain at least one item.")
+
+    validated_items: list[dict[str, Any]] = []
+    seen_variant_ids: set[uuid.UUID] = set()
+    total_price = Decimal("0")
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            raise ValidationError("The requested draft contains an invalid item.")
+        try:
+            variant_id = uuid.UUID(str(raw_item.get("variant_id")))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValidationError("The requested draft contains an invalid variant.") from exc
+
+        quantity = raw_item.get("quantity")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise ValidationError("A draft item has an invalid quantity.")
+        if variant_id in seen_variant_ids:
+            raise ValidationError("A draft cannot contain duplicate variants.")
+        seen_variant_ids.add(variant_id)
+
+        variant = (
+            db.query(ProductVariant)
+            .join(Product)
+            .filter(
+                ProductVariant.id == variant_id,
+                Product.store_id == store_id,
+                Product.is_active.is_(True),
+            )
+            .one_or_none()
+        )
+        if variant is None:
+            raise ValidationError("A draft variant is not available in this store.")
+
+        inventory = (
+            db.query(InventoryItem)
+            .filter(
+                InventoryItem.variant_id == variant.id,
+                InventoryItem.store_id == store_id,
+            )
+            .one_or_none()
+        )
+        available = inventory.quantity if inventory is not None else 0
+        if available < quantity:
+            raise ValidationError(
+                f"Insufficient stock for {variant.product.name}. Available: {available}."
+            )
+
+        unit_price = Decimal(str(variant.product.base_price)) + Decimal(
+            str(variant.price_adjustment or 0)
+        )
+        line_total = unit_price * quantity
+        total_price += line_total
+        validated_items.append(
+            {
+                "variant_id": str(variant.id),
+                "product_name": variant.product.name,
+                "variant_name": variant.name,
+                "unit_price": float(unit_price),
+                "quantity": quantity,
+                "line_total": float(line_total),
+                "available_stock": available,
+            }
+        )
+
+    updated_draft = dict(current_draft)
+    updated_draft.update(
+        items=validated_items,
+        shipping_info=shipping_info or current_draft.get("shipping_info") or {},
+        total_price=float(total_price),
+        currency="DZD",
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    conversation.active_draft_json = updated_draft
+    db.flush()
+    return updated_draft
+
+
 def save_draft_safe(
     db: Session,
     conversation_id: uuid.UUID,

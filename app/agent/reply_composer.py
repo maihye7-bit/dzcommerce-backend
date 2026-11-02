@@ -187,6 +187,11 @@ _LANGUAGE_WORDS = {
         "the", "their", "this", "to", "want", "which", "would", "you", "your",
     },
 }
+_ARABIC_DIGIT_TRANSLATION = str.maketrans(
+    "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"
+    "\u06f0\u06f1\u06f2\u06f3\u06f4\u06f5\u06f6\u06f7\u06f8\u06f9",
+    "01234567890123456789",
+)
 _WORDS = re.compile(r"[^\W\d_]+", re.UNICODE)
 _DIGITS = re.compile(r"\d")
 _UNRESOLVED_PLACEHOLDER = re.compile(
@@ -228,46 +233,16 @@ class ReplyComposer:
             return None
 
         text = response_text.strip()
-
-        # First try: direct JSON parse
-        try:
-            parsed = json.loads(text)
+        decoder = json.JSONDecoder()
+        for start, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                continue
             if isinstance(parsed, dict) and "reply" in parsed:
                 return parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        # Second try: extract from markdown code fences
-        # Pattern: ```json ... ``` or ``` ... ```
-        fence_pattern = re.compile(r'```(?:json)?\s*(\{.*?\})\s*```', re.DOTALL | re.IGNORECASE)
-        for match in fence_pattern.finditer(text):
-            try:
-                parsed = json.loads(match.group(1))
-                if isinstance(parsed, dict) and "reply" in parsed:
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        # Third try: find any JSON-like object with "reply" key
-        # Look for {...} containing "reply"
-        json_pattern = re.compile(r'(\{.*?"reply"\s*:\s*".*?".*?\})', re.DOTALL)
-        for match in json_pattern.finditer(text):
-            try:
-                parsed = json.loads(match.group(1))
-                if isinstance(parsed, dict) and "reply" in parsed:
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        # Fourth try: Look for any valid JSON object, then check for reply key
-        brace_pattern = re.compile(r'(\{.*?\})', re.DOTALL)
-        for match in brace_pattern.finditer(text):
-            try:
-                parsed = json.loads(match.group(1))
-                if isinstance(parsed, dict) and "reply" in parsed:
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                continue
 
         return None
 
@@ -324,9 +299,7 @@ class ReplyComposer:
         ):
             return False
 
-        normalized = reply.translate(
-            str.maketrans("Ù Ù¡Ù¢Ù£Ù¤Ù¥Ù¦Ù§Ù¨Ù©Û°Û±Û²Û³Û´ÛµÛ¶Û·Û¸Û¹", "01234567890123456789")
-        )
+        normalized = reply.translate(_ARABIC_DIGIT_TRANSLATION)
         prices: set[Decimal] = set()
         stocks: set[int] = set()
         availability_values: set[bool] = set()
@@ -625,8 +598,10 @@ class ReplyComposer:
             return None
 
         reply = parsed["reply"].strip()
-        is_safe, diagnostic_code = self.diagnose_reply(reply, language, products)
+        is_safe = self._is_safe_reply(reply, language, products)
         if not is_safe:
+            _, diagnostic_code = self.diagnose_reply(reply, language, products)
+            diagnostic_code = diagnostic_code or "VALIDATION_FAILED"
             # Log the diagnostic code without exposing user data.
             # The codes are internal; map to a short descriptive message for the log.
             code_messages = {
@@ -637,6 +612,7 @@ class ReplyComposer:
                 "LANGUAGE_MISMATCH": "Language script mismatch",
                 "PRICE_MISMATCH": "Price claim not verified against product data",
                 "STOCK_MISMATCH": "Stock claim inconsistent with catalog",
+                "VALIDATION_FAILED": "Reply validation failed",
             }
             log_message = code_messages.get(diagnostic_code, "Reply validation failed")
             logger.warning(
@@ -669,7 +645,7 @@ class ReplyComposer:
         ]
         # Allow natural replies: require at least one verified name if names exist,
         # but don't demand every product be mentioned.
-        if names and not any(name.casefold() in reply.casefold() for name in names):
+        if names and not all(name.casefold() in reply.casefold() for name in names):
             return False
 
         # Language check: be permissive with short replies and mixed language
@@ -678,9 +654,6 @@ class ReplyComposer:
             has_arabic = bool(re.search(r"[\u0600-\u06ff]", reply))
             has_latin = bool(re.search(r"[A-Za-z]", reply))
             if not has_arabic and not has_latin:
-                return False
-            # If it's mostly Arabic, don't reject for containing Latin brand names
-            if has_arabic and not has_latin:
                 return False
         elif language in {"fr", "en"}:
             if not re.search(r"[A-Za-z]", reply):
@@ -760,4 +733,3 @@ class ReplyComposer:
         except (InvalidOperation, ValueError):
             return None
         return amount if amount.is_finite() and amount >= 0 else None
-

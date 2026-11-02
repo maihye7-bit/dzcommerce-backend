@@ -17,6 +17,17 @@ from app.models.product import Product
 from app.models.store import Store
 
 
+def test_composer_extracts_json_wrapped_in_prose_with_braces_in_reply():
+    expected = {"reply": 'Choose {size} or say "large" for this option.'}
+    response = (
+        "Here is the response:\n```json\n"
+        + json.dumps(expected)
+        + "\n```\n"
+    )
+
+    assert ReplyComposer._extract_json_from_response(response) == expected
+
+
 class FixedProvider:
     def __init__(self, content=None, *, error=None, delay=0):
         self.content = content
