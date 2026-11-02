@@ -363,6 +363,10 @@ class ReplyComposer:
                 parsed = add_number(value.get(key))
                 if parsed is not None:
                     prices.add(parsed)
+            for key in ("total_amount", "unit_price"):
+                parsed = add_number(value.get(key))
+                if parsed is not None:
+                    prices.add(parsed)
             for key in ("stock", "stock_available", "available_quantity"):
                 raw_stock = value.get(key)
                 if (
@@ -391,6 +395,16 @@ class ReplyComposer:
             if isinstance(entities, list):
                 for entity in entities:
                     add_entity(entity)
+        for key in ("recent_orders", "open_orders"):
+            orders = verified_facts.get(key)
+            if isinstance(orders, list):
+                for order in orders:
+                    add_entity(order)
+                    if isinstance(order, dict) and isinstance(
+                        order.get("items"), list
+                    ):
+                        for item in order["items"]:
+                            add_entity(item)
         for key in ("product", "draft_summary", "inventory_result"):
             add_entity(verified_facts.get(key))
         for key in (
@@ -398,6 +412,11 @@ class ReplyComposer:
             "requested_quantity",
             "available_quantity",
             "item_count",
+            "total_orders",
+            "completed_orders",
+            "cancelled_orders",
+            "total_purchased_quantity",
+            "total_spent",
         ):
             raw_number = verified_facts.get(key)
             parsed = add_number(raw_number)
@@ -413,6 +432,22 @@ class ReplyComposer:
             ):
                 stocks.add(raw_number)
                 permitted_numbers.add(Decimal(raw_number))
+
+        behavior_summary = verified_facts.get("behavior_summary")
+        if isinstance(behavior_summary, dict):
+            for key in (
+                "total_orders",
+                "completed_orders",
+                "cancelled_orders",
+                "open_orders",
+                "total_purchased_quantity",
+            ):
+                parsed = add_number(behavior_summary.get(key))
+                if parsed is not None:
+                    permitted_numbers.add(parsed)
+            total_spent = add_number(behavior_summary.get("total_spent"))
+            if total_spent is not None:
+                prices.add(total_spent)
 
         # Allow natural replies: require at least one verified name if names exist,
         # but don't demand every product be mentioned.
@@ -477,13 +512,10 @@ class ReplyComposer:
 
         # Language check: be permissive with short replies and mixed language
         if language == "ar":
-            # Allow Arabic script OR Latin script in short replies
+            # Arabic-only and mixed-script replies are both valid Arabic output.
             has_arabic = bool(re.search(r"[\u0600-\u06ff]", reply))
             has_latin = bool(re.search(r"[A-Za-z]", reply))
             if not has_arabic and not has_latin:
-                return False
-            # If it's mostly Arabic, don't reject for containing Latin brand names
-            if has_arabic and not has_latin:
                 return False
         elif language in {"fr", "en"}:
             if not re.search(r"[A-Za-z]", reply):

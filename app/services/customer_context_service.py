@@ -144,6 +144,43 @@ def get_customer_context(
         )
 
     # 9. Assemble the context
+    order_summaries = []
+    for order in recent_orders:
+        items = (
+            db.query(OrderItem, Product.name)
+            .outerjoin(
+                Product,
+                (Product.id == OrderItem.product_id)
+                & (Product.store_id == store_id),
+            )
+            .filter(OrderItem.order_id == order.id)
+            .all()
+        )
+        order_summaries.append(
+            {
+                "id": str(order.id),
+                "status": (
+                    order.status.value
+                    if hasattr(order.status, "value")
+                    else str(order.status)
+                ),
+                "total_amount": str(order.total),
+                "currency": "DZD",
+                "created_at": (
+                    order.created_at.isoformat() if order.created_at else None
+                ),
+                "item_count": len(items),
+                "items": [
+                    {
+                        "product_name": product_name,
+                        "quantity": item.quantity,
+                        "unit_price": str(item.unit_price),
+                    }
+                    for item, product_name in items
+                ],
+            }
+        )
+
     return {
         "customer": {
             "id": str(customer.id),
@@ -155,23 +192,7 @@ def get_customer_context(
                 customer.created_at.isoformat() if customer.created_at else None
             ),
         },
-        "recent_orders": [
-            {
-                "id": str(o.id),
-                "status": (
-                    o.status.value if hasattr(o.status, "value") else str(o.status)
-                ),
-                "total_amount": str(o.total),
-                "currency": "DZD",
-                "created_at": o.created_at.isoformat() if o.created_at else None,
-                "item_count": len(
-                    o.id
-                    and db.query(OrderItem).filter(OrderItem.order_id == o.id).all()
-                    or []
-                ),
-            }
-            for o in recent_orders
-        ],
+        "recent_orders": order_summaries,
         "open_orders": [
             {
                 "id": str(o.id),

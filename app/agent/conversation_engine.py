@@ -53,6 +53,7 @@ AGENT_TOOL_NAMES = (
     "create_order_draft",
     "update_order_draft",
     "confirm_order",
+    "get_customer_context",
 )
 SAFE_FALLBACK_RESPONSE = "عذراً، لم أتمكن من إكمال طلبك حالياً. يرجى المحاولة مرة أخرى لاحقاً."
 logger = logging.getLogger(__name__)
@@ -329,6 +330,18 @@ class ConversationEngine:
             "confirm_order": {
                 "type": "object",
                 "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            "get_customer_context": {
+                "type": "object",
+                "properties": {
+                    "recent_orders_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                    },
+                },
                 "required": [],
                 "additionalProperties": False,
             },
@@ -644,6 +657,16 @@ class ConversationEngine:
         if not isinstance(sanitized, dict):
             return {}
         facts: dict[str, Any] = {}
+        for key in ("recent_orders", "open_orders", "behavior_summary"):
+            if key in sanitized:
+                facts[key] = sanitized[key]
+        recent_orders = sanitized.get("recent_orders")
+        if isinstance(recent_orders, list) and recent_orders:
+            latest_order = recent_orders[0]
+            if isinstance(latest_order, dict) and isinstance(
+                latest_order.get("status"), str
+            ):
+                facts["order_status"] = latest_order["status"]
         if isinstance(sanitized.get("products"), list):
             facts["products"] = sanitized["products"]
         if isinstance(sanitized.get("product"), dict):
@@ -872,6 +895,10 @@ class ConversationEngine:
                     "confirmation for an existing draft.\n"
                     "  • list_catalog_products: For general 'what do you sell?' "
                     "queries (open-ended discovery).\n"
+                    "  • get_customer_context: For questions about the customer's "
+                    "past orders, latest order, order status, totals, or purchased "
+                    "items. Use it again for order-related follow-up questions; "
+                    "never search products for order history.\n"
                     "- NEVER request tools just to fill silence or appear active.\n"
                     "- Only use tool arguments as described in the function schemas — "
                     "do not invent or modify parameters.\n"
@@ -1293,6 +1320,7 @@ class ConversationEngine:
                 {"action"},
             ),
             "confirm_order": (set(), set()),
+            "get_customer_context": ({"recent_orders_limit"}, set()),
         }
         if tool_name not in schemas:
             return False
@@ -1303,6 +1331,13 @@ class ConversationEngine:
             return (
                 isinstance(arguments.get("query"), str)
                 and 0 < len(arguments["query"].strip()) <= 160
+            )
+        if tool_name == "get_customer_context":
+            limit = arguments.get("recent_orders_limit")
+            return limit is None or (
+                isinstance(limit, int)
+                and not isinstance(limit, bool)
+                and 1 <= limit <= 20
             )
         if tool_name == "get_product_details":
             return "product_name" not in arguments or (
@@ -1443,6 +1478,97 @@ class ConversationEngine:
     ) -> tuple[ResolutionResult, dict[str, Any], str, ToolResult] | None:
         if not self._agent_tool_arguments_valid(tool_name, arguments):
             return None
+
+        if tool_name == "get_customer_context":
+            result = await self.registry.aexecute(
+                tool_name=tool_name,
+                arguments=arguments,
+                context={
+                    "db": db,
+                    "store_id": store_id,
+                    "customer_id": customer_id,
+                    "conversation_id": conversation.id,
+                    "channel": channel,
+                },
+            )
+            if result.success and isinstance(result.data, dict):
+                def project_orders(value: Any) -> list[dict[str, Any]]:
+                    if not isinstance(value, list):
+                        return []
+                    projected = []
+                    for order in value[:20]:
+                        if not isinstance(order, dict):
+                            continue
+                        items = order.get("items")
+                        projected_order = {
+                            key: order[key]
+                            for key in (
+                                "status",
+                                "total_amount",
+                                "currency",
+                                "item_count",
+                            )
+                            if key in order
+                        }
+                        projected_order["items"] = (
+                            [
+                                {
+                                    key: item[key]
+                                    for key in (
+                                        "product_name",
+                                        "quantity",
+                                        "unit_price",
+                                    )
+                                    if key in item
+                                }
+                                for item in items[:20]
+                                if isinstance(item, dict)
+                            ]
+                            if isinstance(items, list)
+                            else []
+                        )
+                        projected.append(projected_order)
+                    return projected
+
+                result = ToolResult(
+                    success=True,
+                    data={
+                        "recent_orders": project_orders(
+                            result.data.get("recent_orders")
+                        ),
+                        "open_orders": project_orders(
+                            result.data.get("open_orders")
+                        ),
+                        "behavior_summary": {
+                            key: result.data["behavior_summary"][key]
+                            for key in (
+                                "total_orders",
+                                "completed_orders",
+                                "cancelled_orders",
+                                "open_orders",
+                                "total_purchased_quantity",
+                                "total_spent",
+                            )
+                            if isinstance(
+                                result.data.get("behavior_summary"), dict
+                            )
+                            and key in result.data["behavior_summary"]
+                        },
+                    },
+                )
+            return (
+                ResolutionResult(
+                    allowed_action=AllowedAction.NATURAL_RESPONSE.value,
+                ),
+                {
+                    "intent": "unknown",
+                    "intent_guess": "unknown",
+                    "language": language,
+                    "confidence": 0.95,
+                },
+                tool_name,
+                result,
+            )
 
         state_for_resolution = state
         nlu: dict[str, Any] = {
@@ -2321,6 +2447,24 @@ class ConversationEngine:
             else None
         )
         agent_loop_fallback = False
+        classifier_result = ConversationClassifier.classify(
+            user_message,
+            language=current_state.get("language"),
+            recent_turns=dialogue_context[-4:] if dialogue_context else None,
+            commerce_stage=current_state.get("commerce_stage"),
+            selected_product_id=current_state.get("selected_product_id"),
+            selected_product_name=current_state.get("selected_product_name"),
+        )
+        has_active_draft = (
+            isinstance(current_state.get("active_draft_json"), dict)
+            and bool(current_state["active_draft_json"].get("items"))
+        )
+        # Let Qwen resolve ambiguity unless a draft is pending.
+        bypass_agent_loop = classifier_result.intent in {
+            "GENERAL_CHAT",
+            "TOPIC_CHANGE",
+            "UNSUPPORTED_OR_RESTRICTED",
+        } or (classifier_result.intent == "AMBIGUOUS" and has_active_draft)
         if (
             post_confirmation_response is None
             and post_confirmation_nlu is None
@@ -2329,18 +2473,7 @@ class ConversationEngine:
             and not pending_purchase_request
             and not idempotent_order_request
             and not delivery_info_capture_turn
-            #
-            # --- ConversationClassifier bypass ---
-            # Allow non-commercial messages to bypass the agent loop so the
-            # Qwen agent can generate a natural conversational response without
-            # forcing unnecessary commerce tool calls. The classifier determines
-            # whether the message is commercial or purely conversational.
-            and not ConversationClassifier.is_non_commercial_message(
-                user_message,
-                commerce_stage=current_state.get("commerce_stage"),
-                selected_product_id=current_state.get("selected_product_id"),
-                selected_product_name=current_state.get("selected_product_name"),
-            )
+            and not bypass_agent_loop
             and
             self.agent_tool_loop_enabled
             and self.llm is not None
@@ -2349,17 +2482,6 @@ class ConversationEngine:
             and not self._contains_sensitive_nlu_content(user_message)
             and not turn_plan["has_actions"]
         ):
-            # Run classifier for logging/routing information (but only if we
-            # are actually going to enter the agent loop; if the bypass above
-            # triggered, we skip the classifier since the message is non-commercial)
-            classifier_result = ConversationClassifier.classify(
-                user_message,
-                language=current_state.get("language"),
-                recent_turns=dialogue_context[-4:] if dialogue_context else None,
-                commerce_stage=current_state.get("commerce_stage"),
-                selected_product_id=current_state.get("selected_product_id"),
-                selected_product_name=current_state.get("selected_product_name"),
-            )
             fallback_nlu = self._heuristic_nlu(user_message, current_state)
             if re.search(r"[\u0600-\u06ff]", user_message):
                 fallback_nlu["language"] = "ar"
@@ -2396,6 +2518,8 @@ class ConversationEngine:
                 last_agent_tool_result = agent_loop_result.get("tool_result")
                 if (
                     intent in resolvable_intents
+                    and agent_loop_result.get("tool_name")
+                    != "get_customer_context"
                     and (
                         last_agent_tool_result is None
                         or not last_agent_tool_result.success
@@ -2414,6 +2538,43 @@ class ConversationEngine:
             or delivery_info_capture_turn
         ) and fallback_nlu is None:
             fallback_nlu = local_message_nlu
+
+        product_mention = (
+            fallback_nlu.get("product_mention")
+            if isinstance(fallback_nlu, dict)
+            else None
+        )
+        verified_search_candidate = bool(
+            isinstance(product_mention, str)
+            and product_mention
+            and db.query(Product.id)
+            .filter(
+                Product.store_id == store_id,
+                Product.is_active.is_(True),
+                Product.name == product_mention,
+            )
+            .first()
+        )
+        if (
+            self.agent_tool_loop_enabled
+            and agent_loop_result is not None
+            and agent_loop_result.get("tool_name") is None
+            and isinstance(fallback_nlu, dict)
+            and fallback_nlu.get("intent") == "product_search"
+            and not verified_search_candidate
+            and classifier_result.intent
+            in {"ORDER_STATUS", "AVAILABILITY_INQUIRY", "AMBIGUOUS"}
+        ):
+            # Do not turn an unresolved history question into a product search.
+            fallback_nlu = {
+                **fallback_nlu,
+                "intent": "unknown",
+                "intent_guess": "unknown",
+                "product_mention": None,
+                "confidence": 0.0,
+            }
+            agent_loop_accepted = False
+            agent_loop_fallback = True
 
         agent_draft_created = False
         agent_draft_question_type: str | None = None

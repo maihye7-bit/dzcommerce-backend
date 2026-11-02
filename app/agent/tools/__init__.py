@@ -8,6 +8,7 @@ from app.agent.tools.update_order_draft import UpdateOrderDraftTool
 from app.agent.tools.confirm_order import ConfirmOrderTool # NEW IMPORT
 from app.agent.tools.list_catalog import ListCatalogProductsTool
 from app.agent.tools.store_info import StoreInfoTool
+from app.agent.tools.get_customer_context import GetCustomerContextTool
 
 # Create global registry instance
 tool_registry = ToolRegistry()
@@ -22,6 +23,7 @@ _tools_to_register = [
     ConfirmOrderTool(), # NEW REGISTRATION
     ListCatalogProductsTool(),
     StoreInfoTool(),
+    GetCustomerContextTool(),
 ]
 
 for tool in _tools_to_register:

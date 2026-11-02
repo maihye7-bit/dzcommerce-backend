@@ -21,10 +21,10 @@ class GetCustomerContextTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve structured context about the current customer: "
-            "their info, order history, previous products, open orders, "
-            "recent conversations, preferences, and behavior summary. "
-            "Use this to personalize responses."
+            "Read the current customer's verified order history, including recent "
+            "orders, their statuses, totals, and purchased items. Use this for "
+            "order-history questions and follow-ups about the customer's orders. "
+            "The customer and store are resolved by the server."
         )
 
     @property
@@ -61,7 +61,17 @@ class GetCustomerContextTool(BaseTool):
                 )
 
             db: Session = context["db"]
-            limit = min(int(args.get("recent_orders_limit", 5)), 20)
+            limit = args.get("recent_orders_limit", 5)
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or not 1 <= limit <= 20
+            ):
+                return ToolResult(
+                    success=False,
+                    error="Invalid arguments",
+                    error_code="VALIDATION_ERROR",
+                )
 
             result = customer_context_service.get_customer_context(
                 db=db,

@@ -14,6 +14,7 @@ from app.agent.tools.base import ToolResult
 from app.agent.tools.check_inventory import CheckInventoryTool
 from app.agent.tools.confirm_order import ConfirmOrderTool
 from app.agent.tools.create_order_draft import CreateOrderDraftTool
+from app.agent.tools.get_customer_context import GetCustomerContextTool
 from app.agent.tools.get_product_details import GetProductDetailsTool
 from app.agent.tools.list_catalog import ListCatalogProductsTool
 from app.agent.tools.registry import ToolRegistry
@@ -28,7 +29,7 @@ from app.models.conversation import (
 )
 from app.models.customer import Customer
 from app.models.inventory import InventoryItem
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant
 from app.models.store import Store
 
@@ -130,6 +131,7 @@ def make_registry():
         CreateOrderDraftTool(),
         UpdateOrderDraftTool(),
         ConfirmOrderTool(),
+        GetCustomerContextTool(),
     ):
         registry.register(tool)
     return registry
@@ -444,11 +446,167 @@ async def test_agent_tool_loop_executes_one_resolver_authorized_call(db_session)
         "create_order_draft",
         "update_order_draft",
         "confirm_order",
+        "get_customer_context",
     ]
     tool_result = provider.calls[1][0][-1]
     assert tool_result.role == "tool"
     assert "Samsung Galaxy" in tool_result.content
     assert str(product.id) not in tool_result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ممكن دير تلخيص لطلباتي؟",
+        "واش طلبت من عندكم؟",
+        "وريني آخر كوموند",
+        "قداش عندي من طلب؟",
+    ],
+)
+async def test_order_history_questions_use_customer_context_not_product_search(
+    db_session, message
+):
+    store, customer, conversation, product, _ = make_fixture(db_session)
+    order = Order(
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.DELIVERED,
+        subtotal=Decimal("100.00"),
+        total=Decimal("100.00"),
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        OrderItem(
+            order_id=order.id,
+            product_id=product.id,
+            quantity=1,
+            unit_price=Decimal("100.00"),
+        )
+    )
+    db_session.commit()
+
+    provider = ScriptedToolProvider(
+        [
+            tool_call("get_customer_context", {"recent_orders_limit": 10}),
+            LLMResponse(
+                content="عندك طلب واحد بقيمة 100 دج، وفيه Samsung Galaxy."
+            ),
+        ]
+    )
+    registry = make_registry()
+    executed_tools = []
+    original_execute = registry.aexecute
+
+    async def capture_execute(*, tool_name, arguments, context):
+        executed_tools.append(tool_name)
+        return await original_execute(
+            tool_name=tool_name,
+            arguments=arguments,
+            context=context,
+        )
+
+    registry.aexecute = capture_execute
+    engine = ConversationEngine(provider, registry)
+    engine.agent_tool_loop_enabled = True
+
+    result = await run_turn(engine, db_session, conversation, message)
+
+    assert result["response"] == (
+        "عندك طلب واحد بقيمة 100 دج، وفيه Samsung Galaxy."
+    )
+    assert executed_tools == ["get_customer_context"]
+    assert len(provider.calls) == 2
+    tool_result = provider.calls[1][0][-1]
+    assert tool_result.role == "tool"
+    assert "Samsung Galaxy" in tool_result.content
+    assert '"total_amount": "100.00"' in tool_result.content
+    assert '"quantity": 1' in tool_result.content
+    assert str(order.id) not in tool_result.content
+    assert str(customer.id) not in tool_result.content
+    customer_context_schema = next(
+        entry["function"]
+        for entry in provider.calls[0][1]
+        if entry["function"]["name"] == "get_customer_context"
+    )
+    assert "customer_id" not in customer_context_schema["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_order_history_followup_retrieves_current_status_again(db_session):
+    store, customer, conversation, product, _ = make_fixture(db_session)
+    order = Order(
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        status=OrderStatus.DELIVERED,
+        subtotal=Decimal("100.00"),
+        total=Decimal("100.00"),
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        OrderItem(
+            order_id=order.id,
+            product_id=product.id,
+            quantity=1,
+            unit_price=Decimal("100.00"),
+        )
+    )
+    db_session.commit()
+
+    provider = ScriptedToolProvider(
+        [
+            tool_call("get_customer_context", {}),
+            LLMResponse(content="عندك طلب واحد بقيمة 100 دج."),
+            tool_call("get_customer_context", {}),
+            LLMResponse(content="نعم، آخر طلب وصل إليك."),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    await run_turn(engine, db_session, conversation, "لخص لي طلباتي")
+    result = await run_turn(engine, db_session, conversation, "وهل وصل؟")
+
+    assert len(provider.calls) == 4
+    assert result["response"] == "نعم، آخر طلب وصل إليك."
+    assert [
+        entry["function"]["name"] for entry in provider.calls[0][1]
+    ][-1] == "get_customer_context"
+    assert [
+        entry["function"]["name"] for entry in provider.calls[2][1]
+    ][-1] == "get_customer_context"
+
+
+@pytest.mark.asyncio
+async def test_unresolved_order_history_does_not_fall_back_to_product_search(db_session):
+    _, _, conversation, _, _ = make_fixture(db_session)
+    provider = ScriptedToolProvider(
+        [LLMResponse(content="يمكنني مراجعة طلباتك السابقة.")]
+    )
+    registry = make_registry()
+    executed_tools = []
+    original_execute = registry.aexecute
+
+    async def capture_execute(*, tool_name, arguments, context):
+        executed_tools.append(tool_name)
+        return await original_execute(
+            tool_name=tool_name,
+            arguments=arguments,
+            context=context,
+        )
+
+    registry.aexecute = capture_execute
+    engine = ConversationEngine(provider, registry)
+    engine.agent_tool_loop_enabled = True
+
+    result = await run_turn(engine, db_session, conversation, "واش طلبت من عندكم؟")
+
+    assert executed_tools == []
+    assert result["response"] != "لم أجد هذا المنتج في نتائج المتجر."
 
 
 @pytest.mark.asyncio
@@ -1979,6 +2137,40 @@ def test_agent_reply_validator_rejects_unverified_price_and_policy():
         "Your order has been delivered.",
         "en",
         facts,
+    )
+    order_facts = {
+        "recent_orders": [
+            {
+                "status": "delivered",
+                "total_amount": "100.00",
+                "currency": "DZD",
+                "item_count": 1,
+                "items": [
+                    {
+                        "product_name": "Samsung Galaxy",
+                        "quantity": 1,
+                        "unit_price": "100.00",
+                    }
+                ],
+            }
+        ],
+        "order_status": "delivered",
+        "behavior_summary": {"total_orders": 7, "total_spent": "250.00"},
+    }
+    assert ReplyComposer.is_safe_agent_reply(
+        "نعم، آخر طلب وصل إليك.",
+        "ar",
+        order_facts,
+    )
+    assert ReplyComposer.is_safe_agent_reply(
+        "عندك 7 طلبات.",
+        "ar",
+        order_facts,
+    )
+    assert not ReplyComposer.is_safe_agent_reply(
+        "عندك 8 طلبات.",
+        "ar",
+        order_facts,
     )
 
 
