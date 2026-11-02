@@ -1755,6 +1755,7 @@ class ConversationEngine:
                 product_id=safe_arguments.get("product_id"),
                 tool_result_data=tool_result.data,
             )
+            self._apply_auto_selected_variant(decision, tool_result)
         self._persist_agent_context_updates(
             conversation,
             decision,
@@ -2086,7 +2087,30 @@ class ConversationEngine:
             and current_state.get("last_question_type") == "ORDER_CONFIRMATION"
             and local_message_nlu.get("intent") == "order_confirm"
             and local_message_nlu.get("confirmation_phrase") is True
-            
+        )
+        pending_purchase_acceptance = bool(
+            not has_confirmed_order
+            and current_state.get("commerce_stage") == "VARIANT_SELECTED"
+            and current_state.get("last_question_type") == "ORDER_CREATE_OFFER"
+            and current_state.get("selected_variant_id")
+            and self._is_bare_affirmative(user_message)
+        )
+        pending_purchase_request = bool(
+            not has_confirmed_order
+            and current_state.get("commerce_stage")
+            in {"PRODUCT_SELECTED", "VARIANT_SELECTED"}
+            and local_message_nlu.get("intent") == "order_create"
+        )
+        normalized_order_request = re.sub(
+            r"[\s؟?!.,،؛:]+", " ", (user_message or "").casefold()
+        ).strip()
+        idempotent_order_request = bool(
+            current_state.get("commerce_stage") == "DRAFT_PENDING"
+            and isinstance(current_state.get("active_draft_json"), dict)
+            and re.fullmatch(
+                r"(?:دير(?:لي)?|دير\s+لي)\s+(?:ال)?طلب",
+                normalized_order_request,
+            )
         )
         post_confirmation_response = None
         post_confirmation_nlu = None
@@ -2185,7 +2209,13 @@ class ConversationEngine:
         agent_loop_result = None
         fallback_nlu = post_confirmation_nlu or (
             local_message_nlu
-            if confirmation_pending or turn_plan["has_actions"]
+            if (
+                confirmation_pending
+                or pending_purchase_acceptance
+                or pending_purchase_request
+                or idempotent_order_request
+                or turn_plan["has_actions"]
+            )
             else None
         )
         agent_loop_fallback = False
@@ -2193,6 +2223,9 @@ class ConversationEngine:
             post_confirmation_response is None
             and post_confirmation_nlu is None
             and not confirmation_pending
+            and not pending_purchase_acceptance
+            and not pending_purchase_request
+            and not idempotent_order_request
             #
             # --- ConversationClassifier bypass ---
             # Allow non-commercial messages to bypass the agent loop so the
@@ -2272,6 +2305,9 @@ class ConversationEngine:
             unsupported_policy_topic
             or variant_availability_query
             or confirmation_pending
+            or pending_purchase_acceptance
+            or pending_purchase_request
+            or idempotent_order_request
         ) and fallback_nlu is None:
             fallback_nlu = local_message_nlu
 
@@ -2281,6 +2317,48 @@ class ConversationEngine:
             tool_result = agent_loop_result["tool_result"]
             tool_name = agent_loop_result["tool_name"]
             final_response_content = agent_loop_result["response"]
+            if (
+                tool_name == "get_product_details"
+                and tool_result is not None
+                and tool_result.success
+                and isinstance(tool_result.data, dict)
+                and isinstance(
+                    tool_result.data.get("auto_selected_variant"), dict
+                )
+            ):
+                product = tool_result.data.get("product")
+                selected_variant = tool_result.data["auto_selected_variant"]
+                product_name = (
+                    product.get("name")
+                    if isinstance(product, dict)
+                    else None
+                )
+                variant_name = selected_variant.get("name")
+                response_lower = (final_response_content or "").casefold()
+                asks_for_variant = bool(
+                    re.search(
+                        r"choose|select|pick|which option|"
+                        r"choisissez|quelle option|"
+                        r"اختر|اختار|أي خيار|اي خيار|تختار",
+                        response_lower,
+                    )
+                )
+                if (
+                    not isinstance(product_name, str)
+                    or product_name.casefold() not in response_lower
+                    or not isinstance(variant_name, str)
+                    or variant_name.casefold() not in response_lower
+                    or asks_for_variant
+                ):
+                    final_response_content = (
+                        await self._generate_localized_final_text(
+                            tool_result.data,
+                            decision.response_hint,
+                            user_message,
+                            nlu_output.get("language", "ar"),
+                            nlu_output.get("intent", "product_details"),
+                        )
+                    )
         elif fallback_nlu is not None:
             # A failed/invalid agent turn must not trigger a second provider call.
             nlu_output = fallback_nlu
@@ -2326,6 +2404,8 @@ class ConversationEngine:
                 variant_index=turn_plan["selection"]["index"],
                 quantity=turn_plan["order_changes"].get("quantity"),
             )
+        if idempotent_order_request:
+            nlu_output["idempotent_order_request"] = True
         if unsupported_policy_topic:
             nlu_output["intent"] = "unknown"
             nlu_output["intent_guess"] = "unknown"
@@ -2461,6 +2541,7 @@ class ConversationEngine:
                     product_id=tool_args.get("product_id"),
                     tool_result_data=tool_result.data,
                 )
+                self._apply_auto_selected_variant(decision, tool_result)
             
             # Generate natural language response from tool result
             if tool_result.success:
@@ -2625,6 +2706,16 @@ class ConversationEngine:
             # Case B: Call internal service directly (e.g., create_draft logic if bypassed tool)
             # For Phase 14.1-A, we mostly rely on Tools, but this hook allows direct service calls later.
             service_name = decision.allowed_action.split(":")[1]
+            if service_name == "create_draft":
+                self._ensure_variant_index_mapping(
+                    db=db,
+                    store_id=store_id,
+                    conversation=conversation,
+                    product_id=decision.resolved_entities.get("product_id"),
+                    variant_id=str(
+                        decision.resolved_entities.get("variant_id") or ""
+                    ),
+                )
             final_response_content = await self._handle_service_call(
                 service_name,
                 decision.resolved_entities,
@@ -3255,16 +3346,16 @@ class ConversationEngine:
             },
             "ORDER_CREATE_OFFER": {
                 "fr": (
-                    "Souhaitez-vous préparer une commande avec l’option sélectionnée ?",
-                    "Voulez-vous continuer avec l’option choisie ?",
+                    "L’option choisie est enregistrée. Dites « commander » pour préparer le brouillon.",
+                    "Votre choix est conservé ; dites « commander » pour préparer le brouillon.",
                 ),
                 "en": (
-                    "Would you like to prepare an order with the selected option?",
-                    "Should I continue with the option you selected?",
+                    "Your option is saved. Say “place the order” to prepare the draft.",
+                    "Your choice is saved; say “place the order” to prepare the draft.",
                 ),
                 "ar": (
-                    "تحب نحضّر طلباً بالخيار الذي اخترته؟",
-                    "نواصل بالخيار اللي اخترته؟",
+                    "الخيار الذي اخترته محفوظ. قل «دير طلب» لإعداد المسودة.",
+                    "اختيارك محفوظ؛ قل «دير طلب» لتحضير مسودة الطلب.",
                 ),
             },
         }
@@ -3432,6 +3523,30 @@ class ConversationEngine:
         return False
 
     @staticmethod
+    def _apply_auto_selected_variant(
+        decision: ResolutionResult,
+        tool_result: ToolResult,
+    ) -> None:
+        if not isinstance(tool_result.data, dict):
+            return
+        selected = tool_result.data.get("auto_selected_variant")
+        product = tool_result.data.get("product")
+        if not isinstance(selected, dict) or not isinstance(product, dict):
+            return
+        product_id = product.get("id")
+        variant_id = selected.get("id")
+        if not isinstance(product_id, str) or not isinstance(variant_id, str):
+            return
+        attributes = selected.get("attributes")
+        decision.context_updates.update(
+            selected_product_id=product_id,
+            selected_product_name=product.get("name"),
+            selected_variant_id=variant_id,
+            selected_attributes=attributes if isinstance(attributes, dict) else {},
+            commerce_stage="VARIANT_SELECTED",
+        )
+
+    @staticmethod
     def _persist_displayed_variant_map(
         conversation: Conversation,
         store_id: uuid.UUID,
@@ -3589,6 +3704,14 @@ class ConversationEngine:
         response: str,
     ) -> str | None:
         if tool_result is not None and tool_result.success:
+            if (
+                tool_name == "get_product_details"
+                and isinstance(tool_result.data, dict)
+                and isinstance(
+                    tool_result.data.get("auto_selected_variant"), dict
+                )
+            ):
+                return "ORDER_CREATE_OFFER"
             if tool_name in {"create_order_draft", "update_order_draft"}:
                 return "ORDER_CONFIRMATION"
             if tool_name == "list_catalog_products":
@@ -4332,7 +4455,7 @@ Rules:
         purchase_construction = bool(
             re.search(
                 r"(?<!\w)(?:حبيت|نحب|نبغي|أريد|اريد|أرغب|حاب)\s+"
-                r"(?:(?:ندير|نطلب|نقوم\s+ب)\s+)?"
+                r"(?:(?:ندير(?:لي)?|ندير\s+لي|نطلب|نقوم\s+ب)\s+)?"
                 r"(?:كوموند\w*|كوماندة|طلب\w*|نكومندي|نكوموندي|"
                 r"نطلب|ندي|نشري\w*|أشتري\w*|نشتري\w*)(?!\w)",
                 normalized,
@@ -4347,7 +4470,8 @@ Rules:
                 normalized,
             )
             or re.search(
-                r"(?<!\w)ندير\s+(?:كوموند\w*|كوماندة|طلب\w*)(?!\w)",
+                r"(?<!\w)(?:ندير(?:لي)?|ندير\s+لي|دير(?:لي)?|دير\s+لي)\s+"
+                r"(?:ال)?(?:كوموند\w*|كوماندة|طلب\w*)(?!\w)",
                 normalized,
             )
             or re.search(
@@ -4539,7 +4663,8 @@ Rules:
         mention = re.sub(r"\s+", " ", mention)
         mention = re.sub(
             r"(?i)^(?:كيف(?:اه|اش)\s+)?(?:نحوس\s+)?"
-            r"(?:ندير|نبدأ|نبدا)\s+(?:ال)?(?:طلب|كوموند\w*|كوماندة)"
+            r"(?:ندير(?:لي)?|دير(?:لي)?|ندير\s+لي|دير\s+لي|نبدأ|نبدا)\s+"
+            r"(?:ال)?(?:طلب|كوموند\w*|كوماندة)"
             r"(?:\s+(?:على|عن))?\s*",
             "",
             mention,
@@ -4559,7 +4684,8 @@ Rules:
         removable = (
             r"(?i)(?<!\w)(?:salam|salem|wach|kayen|3andkom|3andkum|ma3lich|"
             r"had|produit|product|n7ab|nheb|nechri|nchri|nshri|nedi|ndi|"
-            r"ncommande|ncommandi|ndir|bghit|commander|commandi|commande|command|buy|order|available|"
+            r"ncommande|ncommandi|ndir|bghit|دير|ديرلي|ندير|نديرلي|"
+            r"commander|commandi|commande|command|buy|order|available|"
             r"ch7al|chhal|bch7al|besh7al|prix|combien|price|"
             r"wa7ed|wahed|wahd|wa7da|one|un|une|please|"
             r"black|noir|white|blanc|blue|bleu|red|rouge|"
@@ -4827,18 +4953,78 @@ Rules:
             r"(?:الخيار\s*)?(?:رقم\s*)?#?\s*(\d{1,2})(?!\d)",
             normalized,
         )
+        ordinal_indices = {
+            "الأول": 1,
+            "الاول": 1,
+            "الأولى": 1,
+            "الاولى": 1,
+            "الأوّل": 1,
+            "الاوّل": 1,
+            "الثاني": 2,
+            "الثانية": 2,
+            "الثالث": 3,
+            "الثالثة": 3,
+        }
         selection_match = re.search(
-            r"(?:نختار|اختار|اختاري|اختر|اختيار|الخيار|option|choice)\s*"
-            r"(?:الخيار\s*)?(?:رقم\s*)?#?\s*(\d{1,2})(?!\d)",
+            r"(?:(?:نختار|اختار|اختاري|اختر|اختيار)\s*)?"
+            r"(?:الخيار\s*)?(?:رقم\s*)?#?\s*"
+            r"(\d{1,2}|الأول|الاول|الأولى|الاولى|الأوّل|الاوّل|"
+            r"الثاني|الثانية|الثالث|الثالثة)(?!\d)",
             normalized,
         )
         selection = None
+        match = None
         if selection_match or correction_match:
             match = correction_match or selection_match
+            reference = match.group(1)
+            index = (
+                int(reference)
+                if reference.isdigit()
+                else ordinal_indices.get(reference)
+            )
+            explicit_selection = bool(
+                re.search(
+                    r"(?:نختار|اختار|اختاري|اختر|اختيار|الخيار|option|choice|رقم|#)",
+                    normalized,
+                )
+            )
+            bare_reference = bool(
+                re.fullmatch(
+                    r"(?:رقم\s*)?(?:\d{1,2}|الأول|الاول|الأولى|الاولى|"
+                    r"الأوّل|الاوّل|الثاني|الثانية|الثالث|الثالثة)",
+                    normalized,
+                )
+            )
+            index_map = (state or {}).get("variant_index_map")
+            displayed_product_id = (state or {}).get(
+                "variant_index_map_product_id"
+            )
+            selected_product_id = (state or {}).get("selected_product_id")
+            map_matches_product = bool(
+                isinstance(index_map, dict)
+                and selected_product_id
+                and str(displayed_product_id) == str(selected_product_id)
+                and index is not None
+                and str(index) in index_map
+            )
+            if not (
+                index is not None
+                and map_matches_product
+                and (
+                    explicit_selection
+                    or (
+                        bare_reference
+                        and (state or {}).get("last_question_type")
+                        == "VARIANT_SELECTION"
+                    )
+                )
+            ):
+                match = None
+        if match is not None:
             selection = {
                 "type": "variant",
-                "reference": match.group(1),
-                "index": int(match.group(1)),
+                "reference": str(index),
+                "index": index,
                 "correction": correction_match is not None,
             }
 
@@ -5238,12 +5424,40 @@ Rules:
                 if isinstance(raw_variants, list)
                 else []
             )
-            asks_price = intent == "product_details"
-
-            formatted_base_price = self._format_verified_price(base_price)
             title = product_name or (
                 "ce produit" if is_french else "this product" if is_english else "هذا المنتج"
             )
+            auto_selected_variant = tool_result_data.get("auto_selected_variant")
+            if isinstance(auto_selected_variant, dict):
+                variant_name = auto_selected_variant.get("name")
+                formatted_variant_price = self._format_verified_price(
+                    auto_selected_variant.get("final_price")
+                )
+                details = (
+                    f"{title} — {variant_name}"
+                    if isinstance(variant_name, str) and variant_name.strip()
+                    else title
+                )
+                if formatted_variant_price is not None:
+                    details += (
+                        f" — {formatted_variant_price} DZD"
+                        if is_french or is_english
+                        else f" — {formatted_variant_price} دج"
+                    )
+                return (
+                    f"The only available option was selected automatically: "
+                    f"{details}. Say “place the order” to prepare the draft."
+                    if is_english
+                    else f"La seule option disponible a été sélectionnée automatiquement : "
+                    f"{details}. Dites « commander » pour préparer le brouillon."
+                    if is_french
+                    else f"تم اختيار الخيار الوحيد المتاح تلقائيًا للمنتج "
+                    f"{details}. "
+                    "قل «دير طلب» لإعداد مسودة الطلب."
+                )
+            asks_price = intent == "product_details"
+
+            formatted_base_price = self._format_verified_price(base_price)
 
             if intent == "order_create":
                 has_in_stock_variant = any(

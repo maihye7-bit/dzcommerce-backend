@@ -448,13 +448,34 @@ class CommerceResolver:
                              )
                              .all()
                          )
-                         if len(variants) == 1:
+                         available_variants = [
+                             variant
+                             for variant in variants
+                             if (self._get_stock_count(store_id, variant.id) or 0) > 0
+                         ]
+                         if len(available_variants) == 1:
+                             selected_variant = available_variants[0]
+                             selected_context = {
+                                 **base_context,
+                                 "selected_product_id": str(product.id),
+                                 "selected_variant_id": str(selected_variant.id),
+                                 "selected_attributes": (
+                                     selected_variant.attributes_json
+                                     if isinstance(
+                                         selected_variant.attributes_json, dict
+                                     )
+                                     else {}
+                                 ),
+                                 "commerce_stage": (
+                                     CommerceStage.VARIANT_SELECTED.value
+                                 ),
+                             }
                              return self._prepare_draft_creation(
                                  store_id,
                                  str(product.id),
-                                 str(variants[0].id),
+                                 str(selected_variant.id),
                                  quantity,
-                                 base_context,
+                                 selected_context,
                              )
                      return ResolutionResult(
                         allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
@@ -641,6 +662,20 @@ class CommerceResolver:
                         response_hint=text(
                             "سأحدّث مسودة الطلب.",
                             "Je vais mettre à jour votre commande provisoire.",
+                        ),
+                    )
+
+                if nlu_output.get("idempotent_order_request") is True:
+                    return ResolutionResult(
+                        allowed_action=AllowedAction.NATURAL_RESPONSE.value,
+                        resolved_entities={},
+                        context_updates=base_context,
+                        response_hint=text(
+                            "مسودة طلبك محفوظة بالفعل ولم يتم تأكيدها. "
+                            "راجع ملخصها وأكد الطلب فقط إذا كنت موافقًا.",
+                            "Votre brouillon est déjà enregistré et n’est pas "
+                            "confirmé. Vérifiez le récapitulatif et confirmez "
+                            "uniquement si vous êtes d’accord.",
                         ),
                     )
 

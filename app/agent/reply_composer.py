@@ -54,7 +54,10 @@ def diagnose_reply(
     names = [p.get("name", "").strip() for p in products if isinstance(p.get("name"), str)]
     # Allow natural replies: require at least one verified name if names exist,
     # but don't demand every product be mentioned.
-    if names and not any(n.lower() in reply.lower() for n in names):
+    if names and (
+        not all(n.casefold() in reply.casefold() for n in names)
+        or ReplyComposer._contains_unverified_product_name(reply, language, names)
+    ):
         return False, "PRODUCT_NAME_MISMATCH"
 
     if language == "ar" and not re.search(r"[؀-ۿ]", reply):
@@ -216,6 +219,35 @@ class ReplyComposer:
         return bool(
             _UNRESOLVED_PLACEHOLDER.search(reply)
             or _UNSUPPORTED_SCRIPT.search(reply)
+        )
+
+    @staticmethod
+    def _contains_unverified_product_name(
+        reply: str,
+        language: str,
+        verified_names: list[str],
+    ) -> bool:
+        remaining_reply = reply
+        for name in sorted(verified_names, key=len, reverse=True):
+            remaining_reply = re.sub(
+                re.escape(name),
+                " ",
+                remaining_reply,
+                flags=re.IGNORECASE,
+            )
+
+        if language in {"en", "fr"} and re.search(r"[\u0600-\u06ff]", remaining_reply):
+            return True
+
+        candidates = re.findall(
+            r"\b(?:[A-Z][A-Za-z0-9]*|[a-z]+[A-Z][A-Za-z0-9]*)\b",
+            remaining_reply,
+        )
+        language_words = _LANGUAGE_WORDS.get(language, set())
+        return any(
+            candidate.casefold() not in language_words
+            and candidate.casefold() not in {"da", "dzd", "eur", "usd"}
+            for candidate in candidates
         )
 
     @staticmethod
@@ -643,9 +675,10 @@ class ReplyComposer:
             for product in products
             if isinstance(product.get("name"), str) and product["name"].strip()
         ]
-        # Allow natural replies: require at least one verified name if names exist,
-        # but don't demand every product be mentioned.
-        if names and not all(name.casefold() in reply.casefold() for name in names):
+        if names and (
+            not all(name.casefold() in reply.casefold() for name in names)
+            or ReplyComposer._contains_unverified_product_name(reply, language, names)
+        ):
             return False
 
         # Language check: be permissive with short replies and mixed language

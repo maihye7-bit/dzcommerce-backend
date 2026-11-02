@@ -129,6 +129,7 @@ class GetProductDetailsTool(BaseTool):
 
             variants_data = []
             variant_map: dict[str, str] = {}
+            available_variants = []
 
             for idx, (variant, stock) in enumerate(variants_rows, start=1):
                 adjustment = getattr(variant, "price_adjustment", 0) or 0
@@ -148,33 +149,65 @@ class GetProductDetailsTool(BaseTool):
                         "stock_available": int(stock) if stock is not None else None,
                     }
                 )
+                if stock is not None and stock > 0:
+                    available_variants.append(
+                        {
+                            "id": str(variant.id),
+                            "index": idx,
+                            "name": variant.name,
+                            "attributes": attributes,
+                            "final_price": final_price,
+                            "stock_available": int(stock),
+                        }
+                    )
 
+            auto_selected_variant = (
+                available_variants[0] if len(available_variants) == 1 else None
+            )
             # 5. Persist mapping into conversation metadata
             if conv is not None:
                 if not conv.metadata_json:
                     conv.metadata_json = {}
 
                 conv.metadata_json["variant_index_map"] = variant_map
+                conv.metadata_json["variant_index_map_product_id"] = str(product.id)
                 conv.metadata_json["last_product_id"] = str(product.id)
                 conv.metadata_json["last_product_name"] = product.name
+                if auto_selected_variant is not None:
+                    conv.metadata_json.update(
+                        selected_product_id=str(product.id),
+                        selected_product_name=product.name,
+                        selected_variant_id=auto_selected_variant["id"],
+                        selected_attributes=(
+                            auto_selected_variant["attributes"]
+                            if isinstance(auto_selected_variant["attributes"], dict)
+                            else {}
+                        ),
+                        candidate_product_ids=[],
+                        commerce_stage="VARIANT_SELECTED",
+                    )
 
                 db.flush()
 
+            result_data = {
+                "product": {
+                    "id": str(product.id),
+                    "name": product.name,
+                    "base_price": float(product.base_price),
+                },
+                "variants": variants_data,
+                "variant_id_map": variant_map,
+                "instruction": (
+                    "To create a draft, call create_order_draft using variant_index, "
+                    "not variant_id. Example: variant_index=1."
+                ),
+            }
+            if auto_selected_variant is not None:
+                result_data["auto_selected_variant"] = auto_selected_variant
+
             return ToolResult(
                 success=True,
-                data={
-                    "product": {
-                        "id": str(product.id),
-                        "name": product.name,
-                        "base_price": float(product.base_price),
-                    },
-                    "variants": variants_data,
-                    "variant_id_map": variant_map,
-                    "instruction": (
-                        "To create a draft, call create_order_draft using variant_index, "
-                        "not variant_id. Example: variant_index=1."
-                    ),
-                },
+                data=result_data,
             )
 
         except Exception as e:

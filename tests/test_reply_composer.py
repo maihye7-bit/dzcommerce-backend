@@ -138,6 +138,21 @@ async def test_composer_rejects_unverified_or_invalid_claims(reply):
     assert result is None
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I found Samsung Galaxy A54 and iPhone. Would you like details?",
+        "I found Samsung Galaxy A54 and آيفون. Would you like details?",
+    ],
+)
+def test_composer_diagnoses_unverified_product_names(reply):
+    assert ReplyComposer.diagnose_reply(
+        reply,
+        "en",
+        [{"name": "Samsung Galaxy A54", "price": "75,000"}],
+    ) == (False, "PRODUCT_NAME_MISMATCH")
+
+
 @pytest.mark.asyncio
 async def test_composer_requires_all_returned_products_to_be_named():
     provider = FixedProvider(
@@ -156,6 +171,20 @@ async def test_composer_requires_all_returned_products_to_be_named():
     )
 
     assert result is None
+
+
+def test_composer_diagnostic_reports_missing_verified_product_name():
+    products = [
+        {"name": "Samsung Galaxy A54", "price": "75,000"},
+        {"name": "iPhone", "price": "100,000"},
+    ]
+    reply = "I found Samsung Galaxy A54. Which one do you want?"
+
+    assert not ReplyComposer._is_safe_reply(reply, "en", products)
+    assert ReplyComposer.diagnose_reply(reply, "en", products) == (
+        False,
+        "PRODUCT_NAME_MISMATCH",
+    )
 
 
 @pytest.mark.asyncio
