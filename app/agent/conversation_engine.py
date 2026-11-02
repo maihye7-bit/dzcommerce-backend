@@ -37,7 +37,9 @@ from app.models.conversation import (
     Message,
     MessageRole,
 )
+from app.models.customer import Customer
 from app.models.order import Order, OrderStatus
+from app.models.store import Store
 from app.models.inventory import InventoryItem
 from app.models.product import Product, ProductVariant
 from app.services import usage_service
@@ -1414,6 +1416,13 @@ class ConversationEngine:
                 and value == "ORDER_CONFIRMED"
             ):
                 continue
+            if (
+                tool_name == "create_order_draft"
+                and not tool_result.success
+                and key == "commerce_stage"
+                and value == "DRAFT_PENDING"
+            ):
+                continue
             if key not in resolver_managed_keys:
                 metadata[key] = value
         conversation.metadata_json = metadata
@@ -1733,17 +1742,45 @@ class ConversationEngine:
         else:
             safe_arguments = {}
 
-        tool_result = await self.registry.aexecute(
-            tool_name=safe_tool_name,
-            arguments=safe_arguments,
-            context={
-                "db": db,
-                "store_id": store_id,
-                "customer_id": customer_id,
-                "conversation_id": conversation.id,
-                "channel": channel,
-            },
-        )
+        tool_context = {
+            "db": db,
+            "store_id": store_id,
+            "customer_id": customer_id,
+            "conversation_id": conversation.id,
+            "channel": channel,
+        }
+        if safe_tool_name in {
+            "create_order_draft",
+            "update_order_draft",
+            "confirm_order",
+        }:
+            try:
+                with db.begin_nested():
+                    tool_result = await self.registry.aexecute(
+                        tool_name=safe_tool_name,
+                        arguments=safe_arguments,
+                        context=tool_context,
+                    )
+            except Exception:
+                logger.exception(
+                    "Agent mutating commerce tool failed; its savepoint was rolled back "
+                    "(tool=%s)",
+                    safe_tool_name,
+                )
+                tool_result = ToolResult(
+                    success=False,
+                    error=(
+                        "The commerce operation failed and was rolled back. "
+                        "The existing order state is unchanged."
+                    ),
+                    error_code="TOOL_ERROR",
+                )
+        else:
+            tool_result = await self.registry.aexecute(
+                tool_name=safe_tool_name,
+                arguments=safe_arguments,
+                context=tool_context,
+            )
         if (
             tool_name == "get_product_details"
             and tool_result.success
@@ -1755,7 +1792,11 @@ class ConversationEngine:
                 product_id=safe_arguments.get("product_id"),
                 tool_result_data=tool_result.data,
             )
-            self._apply_auto_selected_variant(decision, tool_result)
+            self._apply_auto_selected_variant(
+                decision,
+                tool_result,
+                conversation=conversation,
+            )
         self._persist_agent_context_updates(
             conversation,
             decision,
@@ -2039,6 +2080,65 @@ class ConversationEngine:
             has_confirmed_order=has_confirmed_order,
         )
         local_message_nlu = self._heuristic_nlu(user_message, current_state)
+        active_draft = current_state.get("active_draft_json")
+        delivery_info_pending = bool(
+            current_state.get("commerce_stage") == "DRAFT_PENDING"
+            and current_state.get("last_question_type") == "CUSTOMER_DELIVERY_INFO"
+            and isinstance(active_draft, dict)
+            and isinstance(active_draft.get("items"), list)
+            and active_draft.get("items")
+        )
+        delivery_info_capture_turn = False
+        delivery_info_question_type = None
+        if delivery_info_pending:
+            served_wilayas = db.query(Store.served_wilayas).filter(
+                Store.id == store_id
+            ).scalar()
+            received_phone, received_wilaya = self._extract_delivery_details(
+                user_message,
+                served_wilayas,
+            )
+            delivery_info_capture_turn = bool(
+                received_phone
+                or received_wilaya
+                or re.search(r"\d{6,}|\b(?:ال)?ولاية\b", user_message or "")
+            )
+            if delivery_info_capture_turn:
+                updated_draft = dict(active_draft)
+                shipping_info = dict(updated_draft.get("shipping_info") or {})
+                customer = db.query(Customer).filter(
+                    Customer.id == customer_id,
+                    Customer.store_id == store_id,
+                ).one_or_none()
+                if received_phone:
+                    shipping_info["phone"] = received_phone
+                    if customer is not None:
+                        customer.phone = received_phone
+                if received_wilaya:
+                    shipping_info["wilaya"] = received_wilaya
+                updated_draft["shipping_info"] = shipping_info
+                conversation.active_draft_json = updated_draft
+
+                phone = shipping_info.get("phone") or (
+                    customer.phone if customer is not None else None
+                )
+                wilaya = shipping_info.get("wilaya")
+                delivery_info_reply, delivery_info_question_type = (
+                    self._draft_next_step_response(
+                        updated_draft,
+                        phone=phone,
+                        wilaya=wilaya,
+                        language=local_message_nlu.get("language", "ar"),
+                    )
+                )
+                local_message_nlu = {
+                    **local_message_nlu,
+                    "intent": "unknown",
+                    "intent_guess": "unknown",
+                    "product_mention": None,
+                    "response_hint": delivery_info_reply,
+                }
+                current_state["_bypass_conversational"] = True
         turn_plan = self._extract_turn_plan(user_message, current_state)
         if turn_plan["selection"] is not None:
             local_message_nlu = {
@@ -2087,6 +2187,7 @@ class ConversationEngine:
             and current_state.get("last_question_type") == "ORDER_CONFIRMATION"
             and local_message_nlu.get("intent") == "order_confirm"
             and local_message_nlu.get("confirmation_phrase") is True
+            and self._is_required_order_confirmation(user_message)
         )
         pending_purchase_acceptance = bool(
             not has_confirmed_order
@@ -2214,6 +2315,7 @@ class ConversationEngine:
                 or pending_purchase_acceptance
                 or pending_purchase_request
                 or idempotent_order_request
+                or delivery_info_capture_turn
                 or turn_plan["has_actions"]
             )
             else None
@@ -2226,6 +2328,7 @@ class ConversationEngine:
             and not pending_purchase_acceptance
             and not pending_purchase_request
             and not idempotent_order_request
+            and not delivery_info_capture_turn
             #
             # --- ConversationClassifier bypass ---
             # Allow non-commercial messages to bypass the agent loop so the
@@ -2308,15 +2411,48 @@ class ConversationEngine:
             or pending_purchase_acceptance
             or pending_purchase_request
             or idempotent_order_request
+            or delivery_info_capture_turn
         ) and fallback_nlu is None:
             fallback_nlu = local_message_nlu
 
+        agent_draft_created = False
+        agent_draft_question_type: str | None = None
         if agent_loop_accepted:
             nlu_output = agent_loop_result["nlu_output"]
             decision = agent_loop_result["decision"]
             tool_result = agent_loop_result["tool_result"]
             tool_name = agent_loop_result["tool_name"]
             final_response_content = agent_loop_result["response"]
+            if (
+                tool_name == "create_order_draft"
+                and tool_result is not None
+                and tool_result.success
+                and isinstance(conversation.active_draft_json, dict)
+            ):
+                draft = conversation.active_draft_json
+                customer = db.query(Customer).filter(
+                    Customer.id == customer_id,
+                    Customer.store_id == store_id,
+                ).one_or_none()
+                shipping_info = dict(draft.get("shipping_info") or {})
+                phone = shipping_info.get("phone") or (
+                    customer.phone if customer is not None else None
+                )
+                wilaya = shipping_info.get("wilaya")
+                if phone and not shipping_info.get("phone"):
+                    shipping_info["phone"] = phone
+                    draft["shipping_info"] = shipping_info
+                    conversation.active_draft_json = draft
+                (
+                    final_response_content,
+                    agent_draft_question_type,
+                ) = self._draft_next_step_response(
+                    draft,
+                    phone=phone,
+                    wilaya=wilaya,
+                    language=nlu_output.get("language", "ar"),
+                )
+                agent_draft_created = True
             if (
                 tool_name == "get_product_details"
                 and tool_result is not None
@@ -2485,6 +2621,8 @@ class ConversationEngine:
             final_response_content = ""
             tool_result = None
             tool_name = None
+        service_call_succeeded = False
+        service_call_question_type: str | None = None
         
         if agent_loop_accepted:
             pass
@@ -2503,10 +2641,11 @@ class ConversationEngine:
                 "conversation_id": conv_id,
                 "channel": channel,
             }
-            if (
-                tool_name == "update_order_draft"
-                and turn_plan["selection"] is not None
-            ):
+            if tool_name in {
+                "create_order_draft",
+                "update_order_draft",
+                "confirm_order",
+            }:
                 try:
                     with db.begin_nested():
                         tool_result = await self.registry.aexecute(
@@ -2516,11 +2655,16 @@ class ConversationEngine:
                         )
                 except Exception:
                     logger.exception(
-                        "Draft change failed after a variant was selected"
+                        "Mutating commerce tool failed; its savepoint was rolled back "
+                        "(tool=%s)",
+                        tool_name,
                     )
                     tool_result = ToolResult(
                         success=False,
-                        error="The draft could not be updated; the selected option is saved.",
+                        error=(
+                            "The commerce operation failed and was rolled back. "
+                            "The existing order state is unchanged."
+                        ),
                         error_code="TOOL_ERROR",
                     )
             else:
@@ -2541,7 +2685,11 @@ class ConversationEngine:
                     product_id=tool_args.get("product_id"),
                     tool_result_data=tool_result.data,
                 )
-                self._apply_auto_selected_variant(decision, tool_result)
+                self._apply_auto_selected_variant(
+                    decision,
+                    tool_result,
+                    conversation=conversation,
+                )
             
             # Generate natural language response from tool result
             if tool_result.success:
@@ -2632,6 +2780,40 @@ class ConversationEngine:
                                 "Your selection is saved, but the order draft "
                                 "could not be updated. The draft is unchanged."
                             )
+                    elif tool_name == "get_product_details":
+                        language = nlu_output.get("language", "ar")
+                        if current_state.get("selected_variant_id"):
+                            final_response_content = (
+                                "Votre option reste sélectionnée, mais ses détails "
+                                "ne sont pas disponibles pour le moment. Réessayez "
+                                "sans recommencer votre choix."
+                                if language == "fr"
+                                else "Your selected option is still saved, but its "
+                                "details are temporarily unavailable. Please retry "
+                                "without selecting the product again."
+                                if language == "en"
+                                else "الخيار الذي حددته ما زال محفوظًا، لكن تعذر "
+                                "جلب تفاصيله الآن. حاول مجددًا دون إعادة اختيار المنتج."
+                            )
+                        elif current_state.get("selected_product_id"):
+                            final_response_content = (
+                                "Le produit sélectionné est conservé, mais ses "
+                                "options ne sont pas disponibles pour le moment. "
+                                "Réessayez."
+                                if language == "fr"
+                                else "Your selected product is still saved, but "
+                                "its options are temporarily unavailable. Please retry."
+                                if language == "en"
+                                else "المنتج الذي حددته ما زال محفوظًا، لكن تعذر "
+                                "جلب خياراته الآن. حاول مجددًا."
+                            )
+                        else:
+                            final_response_content = self._tool_error_response(
+                                tool_name,
+                                error_code,
+                                tool_args,
+                                language,
+                            )
                     else:
                         final_response_content = self._tool_error_response(
                             tool_name,
@@ -2644,17 +2826,42 @@ class ConversationEngine:
                         and error_code == "NO_RESULTS"
                         and not agent_loop_fallback
                     ):
-                        catalog_result, composed_catalog_reply = (
-                            await self._try_catalog_recovery(
-                                user_message=user_message,
-                                language=nlu_output.get("language", "ar"),
-                                db=db,
-                                store_id=store_id,
-                                conversation=conversation,
-                                customer_id=customer_id,
-                                channel=channel,
+                        catalog_result = None
+                        composed_catalog_reply = None
+                        if self._is_catalog_browse_request(user_message):
+                            catalog_tool = self.registry.get(
+                                "list_catalog_products"
                             )
-                        )
+                            if catalog_tool is not None:
+                                try:
+                                    catalog_result = await self.registry.aexecute(
+                                        tool_name="list_catalog_products",
+                                        arguments={},
+                                        context={
+                                            "db": db,
+                                            "store_id": store_id,
+                                            "customer_id": customer_id,
+                                            "conversation_id": conv_id,
+                                            "channel": channel,
+                                        },
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Catalog browse recovery failed after "
+                                        "a category-style query returned no matches"
+                                    )
+                        if catalog_result is None or not catalog_result.success:
+                            catalog_result, composed_catalog_reply = (
+                                await self._try_catalog_recovery(
+                                    user_message=user_message,
+                                    language=nlu_output.get("language", "ar"),
+                                    db=db,
+                                    store_id=store_id,
+                                    conversation=conversation,
+                                    customer_id=customer_id,
+                                    channel=channel,
+                                )
+                            )
                         if catalog_result is not None:
                             tool_name = "list_catalog_products"
                             tool_result = catalog_result
@@ -2716,13 +2923,18 @@ class ConversationEngine:
                         decision.resolved_entities.get("variant_id") or ""
                     ),
                 )
-            final_response_content = await self._handle_service_call(
+            (
+                final_response_content,
+                service_call_succeeded,
+                service_call_question_type,
+            ) = await self._handle_service_call(
                 service_name,
                 decision.resolved_entities,
                 db,
                 conv_id,
                 nlu_output.get("language", "ar"),
                 user_message=user_message,
+                intent=nlu_output.get("intent", "unknown"),
             )
 
         elif decision.allowed_action == "RESPOND:text_only":
@@ -2818,7 +3030,11 @@ class ConversationEngine:
             final_response_content = "\n".join(
                 part for part in response_parts if part
             )
-        elif nlu_output.get("intent") == "unknown" and not agent_loop_accepted:
+        elif (
+            nlu_output.get("intent") == "unknown"
+            and not agent_loop_accepted
+            and not current_state.get("_bypass_conversational")
+        ):
             final_response_content = (
                 self._contextual_clarification(
                     {
@@ -2937,6 +3153,13 @@ class ConversationEngine:
                     and value == "ORDER_CONFIRMED"
                 ):
                     continue
+                if (
+                    decision.allowed_action == "CALL_SERVICE:create_draft"
+                    and not service_call_succeeded
+                    and key == "commerce_stage"
+                    and value == "DRAFT_PENDING"
+                ):
+                    continue
                 if key not in tool_managed_search_state:
                     conversation.metadata_json[key] = value
             
@@ -2950,6 +3173,20 @@ class ConversationEngine:
             tool_result,
             final_response_content,
         )
+        if agent_draft_created:
+            next_question_type = agent_draft_question_type
+        elif delivery_info_capture_turn:
+            next_question_type = delivery_info_question_type
+        elif (
+            decision.allowed_action == "CALL_SERVICE:create_draft"
+            and service_call_succeeded
+        ):
+            next_question_type = service_call_question_type
+        elif (
+            decision.allowed_action == "CALL_SERVICE:create_draft"
+            and not service_call_succeeded
+        ):
+            next_question_type = "ORDER_CREATE_OFFER"
         read_only_draft_interruption = (
             current_state.get("commerce_stage") == "DRAFT_PENDING"
             and tool_name
@@ -2964,6 +3201,8 @@ class ConversationEngine:
             nlu_output.get("intent") != "unknown"
             and not read_only_draft_interruption
             and not read_only_information_turn
+        ) or delivery_info_capture_turn or agent_draft_created or (
+            decision.allowed_action == "CALL_SERVICE:create_draft"
         ):
             conversation.metadata_json["last_question_type"] = next_question_type
 
@@ -3523,9 +3762,148 @@ class ConversationEngine:
         return False
 
     @staticmethod
+    def _is_required_order_confirmation(message: str) -> bool:
+        normalized = unicodedata.normalize("NFKD", (message or "").casefold())
+        normalized = "".join(
+            character
+            for character in normalized
+            if not unicodedata.combining(character)
+        )
+        normalized = normalized.translate(
+            str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا"})
+        )
+        normalized = re.sub(r"[^\w\s]", " ", normalized)
+        return " ".join(normalized.split()) == "اكد الطلب"
+
+    @staticmethod
+    def _extract_delivery_details(
+        message: str,
+        served_wilayas: str | None,
+    ) -> tuple[str | None, str | None]:
+        phone_match = re.search(
+            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|"
+            r"0[567](?:[\s.-]?\d){8})(?!\d)",
+            message or "",
+        )
+        phone = None
+        remainder = message or ""
+        if phone_match:
+            digits = re.sub(r"\D", "", phone_match.group())
+            phone = f"0{digits[3:]}" if digits.startswith("213") else digits
+            remainder = remainder[:phone_match.start()] + " " + remainder[phone_match.end():]
+
+        normalized_remainder = normalize_product_search_text(remainder)
+        configured_wilayas = [
+            item.strip()
+            for item in re.split(r"[,،;؛|/]+", served_wilayas or "")
+            if item.strip()
+        ]
+        wilaya = next(
+            (
+                item
+                for item in configured_wilayas
+                if normalize_product_search_text(item)
+                and normalize_product_search_text(item)
+                in normalized_remainder
+            ),
+            None,
+        )
+        if wilaya is None:
+            explicit_wilaya = re.search(
+                r"(?:ال)?ولاية\s*[:：،,-]?\s*"
+                r"([\u0600-\u06ffA-Za-z][\u0600-\u06ffA-Za-z\s'-]{1,39})",
+                remainder,
+            )
+            if explicit_wilaya:
+                wilaya = explicit_wilaya.group(1).strip(" ،,؛;:-")
+
+        return phone, wilaya
+
+    @classmethod
+    def _draft_next_step_response(
+        cls,
+        draft: dict[str, Any],
+        *,
+        phone: str | None,
+        wilaya: str | None,
+        language: str,
+    ) -> tuple[str, str]:
+        missing = [
+            field
+            for field, value in (("phone", phone), ("wilaya", wilaya))
+            if not value
+        ]
+        items = draft.get("items")
+        rendered_items = []
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                product_name = str(item.get("product_name") or "المنتج")
+                variant_name = str(item.get("variant_name") or "")
+                quantity = item.get("quantity", 1)
+                line = f"{product_name} — {variant_name} × {quantity}".strip(" —")
+                rendered_items.append(line)
+        total = cls._format_verified_price(draft.get("total_price")) or str(
+            draft.get("total_price", "")
+        )
+        summary = "\n".join(rendered_items)
+
+        if language == "fr":
+            if missing:
+                fields = " et ".join(
+                    "votre numéro de téléphone" if field == "phone" else "votre wilaya"
+                    for field in missing
+                )
+                return (
+                    f"Brouillon enregistré :\n{summary}\nTotal : {total} DZD. "
+                    f"Envoyez {fields} pour continuer.",
+                    "CUSTOMER_DELIVERY_INFO",
+                )
+            return (
+                f"Récapitulatif de la commande :\n{summary}\nTotal : {total} DZD. "
+                "Si tout est correct, écrivez « أكد الطلب » pour confirmer.",
+                "ORDER_CONFIRMATION",
+            )
+        if language == "en":
+            if missing:
+                fields = " and ".join(
+                    "your phone number" if field == "phone" else "your wilaya"
+                    for field in missing
+                )
+                return (
+                    f"Draft saved:\n{summary}\nTotal: {total} DZD. "
+                    f"Send {fields} to continue.",
+                    "CUSTOMER_DELIVERY_INFO",
+                )
+            return (
+                f"Order summary:\n{summary}\nTotal: {total} DZD. "
+                "If everything is correct, write « أكد الطلب » to confirm.",
+                "ORDER_CONFIRMATION",
+            )
+
+        if missing:
+            fields = " و".join(
+                "رقم هاتفك" if field == "phone" else "الولاية"
+                for field in missing
+            )
+            return (
+                f"تم حفظ مسودة الطلب:\n{summary}\nالمجموع: {total} دج. "
+                f"أرسل {fields} لمتابعة الطلب.",
+                "CUSTOMER_DELIVERY_INFO",
+            )
+        return (
+            f"ملخص الطلب:\n{summary}\nالمجموع: {total} دج. "
+            "إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.",
+            "ORDER_CONFIRMATION",
+        )
+
     def _apply_auto_selected_variant(
+        self,
         decision: ResolutionResult,
         tool_result: ToolResult,
+        *,
+        conversation: Conversation,
     ) -> None:
         if not isinstance(tool_result.data, dict):
             return
@@ -3534,6 +3912,19 @@ class ConversationEngine:
         if not isinstance(selected, dict) or not isinstance(product, dict):
             return
         product_id = product.get("id")
+        if decision.resolved_entities.get("suppress_auto_selection") is True:
+            tool_result.data.pop("auto_selected_variant", None)
+            if isinstance(product_id, str):
+                metadata = dict(conversation.metadata_json or {})
+                metadata.update(
+                    selected_product_id=product_id,
+                    selected_product_name=product.get("name"),
+                    selected_variant_id=None,
+                    selected_attributes={},
+                    commerce_stage="PRODUCT_SELECTED",
+                )
+                conversation.metadata_json = metadata
+            return
         variant_id = selected.get("id")
         if not isinstance(product_id, str) or not isinstance(variant_id, str):
             return
@@ -3610,7 +4001,7 @@ class ConversationEngine:
             has_active_draft
             and stage == "DRAFT_PENDING"
             and last_question_type == "ORDER_CONFIRMATION"
-            and cls._is_order_confirmation_reply(user_message)
+            and cls._is_required_order_confirmation(user_message)
         ):
             output.update(
                 intent="order_confirm",
@@ -3630,7 +4021,7 @@ class ConversationEngine:
                 and has_active_draft
                 and stage == "DRAFT_PENDING"
             ):
-                intent = "order_confirm"
+                intent = "unknown"
             elif last_question_type == "PRODUCT_SEARCH_OFFER":
                 intent = "product_search"
             elif (
@@ -3686,7 +4077,7 @@ class ConversationEngine:
                 not has_active_draft
                 or stage != "DRAFT_PENDING"
                 or last_question_type != "ORDER_CONFIRMATION"
-                or not cls._is_order_confirmation_reply(user_message)
+                or not cls._is_required_order_confirmation(user_message)
             ):
                 output.update(
                     intent="unknown",
@@ -4513,7 +4904,7 @@ Rules:
         catalog_question = bool(
             re.search(
                 r"(?:وش|واش|ماذا|ما|شنو|شنو)\s+(?:عندكم|لديكم|يوجد)?\s*"
-                r"(?:من\s+)?(?:ال)?منتج(?:ات)?|"
+                r"(?:من\s+)?(?:ال)?(?:م{0,2}نتج(?:ات)?|منتوجات)|"
                 r"(?:عندكم|لديكم)\s+(?:ال)?منتجات|"
                 r"(?:عندكم|لديكم)\s+(?:شنو|شنو)\s*(?:[\?\؟]|$)|"
                 r"(?:وش|واش|شنو|شنو|ما)\s+(?:عندكم|لديكم)\s*(?:[\?\؟]|$)|"
@@ -4540,15 +4931,25 @@ Rules:
                 normalized,
             )
         )
+        specific_display_search = bool(
+            product_mention
+            and re.search(
+                r"(?:وريني|ورينيلي|أريني|اريني|اعرضلي|شوفلي|"
+                r"show\s+me|display)\s+",
+                normalized,
+            )
+        )
 
         if delivery_request and asks_price:
             return "unknown", 0.95
-        if catalog_question or self._is_generic_category_browse(normalized):
+        if catalog_question or self._is_catalog_browse_request(normalized):
             return "catalog_browse", 0.95
         if purchase_construction:
             if attributes and selected_product_id:
                 return "variant_selection", 0.95
             return "order_create", 0.95
+        if specific_display_search:
+            return "product_search", 0.95
         if asks_price:
             if product_mention:
                 price_subject = product_mention.casefold()
@@ -4695,6 +5096,7 @@ Rules:
         mention = re.sub(removable, " ", mention)
         arabic_removable = (
             "السلام عليكم", "مرحبا", "عندكم", "لديكم", "توجد", "عندي",
+            "ورينيلي", "وريني", "أريني", "اريني", "اعرضلي", "شوفلي",
             "المنتج", "بشحال", "بقداه", "السومة", "السعر", "واحدة",
             "نكوموندي", "نكومندي", "كوماندة", "كوموند", "كوموندي",
             "نبغي", "ندير", "نطلب", "سوداء", "سودا", "بيضاء", "بيضا",
@@ -4852,7 +5254,7 @@ Rules:
         if self._is_bare_affirmative(msg):
             intent = "order_confirm"
             return {"intent": intent, "intent_guess": intent, "product_mention": None, "attributes": {}, "quantity": None, "confirmation_phrase": True, "language": language, "confidence": 0.9}
-        elif self._is_generic_category_browse(msg):
+        elif self._is_catalog_browse_request(msg):
             intent, confidence = "catalog_browse", 0.95
         else:
             intent, confidence = self._understand_intent_from_context(
@@ -4936,6 +5338,21 @@ Rules:
             "لو",
         }
         return all(token in categories or token in request_words for token in tokens)
+
+    @staticmethod
+    def _is_catalog_browse_request(message: str) -> bool:
+        normalized = normalize_product_search_text(
+            re.sub(r"[^\w\s]", " ", message)
+        )
+        return bool(
+            ConversationEngine._is_generic_category_browse(message)
+            or re.search(
+                r"(?:نشوف|نحب\s+نشوف|حاب\s+نشوف|وريني|اريني|أريني)\s+"
+                r"(?:وش|واش)\s+(?:من\s+)?(?:م{0,2}نتج(?:ات)?|منتوجات)|"
+                r"(?:وش|واش)\s+(?:من\s+)?(?:م{0,2}نتج(?:ات)?|منتوجات)",
+                normalized,
+            )
+        )
 
     @staticmethod
     def _extract_turn_plan(
@@ -5433,6 +5850,7 @@ Rules:
                 formatted_variant_price = self._format_verified_price(
                     auto_selected_variant.get("final_price")
                 )
+                formatted_base_price = self._format_verified_price(base_price)
                 details = (
                     f"{title} — {variant_name}"
                     if isinstance(variant_name, str) and variant_name.strip()
@@ -5444,15 +5862,41 @@ Rules:
                         if is_french or is_english
                         else f" — {formatted_variant_price} دج"
                     )
+                base_price_note = (
+                    (
+                        f" Base price: {formatted_base_price} DZD."
+                        if is_english
+                        else f" Prix de base : {formatted_base_price} DZD."
+                        if is_french
+                        else f" السعر الأساسي: {formatted_base_price} دج."
+                    )
+                    if formatted_base_price is not None
+                    else ""
+                )
+                selected_stock = auto_selected_variant.get("stock_available")
+                stock_note = (
+                    (
+                        f" Stock: {selected_stock}."
+                        if is_english
+                        else f" Stock : {selected_stock}."
+                        if is_french
+                        else f" المتوفر: {selected_stock}."
+                    )
+                    if isinstance(selected_stock, int)
+                    and not isinstance(selected_stock, bool)
+                    else ""
+                )
                 return (
                     f"The only available option was selected automatically: "
-                    f"{details}. Say “place the order” to prepare the draft."
+                    f"{details}.{base_price_note}{stock_note} "
+                    "Say “place the order” to prepare the draft."
                     if is_english
                     else f"La seule option disponible a été sélectionnée automatiquement : "
-                    f"{details}. Dites « commander » pour préparer le brouillon."
+                    f"{details}.{base_price_note}{stock_note} "
+                    "Dites « commander » pour préparer le brouillon."
                     if is_french
                     else f"تم اختيار الخيار الوحيد المتاح تلقائيًا للمنتج "
-                    f"{details}. "
+                    f"{details}.{base_price_note}{stock_note} "
                     "قل «دير طلب» لإعداد مسودة الطلب."
                 )
             asks_price = intent == "product_details"
@@ -5638,11 +6082,13 @@ Rules:
         conv_id: uuid.UUID,
         language: str = "ar",
         user_message: str = "",
-    ) -> str:
+        intent: str = "unknown",
+    ) -> tuple[str, bool, str | None]:
         """
         Executes approved backend service calls using resolver-validated entities.
         """
         is_french = language == "fr"
+        is_english = language == "en"
         if service_name == "create_draft":
             from app.services.exceptions import NotFoundError, ValidationError
             from app.services.order_draft_service import save_draft
@@ -5660,20 +6106,26 @@ Rules:
                 return (
                     "Impossible de préparer la commande : le produit ou l’option est invalide."
                     if is_french
-                    else "تعذر إنشاء المسودة: بيانات المنتج أو الخيار غير صالحة."
+                    else "تعذر إنشاء المسودة: بيانات المنتج أو الخيار غير صالحة.",
+                    False,
+                    None,
                 )
 
             if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
                 return (
                     "Impossible de préparer la commande : la quantité est invalide."
                     if is_french
-                    else "تعذر إنشاء المسودة: الكمية غير صالحة."
+                    else "تعذر إنشاء المسودة: الكمية غير صالحة.",
+                    False,
+                    None,
                 )
             if unit_price is None or total_price is None:
                 return (
                     "Impossible de préparer la commande : les informations de prix sont indisponibles."
                     if is_french
-                    else "تعذر إنشاء المسودة: بيانات السعر غير مكتملة."
+                    else "تعذر إنشاء المسودة: بيانات السعر غير مكتملة.",
+                    False,
+                    None,
                 )
 
             conversation = db.query(Conversation).filter(
@@ -5683,7 +6135,9 @@ Rules:
                 return (
                     "Impossible de préparer la commande pour cette conversation."
                     if is_french
-                    else "تعذر إنشاء المسودة: المحادثة غير موجودة."
+                    else "تعذر إنشاء المسودة: المحادثة غير موجودة.",
+                    False,
+                    None,
                 )
 
             variant = (
@@ -5701,7 +6155,9 @@ Rules:
                 return (
                     "Ce produit ou cette option n’est pas disponible dans cette boutique."
                     if is_french
-                    else "تعذر إنشاء المسودة: المنتج أو الخيار غير متاح لهذا المتجر."
+                    else "تعذر إنشاء المسودة: المنتج أو الخيار غير متاح لهذا المتجر.",
+                    False,
+                    None,
                 )
 
             metadata = dict(conversation.metadata_json or {})
@@ -5738,26 +6194,50 @@ Rules:
                     )
             except (NotFoundError, ValidationError) as exc:
                 logger.info("Draft creation was rejected: %s", exc)
-                error_text = (
-                    f"تعذر إنشاء مسودة الطلب بسبب مشكلة في الخيار أو الكمية: {exc} "
-                    "تحقق من الاختيار والكمية ثم حاول مجدداً."
+                return (
+                    "Votre sélection est conservée, mais le brouillon n’a pas "
+                    "été enregistré. Vérifiez l’option ou la quantité puis réessayez."
+                    if is_french
+                    else "اختيارك محفوظ، لكن لم تُحفظ مسودة الطلب. تحقق من الخيار "
+                    "أو الكمية ثم أعد المحاولة.",
+                    False,
+                    None,
                 )
-                return await self._generate_corrective_tool_error(
-                    user_message=user_message,
-                    error_text=error_text,
-                    language=language,
+            except Exception:
+                logger.exception("Draft creation failed unexpectedly")
+                return (
+                    "Votre sélection est conservée, mais le brouillon n’a pas "
+                    "pu être enregistré. Vous pouvez réessayer."
+                    if is_french
+                    else "اختيارك محفوظ، لكن تعذر حفظ مسودة الطلب الآن. يمكنك "
+                    "إعادة المحاولة.",
+                    False,
+                    None,
                 )
 
             metadata = dict(conversation.metadata_json or {})
             metadata["commerce_stage"] = "DRAFT_PENDING"
             conversation.metadata_json = metadata
-
-            if is_french:
-                return (
-                    f"Votre commande provisoire est enregistrée. Total : "
-                    f"{draft['total_price']} DZD. Dites « confirmer » pour continuer."
-                )
-            return f"تم حفظ مسودة الطلب. المجموع: {draft['total_price']} دج. قل 'أكد' للمتابعة."
+            customer = db.query(Customer).filter(
+                Customer.id == conversation.customer_id,
+                Customer.store_id == conversation.store_id,
+            ).one_or_none()
+            shipping_info = dict(draft.get("shipping_info") or {})
+            phone = shipping_info.get("phone") or (
+                customer.phone if customer is not None else None
+            )
+            wilaya = shipping_info.get("wilaya")
+            if phone and not shipping_info.get("phone"):
+                shipping_info["phone"] = phone
+                draft["shipping_info"] = shipping_info
+                conversation.active_draft_json = draft
+            response, question_type = self._draft_next_step_response(
+                draft,
+                phone=phone,
+                wilaya=wilaya,
+                language=language,
+            )
+            return response, True, question_type
 
         elif service_name == "resolve_variant":
             price = data.get("price")
@@ -5781,6 +6261,60 @@ Rules:
                 else None
             )
             variant_name = variant.name if variant is not None else None
+            if intent == "product_details" and variant is not None:
+                product = (
+                    db.query(Product)
+                    .filter(
+                        Product.id == variant.product_id,
+                        Product.store_id == conversation_store_id,
+                        Product.is_active.is_(True),
+                    )
+                    .one_or_none()
+                )
+                if product is not None:
+                    product_price = self._format_verified_price(
+                        product.base_price
+                    )
+                    option_price = self._format_verified_price(price)
+                    if is_french:
+                        response = (
+                            f"Prix de {product.name} : {product_price} DZD."
+                            if product_price is not None
+                            else f"{product.name}."
+                        )
+                        if variant_name and option_price is not None:
+                            response += (
+                                f" Prix de l’option {variant_name} : "
+                                f"{option_price} DZD."
+                            )
+                        if isinstance(stock, int) and not isinstance(stock, bool):
+                            response += f" Quantité disponible : {stock}."
+                    elif is_english:
+                        response = (
+                            f"Price for {product.name}: {product_price} DZD."
+                            if product_price is not None
+                            else f"{product.name}."
+                        )
+                        if variant_name and option_price is not None:
+                            response += (
+                                f" Price for option {variant_name}: "
+                                f"{option_price} DZD."
+                            )
+                        if isinstance(stock, int) and not isinstance(stock, bool):
+                            response += f" Available quantity: {stock}."
+                    else:
+                        response = (
+                            f"سعر {product.name}: {product_price} دج."
+                            if product_price is not None
+                            else f"{product.name}."
+                        )
+                        if variant_name and option_price is not None:
+                            response += (
+                                f" سعر خيار {variant_name}: {option_price} دج."
+                            )
+                        if isinstance(stock, int) and not isinstance(stock, bool):
+                            response += f" الكمية المتوفرة: {stock}."
+                    return response, True, None
 
             if is_french:
                 stock_text = (
@@ -5797,7 +6331,9 @@ Rules:
                     +
                     f"Prix : {price} DZD\n"
                     f"{stock_text}\n"
-                    "Dites « commander » pour l’ajouter à votre panier."
+                    "Dites « commander » pour l’ajouter à votre panier.",
+                    True,
+                    None,
                 )
             stock_text = (
                 "يجب التحقق من المخزون"
@@ -5813,13 +6349,17 @@ Rules:
                 +
                 f"السعر: {price} دج\n"
                 f"{stock_text}\n"
-                "قل 'ديرلي طلب' لإضافة المنتج للسلة."
+                "قل 'ديرلي طلب' لإضافة المنتج للسلة.",
+                True,
+                None,
             )
 
         return (
             "Cette action n’est pas disponible pour le moment."
             if is_french
-            else "هذا الإجراء غير متاح حاليًا."
+            else "هذا الإجراء غير متاح حاليًا.",
+            False,
+            None,
         )
 
     @staticmethod

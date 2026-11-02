@@ -99,8 +99,12 @@ class CreateOrderDraftTool(BaseTool):
                             for i in draft_data["items"]
                         ],
                     },
-                    "instruction": "Ask the customer to confirm with 'أكد'.",
-                },
+                        "instruction": (
+                            "Do not confirm the final order. The conversation engine "
+                            "collects missing phone and wilaya details, then asks the "
+                            "customer to write the exact phrase 'أكد الطلب'."
+                        ),
+                    },
             )
         except ValidationError as exc:
             message = str(exc)

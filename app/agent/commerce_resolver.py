@@ -350,7 +350,10 @@ class CommerceResolver:
                     if variant is None:
                         return ResolutionResult(
                             allowed_action=AllowedAction.GET_PRODUCT_DETAILS.value,
-                            resolved_entities={"product_id": str(prod_uuid)},
+                            resolved_entities={
+                                "product_id": str(prod_uuid),
+                                "suppress_auto_selection": True,
+                            },
                             context_updates=base_context,
                             response_hint=text(
                                 "قائمة الخيارات لم تعد صالحة. سأعرض الخيارات الحالية؛ اختر رقمًا منها.",
@@ -453,6 +456,18 @@ class CommerceResolver:
                              for variant in variants
                              if (self._get_stock_count(store_id, variant.id) or 0) > 0
                          ]
+                         if len(variants) == 1 and self._get_stock_count(
+                             store_id, variants[0].id
+                         ) is None:
+                             return ResolutionResult(
+                                 allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+                                 resolved_entities={},
+                                 context_updates=base_context,
+                                 response_hint=text(
+                                     "مخزون هذا الخيار غير مسجل، لذلك لا أستطيع إعداد المسودة قبل التحقق من توفره.",
+                                     "Le stock de cette option n’est pas renseigné ; je ne peux pas préparer le brouillon avant d’en vérifier la disponibilité.",
+                                 ),
+                             )
                          if len(available_variants) == 1:
                              selected_variant = available_variants[0]
                              selected_context = {

@@ -27,7 +27,8 @@ class ConfirmOrderTool(BaseTool):
         return (
             "Confirms the current order draft and places the final order. "
             "This action DEDUCTS STOCK permanently. "
-            "Use this ONLY after the customer explicitly says 'Yes', 'Confirm', or 'أكد'."
+            "Use this ONLY after the customer writes the exact phrase 'أكد الطلب' "
+            "in response to the verified order summary."
         )
 
     @property

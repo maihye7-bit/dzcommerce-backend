@@ -226,22 +226,9 @@ def test_agent_facts_expose_verified_variant_choices_without_internal_ids(db_ses
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "confirmation",
-    [
-        "اكدلي الطلب",
-        "اكدلي",
-        "اكده",
-        "اكدهالي",
-        "اكد الطلبية",
-        "اكدهولنا",
-        "أكدلهم",
-        "confirme",
-        "confirme la commande",
-        "اكد",
-        "أكد",
-        "نعم",
-    ],
+    ["أكد الطلب", "اكد الطلب"],
 )
-async def test_attached_pronoun_confirmation_creates_order_and_one_reply(
+async def test_required_confirmation_phrase_creates_order_and_one_reply(
     db_session,
     confirmation,
     caplog,
@@ -265,8 +252,7 @@ async def test_attached_pronoun_confirmation_creates_order_and_one_reply(
     assert result["turn_diagnostics"]["resolver_action"] == (
         "EXECUTE_TOOL:confirm_order"
     )
-    if not ConversationEngine._is_bare_affirmative(confirmation):
-        assert provider.calls == []
+    assert provider.calls == []
     assert result["turn_diagnostics"]["response_candidates"] == 1
     assert result["turn_diagnostics"]["responses_returned"] == 1
     assert "conversation_turn" in caplog.text
@@ -289,6 +275,35 @@ async def test_attached_pronoun_confirmation_creates_order_and_one_reply(
         Message.role == MessageRole.AGENT,
     ).count() == previous_agent_messages + 1
     assert conversation.active_draft_json is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation", ["نعم", "أكد", "confirme"])
+async def test_order_is_not_confirmed_without_required_phrase(
+    db_session,
+    confirmation,
+):
+    store, _, conversation, product, _ = make_fixture(db_session, with_draft=True)
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+
+    result = await run_turn(engine, db_session, conversation, confirmation)
+
+    assert result["turn_diagnostics"]["resolver_action"] != (
+        "EXECUTE_TOOL:confirm_order"
+    )
+    assert conversation.active_draft_json["items"]
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id,
+        Order.store_id == store.id,
+        Order.status == OrderStatus.CONFIRMED,
+    ).count() == 0
 
 
 def test_confirmation_normalization_splits_pronouns_and_command_objects():
@@ -556,7 +571,9 @@ async def test_single_variant_purchase_creates_draft_without_customer_index(db_s
     assert "سعر" not in result["response"]
     assert conversation.active_draft_json["items"][0]["variant_id"] == str(variant.id)
     assert conversation.metadata_json["commerce_stage"] == "DRAFT_PENDING"
-    assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
+    assert conversation.metadata_json["last_question_type"] == (
+        "CUSTOMER_DELIVERY_INFO"
+    )
     assert conversation.metadata_json["variant_index_map_product_id"] == str(product.id)
 
 
@@ -795,14 +812,27 @@ async def test_agent_loop_draft_then_confirmation_uses_existing_tools(db_session
         "Prepare one Samsung Galaxy",
     )
     assert "100" in draft_result["response"]
-    assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
+    assert conversation.metadata_json["last_question_type"] == (
+        "CUSTOMER_DELIVERY_INFO"
+    )
     assert conversation.active_draft_json["items"]
+
+    details_result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "0555123456، ولاية وهران",
+    )
+    assert "أكد الطلب" in details_result["response"]
+    assert conversation.metadata_json["last_question_type"] == (
+        "ORDER_CONFIRMATION"
+    )
 
     confirm_result = await run_turn(
         engine,
         db_session,
         conversation,
-        "yes",
+        "أكد الطلب",
     )
     assert "تم تأكيد طلبك بنجاح" in confirm_result["response"]
     assert conversation.active_draft_json is None
@@ -872,7 +902,7 @@ async def test_agent_usage_does_not_rollback_order_confirmation_on_sqlite(db_eng
         engine = ConversationEngine(provider, make_registry())
         engine.agent_tool_loop_enabled = True
 
-        result = await run_turn(engine, db_session, conversation, "نعم")
+        result = await run_turn(engine, db_session, conversation, "أكد الطلب")
 
         assert "رقم الطلب" in result["response"]
         assert conversation.active_draft_json is None
@@ -2093,6 +2123,136 @@ async def test_messenger_first_purchase_saves_draft_without_confirming(db_sessio
         == 0
     )
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_purchase_resumes_through_delivery_details_and_exact_confirmation(
+    db_session,
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    store.served_wilayas = "وهران، الجزائر"
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    db_session.commit()
+
+    registry = make_registry()
+    registry.aexecute = AsyncMock(wraps=registry.aexecute)
+    engine = ConversationEngine(ScriptedToolProvider([]), registry)
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    draft_result = await run_turn(engine, db_session, conversation, "دير طلب")
+
+    assert conversation.active_draft_json is not None
+    assert len(conversation.active_draft_json["items"]) == 1
+    assert conversation.metadata_json["last_question_type"] == (
+        "CUSTOMER_DELIVERY_INFO"
+    )
+    assert "رقم هاتفك" in draft_result["response"]
+    assert "الولاية" in draft_result["response"]
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+
+    details_result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "0555 12 34 56، ولاية وهران",
+    )
+
+    assert customer.phone == "0555123456"
+    assert conversation.active_draft_json["shipping_info"] == {
+        "phone": "0555123456",
+        "wilaya": "وهران",
+    }
+    assert conversation.metadata_json["last_question_type"] == (
+        "ORDER_CONFIRMATION"
+    )
+    assert product.name in details_result["response"]
+    assert variant.name in details_result["response"]
+    assert "اكتب «أكد الطلب»" in details_result["response"]
+
+    affirmative_result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "نعم",
+    )
+    assert "EXECUTE_TOOL:confirm_order" != affirmative_result[
+        "turn_diagnostics"
+    ]["resolver_action"]
+    assert conversation.active_draft_json["items"]
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+
+    confirmation_result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "أكد الطلب",
+    )
+    assert confirmation_result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:confirm_order"
+    )
+    assert conversation.active_draft_json is None
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id,
+        Order.status == OrderStatus.CONFIRMED,
+    ).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_first_draft_preserves_selection_and_does_not_claim_success(
+    db_session,
+    monkeypatch,
+):
+    _, _, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    db_session.commit()
+
+    def fail_save_draft(**_kwargs):
+        raise RuntimeError("local draft persistence failure")
+
+    monkeypatch.setattr(
+        "app.services.order_draft_service.save_draft",
+        fail_save_draft,
+    )
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine._extract_nlu_via_qwen = AsyncMock(
+        side_effect=lambda message, state, **_kwargs: engine._heuristic_nlu(
+            message, state
+        )
+    )
+
+    result = await run_turn(engine, db_session, conversation, "دير طلب")
+
+    assert "تعذر حفظ مسودة الطلب" in result["response"]
+    assert "تم حفظ مسودة الطلب" not in result["response"]
+    assert conversation.active_draft_json is None
+    assert conversation.metadata_json["commerce_stage"] == "VARIANT_SELECTED"
+    assert conversation.metadata_json["selected_product_id"] == str(product.id)
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+    assert conversation.metadata_json["last_question_type"] == "ORDER_CREATE_OFFER"
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
 
 
 @pytest.mark.asyncio

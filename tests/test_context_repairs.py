@@ -341,7 +341,7 @@ async def test_yes_without_active_draft_does_not_confirm(db_session):
 
 
 @pytest.mark.asyncio
-async def test_yes_after_order_confirmation_with_draft_confirms(db_session):
+async def test_yes_after_order_confirmation_does_not_confirm(db_session):
     conversation = make_conversation(
         db_session,
         metadata={
@@ -374,8 +374,8 @@ async def test_yes_after_order_confirmation_with_draft_confirms(db_session):
         "نعم",
     )
 
-    assert registry.aexecute.await_args.kwargs["tool_name"] == "confirm_order"
-    assert "تم تأكيد طلبك بنجاح" in result["response"]
+    registry.aexecute.assert_not_awaited()
+    assert "غير مؤكد" in result["response"]
 
 
 @pytest.mark.asyncio
@@ -468,9 +468,9 @@ async def test_real_confirmation_and_duplicate_do_not_deduct_twice(db_session):
         registry,
     )
 
-    await process(engine, db_session, conversation, "نعم")
+    await process(engine, db_session, conversation, "أكد الطلب")
     db_session.expire_all()
-    await process(engine, db_session, conversation, "نعم")
+    await process(engine, db_session, conversation, "أكد الطلب")
     db_session.expire_all()
 
     assert db_session.query(Order).filter(
@@ -876,7 +876,22 @@ async def test_catalog_browse_lists_only_active_products_from_the_current_store(
             "EXECUTE_TOOL:list_catalog_products",
         ),
         (
+            "نشوف وش ممنتجات",
+            "catalog_browse",
+            "EXECUTE_TOOL:list_catalog_products",
+        ),
+        (
+            "وريني الأحذية",
+            "catalog_browse",
+            "EXECUTE_TOOL:list_catalog_products",
+        ),
+        (
             "حذاء Nike رياضي",
+            "product_search",
+            "EXECUTE_TOOL:search_products",
+        ),
+        (
+            "وريني Samsung A50",
             "product_search",
             "EXECUTE_TOOL:search_products",
         ),
@@ -1190,7 +1205,8 @@ async def test_messenger_darija_product_price_and_purchase_flow_uses_database_fa
     assert "256GB أسود" in details_result["response"]
     assert "102,500 دج" in details_result["response"]
     assert "المتوفر: 3" in details_result["response"]
-    assert conversation.metadata_json["last_question_type"] == "VARIANT_SELECTION"
+    assert conversation.metadata_json["last_question_type"] == "ORDER_CREATE_OFFER"
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
     assert conversation.metadata_json["variant_index_map"]
     assert conversation.metadata_json["variant_index_map_product_id"] == str(product.id)
 
@@ -1224,9 +1240,14 @@ async def test_messenger_darija_product_price_and_purchase_flow_uses_database_fa
         conversation,
         "حبيت نكومندي واحد",
     )
-    assert purchase_result["response"].startswith("تم حفظ مسودة الطلب.")
+    assert purchase_result["response"].startswith("تم حفظ مسودة الطلب:")
+    assert "رقم هاتفك" in purchase_result["response"]
+    assert "الولاية" in purchase_result["response"]
     assert conversation.active_draft_json["items"][0]["variant_id"] == str(variant.id)
-    assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
+    assert (
+        conversation.metadata_json["last_question_type"]
+        == "CUSTOMER_DELIVERY_INFO"
+    )
     assert db_session.query(Order).filter(
         Order.conversation_id == conversation.id
     ).count() == 0
@@ -1520,7 +1541,10 @@ async def test_invalid_numeric_variant_mapping_refreshes_options_without_selecti
         "1",
     )
 
-    assert "اختر رقمًا من قائمة الخيارات الحالية." in result["response"]
+    assert (
+        "اختر رقمًا من قائمة الخيارات الحالية." in result["response"]
+        or "Choose a number from the current options list." in result["response"]
+    )
     assert "Current Option" in result["response"]
     assert conversation.metadata_json.get("selected_variant_id") is None
     assert conversation.metadata_json["variant_index_map"] == {
