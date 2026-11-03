@@ -271,6 +271,7 @@ def _is_order_status(message: str) -> bool:
         r"حالة|status|état",
         r"وين\s+طلبي|where\s+is\s+my\s+order",
         r"track|تتبع|تتبع",
+        r"طلبات|تاريخ\s+الطلبات|تلخيص",  # Arabic: orders, order history, summary
     ]
     for pattern in order_status_patterns:
         if re.search(pattern, normalized):
@@ -609,6 +610,13 @@ def _infer_intent_from_context(
             return intent, entities, commerce_tools_needed, clarification_needed
 
         # Check for price inquiry without product context
+        # When explicitly in EMPTY stage, price inquiry is ambiguous (need to know which product)
+        if commerce_stage == "EMPTY" and _is_price_inquiry(message):
+            intent = INTENT_AMBIGUOUS
+            commerce_tools_needed = False
+            clarification_needed = True  # Need to know which product
+            return intent, entities, commerce_tools_needed, clarification_needed
+        # Check for price inquiry without product context (default stage)
         if _is_price_inquiry(message):
             intent = INTENT_PRICE_INQUIRY
             commerce_tools_needed = True
@@ -925,12 +933,13 @@ class ConversationClassifier:
         if intent == INTENT_GENERAL_CHAT and not entities:
             base = 0.95
 
-        # Product inquiry with clear entity
+# Product inquiry with clear entity
         if intent == INTENT_PRODUCT_INQUIRY and entities.get("product_mention"):
             base = 0.85
-        # Product inquiry without clear entity (needs clarification)
+        # Product inquiry without clear entity - raise base confidence
+        # to reflect clear pattern matching, but still apply penalties
         elif intent == INTENT_PRODUCT_INQUIRY:
-            base = 0.70
+            base = 0.75
 
         # Price inquiry: moderate confidence (need to know which product)
         if intent == INTENT_PRICE_INQUIRY:

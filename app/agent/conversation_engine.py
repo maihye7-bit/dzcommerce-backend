@@ -3970,13 +3970,22 @@ class ConversationEngine:
             None,
         )
         if wilaya is None:
+            # Try to extract wilaya name - support both "olaya Name" and standalone "Name"
             explicit_wilaya = re.search(
-                r"(?:ال)?ولاية\s*[:：،,-]?\s*"
+                r"(?:[Ww]ilaya|[Oo]laya|al? )?[:：،,-]?\s*"
                 r"([\u0600-\u06ffA-Za-z][\u0600-\u06ffA-Za-z\s'-]{1,39})",
                 remainder,
             )
             if explicit_wilaya:
                 wilaya = explicit_wilaya.group(1).strip(" ،,؛;:-")
+            else:
+                # Also try matching just the wilaya name directly without prefix
+                direct_wilaya = re.search(
+                    r"([\u0600-\u06ff][\u0600-\u06ff\s]{1,39})(?:\s|$|[،;])",
+                    remainder,
+                )
+                if direct_wilaya:
+                    wilaya = direct_wilaya.group(1).strip(" ،,؛;:-")
 
         return phone, wilaya
 
