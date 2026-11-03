@@ -17,3 +17,4 @@ htmlcov/
 .mypy_cache/
 .vscode/
 .idea/
+var/product-images/

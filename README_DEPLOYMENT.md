@@ -27,7 +27,13 @@ git push -u origin main
 - داخل المشروع: New → Database → Add PostgreSQL
 - Railway سيضيف DATABASE_URL تلقائياً في Variables
 
-### 4. إضافة المتغيرات
+### 4. إعداد تخزين صور المنتجات
+- أضف **Volume** إلى خدمة التطبيق، واضبط Mount Path على `/data`.
+- يحدد Railway المتغير `RAILWAY_VOLUME_MOUNT_PATH` تلقائيًا؛ سيحفظ التطبيق الصور في `product-images` داخل هذا الـ Volume.
+- يتوقف التطبيق عند بدء التشغيل على Railway إذا لم يجد Volume دائمًا، حتى لا يقبل صورًا ستُفقد عند إعادة النشر.
+- لا يحتاج التخزين المحلي إلى خدمة صور خارجية مدفوعة. استخدم نسخة تشغيل واحدة عند الاعتماد على Volume محلي؛ التخزين المحلي غير مشترك بين النسخ المتعددة. عند الحاجة إلى التوسع الأفقي، انقل التخزين إلى خدمة كائنات مشتركة متوافقة مع S3.
+
+### 5. إضافة المتغيرات
 في تبويب Variables لخدمة التطبيق، أضف من .env المحلي:
 - OPENROUTER_API_KEY
 - QWEN_MODEL
@@ -40,34 +46,36 @@ git push -u origin main
 - SOCIAL_TOKEN_ENCRYPTION_KEY
 - ENVIRONMENT=production
 - ALLOWED_HOSTS=.railway.app
+- PRODUCT_IMAGE_STORAGE_DIR اختياري؛ إن ضُبط على Railway فيجب أن يكون داخل مسار الـ Volume
 
 ⚠️ لا تضف DATABASE_URL يدوياً (Railway يضيفه).
 
-### 5. تشغيل الترحيلات
+### 6. تشغيل الترحيلات
 افتح تبويب Shell لخدمة التطبيق ونفّذ:
 ```bash
 alembic upgrade head
 ```
+لا يشغّل التطبيق الترحيلات تلقائيًا. راجع الإصدار الحالي في قاعدة البيانات ومخرجات الترحيل قبل تشغيله على الإنتاج.
 
-### 6. إنشاء المالك
+### 7. إنشاء المالك
 ```bash
 python scripts/create_owner.py --store-slug dzcommerce --username admin --password "كلمة_سر_قوية"
 ```
 
-### 7. الحصول على الرابط
+### 8. الحصول على الرابط
 Settings → Production Domain → انسخ الرابط (مثال: dzcommerce-backend-production.up.railway.app)
 
-### 8. تحديث Meta Webhook
+### 9. تحديث Meta Webhook
 في developers.facebook.com → تطبيقك → Messenger → Webhooks:
 - Callback URL: https://رابطك.up.railway.app/webhooks/meta
 - Verify Token: نفس قيمة META_VERIFY_TOKEN
 - اضغط Vérifier et enregistrer
 - فعّل: messages, messaging_postbacks, feed
 
-### 9. اختبار البوت
+### 10. اختبار البوت
 افتح Messenger وأرسل رسالة لصفحتك.
 
-### 10. النشر الرسمي
+### 11. النشر الرسمي
 App Review → طلب الصلاحيات → الموافقة → Publier (Live Mode).
 
 ## استكشاف الأخطاء

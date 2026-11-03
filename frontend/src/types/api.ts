@@ -96,6 +96,25 @@ export interface Product {
   updated_at: string;
 }
 
+export interface ProductImage {
+  id: string;
+  store_id: string;
+  product_id: string;
+  image_url: string;
+  thumbnail_url: string | null;
+  mime_type: string;
+  file_size: number;
+  width: number | null;
+  height: number | null;
+  is_primary: boolean;
+  display_order: number;
+  processing_status: string;
+  embedding_model: string | null;
+  embedding_version: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ProductCreatePayload {
   name: string;
   description: string | null;

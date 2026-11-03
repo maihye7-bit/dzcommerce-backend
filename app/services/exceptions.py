@@ -34,3 +34,11 @@ class InsufficientInventoryError(ServiceError):
 
 class OrderNotModifiableError(ServiceError):
     """Raised when trying to modify an order that is no longer in DRAFT state."""
+
+
+class InvalidImageError(ServiceError):
+    """Raised when an image file is invalid (format, size, etc.)."""
+
+
+class ImageStorageError(ServiceError):
+    """Raised when product image storage cannot safely complete an operation."""

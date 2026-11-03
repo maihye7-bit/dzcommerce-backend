@@ -4,7 +4,7 @@ Supports variants (size, color) and multi-tenancy.
 """
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Text, Boolean, Numeric, ForeignKey, func, DateTime
+from sqlalchemy import String, Text, Boolean, Numeric, ForeignKey, func, DateTime, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -12,6 +12,9 @@ from app.database import Base
 
 class Product(Base):
     __tablename__ = "products"
+    __table_args__ = (
+        UniqueConstraint("store_id", "id", name="uq_products_store_id_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     store_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
@@ -28,6 +31,13 @@ class Product(Base):
 
     # Relationships
     variants = relationship("ProductVariant", back_populates="product", cascade="all, delete-orphan")
+    images = relationship(
+        "ProductImage",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        order_by="(ProductImage.display_order, ProductImage.created_at, ProductImage.id)",
+        foreign_keys="ProductImage.product_id",
+    )
 
 class ProductVariant(Base):
     __tablename__ = "product_variants"

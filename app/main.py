@@ -17,6 +17,7 @@ from app.api import (
     inventory,
     orders,
     products,
+    product_images,
     stats,
     stores,
     super_admin,
@@ -32,6 +33,9 @@ from app.config import settings
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: tools are registered in app/agent/tools/__init__.py
+    from app.services.product_image_storage import ensure_storage_ready
+
+    ensure_storage_ready()
     yield
     # Shutdown: cleanup if needed
 
@@ -74,6 +78,8 @@ app.include_router(dashboard.router, prefix="/api")
 app.include_router(inventory.router, prefix="/api")
 app.include_router(orders.router, prefix="/api")
 app.include_router(products.router, prefix="/api")
+app.include_router(product_images.router, prefix="/api")
+app.include_router(product_images.media_router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
 app.include_router(stores.router, prefix="/api")
 app.include_router(super_admin.router, prefix="/api")

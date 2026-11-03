@@ -1,9 +1,7 @@
 import os
+from app.config import settings
 
 import httpx
-
-from app.core.config import \
-    settings  # أو استخدم os.getenv مباشرة إذا كان config معقداً
 
 
 async def generate_ai_response(

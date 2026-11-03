@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     )
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # Product image storage. Railway volumes expose their mount path through
+    # RAILWAY_VOLUME_MOUNT_PATH; local development defaults to ./var/product-images.
+    PRODUCT_IMAGE_STORAGE_DIR: str | None = None
+    RAILWAY_VOLUME_MOUNT_PATH: str | None = None
+    RAILWAY_ENVIRONMENT: str | None = None
+
     @model_validator(mode="after")
     def require_secure_production_secret(self):
         if self.ENV.lower() in {"production", "prod"} and (
