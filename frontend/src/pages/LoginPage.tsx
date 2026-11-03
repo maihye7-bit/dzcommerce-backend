@@ -1,6 +1,11 @@
 import { useState, useCallback, type FormEvent } from "react";
 import axios from "axios";
-import { useLocation, useNavigate } from "react-router-dom";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -21,7 +26,10 @@ interface LoginLocationState {
 
 export function LoginPage() {
   // All state variables declared upfront
-  const [isLoggingIn, setIsLoggingIn] = useState(true);
+  const [searchParams] = useSearchParams();
+  const [isLoggingIn, setIsLoggingIn] = useState(
+    () => searchParams.get("mode") !== "register",
+  );
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -66,7 +74,7 @@ export function LoginPage() {
         setIsSubmitting(false);
       }
     },
-    [email, password, location, navigate],
+    [email, password, location, login, navigate],
   );
 
   // Handle registration submission via direct API call
@@ -123,12 +131,31 @@ export function LoginPage() {
 
   return (
     <main
-      className="grid min-h-screen place-items-center bg-gradient-to-br from-slate-100 via-background to-sky-100 p-4"
+      className="relative isolate grid min-h-screen place-items-center overflow-hidden bg-background p-4"
       dir="rtl"
     >
-      <Card className="w-full max-w-md shadow-lg">
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -right-32 -top-32 -z-10 size-[30rem] rounded-full bg-primary/10 blur-[120px]"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -bottom-40 -left-20 -z-10 size-[26rem] rounded-full bg-[#65c9b7]/[0.07] blur-[120px]"
+      />
+      <Card className="w-full max-w-md border-border/80 bg-card/95 shadow-2xl shadow-black/20">
         <CardHeader className="space-y-2">
-          <p className="text-sm font-semibold text-primary">DzCommerce</p>
+          <Link
+            to="/"
+            className="mb-3 inline-flex w-fit items-center gap-2 rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="العودة إلى الصفحة الرئيسية"
+          >
+            <span className="grid size-8 place-items-center rounded-lg bg-primary text-[10px] font-black text-primary-foreground">
+              DZ
+            </span>
+            <span className="text-sm font-bold">
+              Dz<span className="text-primary">Commerce</span>
+            </span>
+          </Link>
 
           {isLoggingIn ? (
             <>
@@ -137,8 +164,8 @@ export function LoginPage() {
             </>
           ) : (
             <>
-              <CardTitle className="text-2xl">انشاء حساب جديد</CardTitle>
-              <CardDescription>سجّل دخولك إلى لوحة الإدارة.</CardDescription>
+              <CardTitle className="text-2xl">إنشاء حساب جديد</CardTitle>
+              <CardDescription>أنشئ حسابًا لإدارة متجرك.</CardDescription>
             </>
           )}
         </CardHeader>
@@ -180,12 +207,14 @@ export function LoginPage() {
                 {isSubmitting ? "جارٍ تسجيل الدخول..." : "تسجيل الدخول"}
               </Button>
               <p className="text-sm text-muted-foreground mt-2">
-                لا تملك Account؟ {" "}
+                ليس لديك حساب؟{" "}
                 <Button
-                  onClick={() => setIsLoggingIn(!isLoggingIn)}
-                  className="underline text-primary"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setIsLoggingIn(false)}
+                  className="h-auto px-1 text-primary underline hover:bg-transparent hover:text-primary"
                 >
-                  أنشئ Account جديد
+                  أنشئ حسابًا جديدًا
                 </Button>
               </p>
             </form>
@@ -234,7 +263,7 @@ export function LoginPage() {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="reg-confirm-password">確認 كلمة المرور</Label>
+                <Label htmlFor="reg-confirm-password">تأكيد كلمة المرور</Label>
                 <Input
                   autoComplete="current-password"
                   id="reg-confirm-password"
@@ -248,12 +277,14 @@ export function LoginPage() {
                 {isSubmitting ? "جارٍ إنشاء الحساب..." : "إنشاء الحساب"}
               </Button>
               <p className="text-sm text-muted-foreground mt-2">
-                Already have an account? {" "}
+                لديك حساب بالفعل؟{" "}
                 <Button
-                  onClick={() => setIsLoggingIn(!isLoggingIn)}
-                  className="underline text-primary"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setIsLoggingIn(true)}
+                  className="h-auto px-1 text-primary underline hover:bg-transparent hover:text-primary"
                 >
-                  سجل دخول
+                  سجّل الدخول
                 </Button>
               </p>
             </form>
