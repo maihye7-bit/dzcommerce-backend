@@ -543,6 +543,21 @@ def test_contextual_product_followup() -> None:
     assert result.commerce_tools_needed is False
 
 
+@pytest.mark.parametrize("message", ["دير طلب", "ديرلي طلب"])
+def test_explicit_order_request_overrides_product_details_followup(message: str) -> None:
+    result = ConversationClassifier.classify(
+        message,
+        commerce_stage="PRODUCT_SELECTED",
+        selected_product_id=str(uuid.uuid4()),
+        selected_product_name="الحذاء",
+        last_question_type="PRODUCT_DETAILS_OFFER",
+    )
+
+    assert result.intent == INTENT_PURCHASE_INTENT
+    assert result.commerce_tools_needed is True
+    assert result.clarification_needed is False
+
+
 def test_contextual_price_with_selected_product() -> None:
     """Test price inquiry when product is selected → price inquiry with entity."""
     result = ConversationClassifier.classify(

@@ -2454,6 +2454,7 @@ class ConversationEngine:
             commerce_stage=current_state.get("commerce_stage"),
             selected_product_id=current_state.get("selected_product_id"),
             selected_product_name=current_state.get("selected_product_name"),
+            last_question_type=current_state.get("last_question_type"),
         )
         has_active_draft = (
             isinstance(current_state.get("active_draft_json"), dict)
@@ -3970,22 +3971,15 @@ class ConversationEngine:
             None,
         )
         if wilaya is None:
-            # Try to extract wilaya name - support both "olaya Name" and standalone "Name"
+            # Only trust an explicitly labeled wilaya when the store has no
+            # configured list; arbitrary Arabic text is not delivery data.
             explicit_wilaya = re.search(
-                r"(?:[Ww]ilaya|[Oo]laya|al? )?[:：،,-]?\s*"
+                r"(?<!\w)(?:ولاية|[Ww]ilaya|[Oo]laya)\s*[:：،,-]?\s*"
                 r"([\u0600-\u06ffA-Za-z][\u0600-\u06ffA-Za-z\s'-]{1,39})",
                 remainder,
             )
             if explicit_wilaya:
                 wilaya = explicit_wilaya.group(1).strip(" ،,؛;:-")
-            else:
-                # Also try matching just the wilaya name directly without prefix
-                direct_wilaya = re.search(
-                    r"([\u0600-\u06ff][\u0600-\u06ff\s]{1,39})(?:\s|$|[،;])",
-                    remainder,
-                )
-                if direct_wilaya:
-                    wilaya = direct_wilaya.group(1).strip(" ،,؛;:-")
 
         return phone, wilaya
 

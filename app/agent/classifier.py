@@ -332,6 +332,8 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
     product in context.  Without context, only strong purchase phrases count.
     """
     if state and state.get("selected_product_id"):
+        if _is_explicit_order_request(message):
+            return True
         # If a product is already selected, many messages become follow-ups
         # rather than new purchase intent
         normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
@@ -403,6 +405,8 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
         r"نشرى",               # "We/I buy"
         r"نشرى واحد",          # "Buy one"
     ]
+    if _is_explicit_order_request(message):
+        return True
     for phrase_pattern in strong_purchase_phrases:
         if re.search(phrase_pattern, normalized):
             return True
@@ -417,6 +421,19 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
             return True  # Will be resolved by context later
 
     return False
+
+
+def _is_explicit_order_request(message: str) -> bool:
+    """Recognize direct order commands independently of product-follow-up context."""
+    normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
+    return bool(
+        re.search(
+            r"(?<!\w)(?:دير(?:لي)?|ندير(?:لي)?|حضر(?:لي)?|حضّر(?:لي)?)\s+"
+            r"(?:ال)?(?:طلب\w*|كوموند\w*|كوماندة)(?!\w)",
+            normalized,
+        )
+        or re.search(r"(?<!\w)خليني\s+نطلب(?!\w)", normalized)
+    )
 
 
 def _is_objection_handling(message: str) -> bool:
@@ -532,6 +549,15 @@ def _infer_intent_from_context(
     # ------------------------------------------------------------------
     if commerce_stage in {"PRODUCT_SELECTED", "VARIANT_SELECTED", "DRAFT_PENDING"} and selected_product_name:
         entities["product_mention"] = selected_product_name
+
+        if _is_purchase_intent(
+            message,
+            {
+                "selected_product_id": selected_product_id,
+                "selected_product_name": selected_product_name,
+            },
+        ):
+            return INTENT_PURCHASE_INTENT, entities, True, False
 
         # Check if this is a follow-up about the selected product
         if last_question_type == "PRODUCT_DETAILS_OFFER":

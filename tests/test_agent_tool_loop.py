@@ -764,6 +764,7 @@ async def test_bare_yes_routes_to_pending_product_details_question(db_session):
         "commerce_stage": "PRODUCT_SELECTED",
         "selected_product_id": str(product.id),
         "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
         "last_question_type": "PRODUCT_DETAILS_OFFER",
     }
     db_session.flush()
@@ -3067,6 +3068,98 @@ async def test_purchase_request_creates_one_draft_and_repeats_are_idempotent(
         == 0
     )
     registry.aexecute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_order_command_after_product_selection_creates_first_draft(
+    db_session,
+):
+    store, _, conversation, product, variant = make_fixture(db_session)
+    product.name = "الحذاء"
+    product.base_price = Decimal("137.50")
+    variant.price_adjustment = Decimal("12.50")
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "last_question_type": "PRODUCT_DETAILS_OFFER",
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider(
+        [tool_call("get_product_details", {}, "stale-details")]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+    engine.reply_composer_enabled = False
+
+    result = await run_turn(engine, db_session, conversation, "دير طلب")
+
+    db_session.refresh(conversation)
+    assert result["turn_diagnostics"]["intent"] == "order_create"
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "CALL_SERVICE:create_draft"
+    )
+    assert "تم حفظ مسودة الطلب" in result["response"]
+    assert "هذا الإجراء غير متاح حاليًا" not in result["response"]
+    assert len(conversation.active_draft_json["items"]) == 1
+    assert conversation.active_draft_json["items"][0] == {
+        "variant_id": str(variant.id),
+        "product_name": "الحذاء",
+        "variant_name": variant.name,
+        "unit_price": 150.0,
+        "quantity": 1,
+        "line_total": 150.0,
+        "available_stock": 5,
+    }
+    assert conversation.metadata_json["commerce_stage"] == "DRAFT_PENDING"
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_bare_yes_without_pending_question_does_not_create_or_confirm_order(
+    db_session,
+):
+    store, _, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    db_session.commit()
+
+    engine = ConversationEngine(None, make_registry())
+    engine.agent_tool_loop_enabled = False
+    engine.reply_composer_enabled = False
+
+    result = await run_turn(engine, db_session, conversation, "نعم")
+
+    assert result["turn_diagnostics"]["intent"] == "unknown"
+    assert conversation.active_draft_json is None
+    assert conversation.metadata_json["selected_product_id"] == str(product.id)
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["دير طلب", "ديرلي طلب"],
+)
+def test_order_requests_are_not_parsed_as_delivery_wilayas(message):
+    assert ConversationEngine._extract_delivery_details(message, None) == (
+        None,
+        None,
+    )
+    assert ConversationEngine._extract_delivery_details("ولاية قالمة", None) == (
+        None,
+        "قالمة",
+    )
 
 
 @pytest.mark.asyncio
