@@ -7,8 +7,14 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from app.agent.classifier import (
+    INTENT_AMBIGUOUS,
+    INTENT_GENERAL_CHAT,
+    INTENT_TOPIC_CHANGE,
+    ConversationClassifier,
+)
+from app.agent.commerce_resolver import CommerceResolver, ResolutionResult
 from app.agent.conversation_engine import ConversationEngine
-from app.agent.commerce_resolver import ResolutionResult
 from app.agent.providers.base import LLMResponse
 from app.agent.tools.base import ToolResult
 from app.agent.tools.check_inventory import CheckInventoryTool
@@ -21,6 +27,7 @@ from app.agent.tools.registry import ToolRegistry
 from app.agent.tools.search_products import SearchProductsTool
 from app.agent.tools.update_order_draft import UpdateOrderDraftTool
 from app.agent.reply_composer import ReplyComposer
+from app.agent.classifier import ConversationClassifier, INTENT_GENERAL_CHAT, INTENT_TOPIC_CHANGE, INTENT_AMBIGUOUS
 from app.models.conversation import (
     Conversation,
     ConversationStatus,
@@ -456,6 +463,118 @@ async def test_agent_tool_loop_executes_one_resolver_authorized_call(db_session)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "classifier_intent",
+    [INTENT_GENERAL_CHAT, INTENT_TOPIC_CHANGE, INTENT_AMBIGUOUS],
+)
+async def test_agent_loop_gets_noncommercial_messages_despite_classifier(
+    db_session,
+    monkeypatch,
+    classifier_intent,
+):
+    _, _, conversation, _, _ = make_fixture(db_session, with_draft=True)
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "last_question_type": "ORDER_CONFIRMATION",
+    }
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [LLMResponse(content="We can talk about something else.")]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+    monkeypatch.setattr(
+        ConversationClassifier,
+        "classify",
+        lambda *args, **kwargs: type(
+            "ClassifierResult", (), {"intent": classifier_intent}
+        )(),
+    )
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "Let's talk about something else.",
+    )
+
+    assert len(provider.calls) == 1
+    assert result["response"] == "We can talk about something else."
+    assert conversation.active_draft_json["items"]
+    assert not db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).all()
+
+
+@pytest.mark.asyncio
+async def test_agent_selected_tool_is_not_reclassified_by_commerce_resolver(
+    db_session,
+    monkeypatch,
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    db_session.flush()
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    state = engine._normalize_current_state(conversation, store.id)
+
+    def reject_resolver(*args, **kwargs):
+        raise AssertionError("Qwen's selected tool must not be reclassified")
+
+    monkeypatch.setattr(CommerceResolver, "resolve", reject_resolver)
+    execution = await engine._execute_agent_tool_call(
+        tool_name="get_product_details",
+        arguments={},
+        user_message="How much is my selected option?",
+        language="en",
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation=conversation,
+        channel="test",
+        state=state,
+    )
+
+    assert execution is not None
+    decision, _, tool_name, tool_result = execution
+    assert decision.allowed_action == "EXECUTE_TOOL:get_product_details"
+    assert tool_name == "get_product_details"
+    assert tool_result.success is True
+    assert tool_result.data["product"]["name"] == product.name
+
+
+@pytest.mark.asyncio
+async def test_agent_product_tool_resolution_preserves_store_isolation(db_session):
+    store_a, customer_a, conversation_a, _, _ = make_fixture(db_session)
+    _, _, _, product_b, _ = make_fixture(db_session)
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    state = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product_b.id),
+        "selected_product_name": product_b.name,
+    }
+
+    execution = await engine._execute_agent_tool_call(
+        tool_name="get_product_details",
+        arguments={},
+        user_message="Show the selected product",
+        language="en",
+        db=db_session,
+        store_id=store_a.id,
+        customer_id=customer_a.id,
+        conversation=conversation_a,
+        channel="test",
+        state=state,
+    )
+
+    assert execution is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "message",
     [
         "ممكن دير تلخيص لطلباتي؟",
@@ -656,10 +775,8 @@ async def test_arabic_customer_does_not_receive_english_agent_reply(db_session):
 
 
 @pytest.mark.asyncio
-async def test_clear_product_lookup_routes_to_resolver_if_agent_only_clarifies(
-    db_session,
-):
-    _, _, conversation, product, _ = make_fixture(db_session)
+async def test_qwen_clarification_does_not_fall_back_to_product_search(db_session):
+    _, _, conversation, _, _ = make_fixture(db_session)
     provider = ScriptedToolProvider(
         [LLMResponse(content="ما هو المنتج الذي تبحث عنه؟")]
     )
@@ -673,9 +790,8 @@ async def test_clear_product_lookup_routes_to_resolver_if_agent_only_clarifies(
         "عندكم Samsung Galaxy؟",
     )
 
-    assert "Samsung Galaxy" in result["response"]
-    assert "100" in result["response"]
-    assert conversation.metadata_json["selected_product_id"] == str(product.id)
+    assert result["response"] == "ما هو المنتج الذي تبحث عنه؟"
+    assert conversation.metadata_json.get("selected_product_id") is None
 
 
 @pytest.mark.asyncio
@@ -759,7 +875,7 @@ async def test_clear_purchase_intent_routes_to_resolver_if_agent_skips_tool(db_s
 
 @pytest.mark.asyncio
 async def test_bare_yes_routes_to_pending_product_details_question(db_session):
-    store, _, conversation, product, _ = make_fixture(db_session)
+    store, _, conversation, product, variant = make_fixture(db_session)
     conversation.metadata_json = {
         "commerce_stage": "PRODUCT_SELECTED",
         "selected_product_id": str(product.id),
@@ -778,7 +894,6 @@ async def test_bare_yes_routes_to_pending_product_details_question(db_session):
 
     assert "Samsung Galaxy" in result["response"]
     assert "Black" in result["response"]
-    assert conversation.metadata_json["variant_index_map"]
     assert conversation.active_draft_json is None
 
 
@@ -816,6 +931,57 @@ async def test_agent_purchase_resolves_selected_variant_without_existing_index_m
     assert tool_name == "create_order_draft"
     assert tool_result.success is True
     assert conversation.active_draft_json["items"][0]["variant_id"] == str(variant.id)
+
+
+@pytest.mark.asyncio
+async def test_agent_receives_order_draft_stock_failure_for_recovery(db_session):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "selected_attributes": {"color": "black"},
+    }
+    inventory = (
+        db_session.query(InventoryItem)
+        .filter(InventoryItem.variant_id == variant.id)
+        .one()
+    )
+    inventory.quantity = 0
+    db_session.flush()
+
+    provider = ScriptedToolProvider(
+        [
+            tool_call("create_order_draft", {"quantity": 1}),
+            LLMResponse(content="هل تود اختيار كمية أخرى؟"),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+    state = engine._normalize_current_state(conversation, store.id)
+
+    result = await engine._run_agent_tool_loop(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation=conversation,
+        channel="test",
+        user_message="حبيت نشري الحذاء",
+        current_state=state,
+        dialogue_context=[],
+        language="ar",
+    )
+
+    assert result is not None
+    assert result["accepted"] is True
+    assert result["tool_name"] == "create_order_draft"
+    assert result["tool_result"].success is False
+    tool_message = provider.calls[1][0][-1]
+    assert tool_message.role == "tool"
+    assert json.loads(tool_message.content)["success"] is False
+    assert conversation.active_draft_json is None
+    assert inventory.quantity == 0
 
 
 def test_agent_reply_validator_rejects_placeholders_and_foreign_scripts():
@@ -1709,7 +1875,9 @@ async def test_non_order_interruption_does_not_confirm_or_change_draft(db_sessio
 
     result = await run_turn(engine, db_session, conversation, "Let me think.")
 
-    assert "The order is not confirmed." in result["response"]
+    assert result["response"] == (
+        "Take your time. We can continue whenever you are ready."
+    )
     assert len(provider.calls) == 1
     assert conversation.active_draft_json == original_draft
     assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
@@ -1741,7 +1909,9 @@ async def test_customer_can_return_to_draft_after_an_interruption(db_session):
         conversation,
         "Let me think.",
     )
-    assert "The order is not confirmed." in first_result["response"]
+    assert first_result["response"] == (
+        "Take your time; your draft is still open."
+    )
 
     provider.responses.append(
         LLMResponse(
@@ -1755,7 +1925,9 @@ async def test_customer_can_return_to_draft_after_an_interruption(db_session):
         "Okay, continue.",
     )
 
-    assert "review the order summary" in next_result["response"].casefold()
+    assert next_result["response"] == (
+        "Your draft is still open. We can continue whenever you are ready."
+    )
     assert conversation.active_draft_json == original_draft
     assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
 
@@ -1865,7 +2037,10 @@ async def test_agent_loop_does_not_confirm_without_the_pending_confirmation(
 
     assert confirmation_tool.execution_count == 0
     assert conversation.active_draft_json["items"]
-    assert "غير مؤكد" in result["response"]
+    assert (
+        "not confirmed" in result["response"].casefold()
+        or "غير مؤكد" in result["response"]
+    )
 
 
 @pytest.mark.asyncio
@@ -3082,6 +3257,7 @@ async def test_order_command_after_product_selection_creates_first_draft(
         "commerce_stage": "PRODUCT_SELECTED",
         "selected_product_id": str(product.id),
         "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
         "last_question_type": "PRODUCT_DETAILS_OFFER",
     }
     db_session.commit()

@@ -1462,6 +1462,104 @@ class ConversationEngine:
                 metadata[key] = value
         conversation.metadata_json = metadata
 
+    @staticmethod
+    def _agent_product_for_tool(
+        db: Session,
+        store_id: uuid.UUID,
+        state: dict[str, Any],
+        product_name: str | None,
+    ) -> Product | None:
+        candidate_ids = state.get("candidate_product_ids")
+        if product_name:
+            known_ids = list(candidate_ids) if isinstance(candidate_ids, list) else []
+            if state.get("selected_product_id"):
+                known_ids.append(state["selected_product_id"])
+        elif state.get("selected_product_id"):
+            known_ids = [state["selected_product_id"]]
+        elif isinstance(candidate_ids, list):
+            known_ids = candidate_ids
+        else:
+            known_ids = []
+
+        product_uuids = list(
+            dict.fromkeys(
+                product_id
+                for value in known_ids
+                if (product_id := CommerceResolver._parse_uuid(value)) is not None
+            )
+        )
+        if not product_uuids:
+            return None
+
+        products = (
+            db.query(Product)
+            .filter(
+                Product.id.in_(product_uuids),
+                Product.store_id == store_id,
+                Product.is_active.is_(True),
+            )
+            .all()
+        )
+        if not product_name:
+            return products[0] if len(products) == 1 else None
+
+        mention = normalize_product_search_text(product_name)
+        if not mention:
+            return None
+        exact_matches = [
+            product
+            for product in products
+            if normalize_product_search_text(product.name) == mention
+        ]
+        if exact_matches:
+            return exact_matches[0] if len(exact_matches) == 1 else None
+        partial_matches = [
+            product
+            for product in products
+            if mention in normalize_product_search_text(product.name)
+            or normalize_product_search_text(product.name) in mention
+        ]
+        return partial_matches[0] if len(partial_matches) == 1 else None
+
+    @staticmethod
+    def _agent_variant_for_tool(
+        db: Session,
+        store_id: uuid.UUID,
+        state: dict[str, Any],
+        product: Product,
+        variant_index: int | None = None,
+    ) -> ProductVariant | None:
+        if variant_index is not None:
+            index_map = state.get("variant_index_map")
+            if (
+                not isinstance(index_map, dict)
+                or str(state.get("variant_index_map_product_id")) != str(product.id)
+            ):
+                return None
+            variant_id = CommerceResolver._parse_uuid(
+                index_map.get(str(variant_index))
+            )
+        elif str(state.get("selected_product_id")) == str(product.id):
+            variant_id = CommerceResolver._parse_uuid(
+                state.get("selected_variant_id")
+            )
+        else:
+            return None
+
+        if variant_id is None:
+            return None
+        return (
+            db.query(ProductVariant)
+            .join(Product)
+            .filter(
+                ProductVariant.id == variant_id,
+                ProductVariant.product_id == product.id,
+                Product.store_id == store_id,
+                Product.is_active.is_(True),
+            )
+            .one_or_none()
+        )
+
     async def _execute_agent_tool_call(
         self,
         *,
@@ -1570,7 +1668,6 @@ class ConversationEngine:
                 result,
             )
 
-        state_for_resolution = state
         nlu: dict[str, Any] = {
             "intent": "unknown",
             "intent_guess": "unknown",
@@ -1580,7 +1677,18 @@ class ConversationEngine:
             "confirmation_phrase": False,
             "confidence": 0.95,
         }
-        expected_action = ""
+        tool_actions = {
+            "search_products": AllowedAction.SEARCH_PRODUCTS.value,
+            "list_catalog_products": AllowedAction.LIST_CATALOG_PRODUCTS.value,
+            "get_product_details": AllowedAction.GET_PRODUCT_DETAILS.value,
+            "check_inventory": AllowedAction.RESOLVE_VARIANT.value,
+            "create_order_draft": AllowedAction.CREATE_DRAFT.value,
+            "update_order_draft": AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value,
+            "confirm_order": AllowedAction.CONFIRM_ORDER.value,
+        }
+        action = tool_actions.get(tool_name)
+        if action is None:
+            return None
         safe_arguments: dict[str, Any] = {}
 
         if tool_name == "search_products":
@@ -1589,37 +1697,54 @@ class ConversationEngine:
                 intent_guess="product_search",
                 product_mention=arguments["query"].strip(),
             )
-            expected_action = AllowedAction.SEARCH_PRODUCTS.value
+            safe_arguments = {"query": arguments["query"].strip()}
         elif tool_name == "list_catalog_products":
             nlu.update(intent="catalog_browse", intent_guess="catalog_browse")
-            expected_action = AllowedAction.LIST_CATALOG_PRODUCTS.value
         elif tool_name == "get_product_details":
-            product_name = arguments.get("product_name")
+            product = self._agent_product_for_tool(
+                db,
+                store_id,
+                state,
+                arguments.get("product_name"),
+            )
+            if product is None:
+                return None
             nlu.update(
                 intent="product_details",
                 intent_guess="product_details",
-                product_mention=product_name.strip() if product_name else None,
+                product_mention=product.name,
             )
-            expected_action = AllowedAction.GET_PRODUCT_DETAILS.value
+            safe_arguments = {"product_id": str(product.id)}
         elif tool_name == "check_inventory":
             variant_index = arguments.get("variant_index")
-            if variant_index is not None:
-                nlu.update(
-                    intent="variant_selection",
-                    intent_guess="variant_selection",
-                    variant_index=variant_index,
-                )
-            else:
-                nlu.update(intent="product_details", intent_guess="product_details")
-            expected_action = AllowedAction.RESOLVE_VARIANT.value
-            safe_arguments["quantity"] = arguments["quantity"]
+            product = self._agent_product_for_tool(db, store_id, state, None)
+            if product is None:
+                return None
+            variant = self._agent_variant_for_tool(
+                db, store_id, state, product, variant_index
+            )
+            if variant is None:
+                return None
+            intent = (
+                "variant_selection"
+                if variant_index is not None
+                else "product_details"
+            )
+            nlu.update(
+                intent=intent,
+                intent_guess=intent,
+                variant_index=variant_index,
+            )
+            safe_arguments = {
+                "variant_id": str(variant.id),
+                "quantity": arguments["quantity"],
+            }
         elif tool_name == "create_order_draft":
             nlu.update(
                 intent="order_create",
                 intent_guess="order_create",
                 quantity=arguments["quantity"],
             )
-            expected_action = AllowedAction.CREATE_DRAFT.value
         elif tool_name == "update_order_draft":
             if arguments.get("action") == "replace":
                 nlu.update(
@@ -1630,7 +1755,6 @@ class ConversationEngine:
             else:
                 nlu.update(intent="order_create", intent_guess="order_create")
             nlu["draft_action"] = arguments.get("action")
-            expected_action = AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value
         elif tool_name == "confirm_order":
             nlu.update(
                 intent="order_confirm",
@@ -1642,231 +1766,168 @@ class ConversationEngine:
                 "confirmation_phrase"
             ):
                 return None
-            expected_action = AllowedAction.CONFIRM_ORDER.value
 
-        if (
-            nlu.get("intent") == "variant_selection"
-            and isinstance(nlu.get("variant_index"), int)
-            and state.get("commerce_stage") == "VARIANT_SELECTED"
-        ):
-            index_map = state.get("variant_index_map")
-            selected_product_id = state.get("selected_product_id")
+        if tool_name == "create_order_draft":
+            active_draft = state.get("active_draft_json")
             if (
-                isinstance(index_map, dict)
-                and str(nlu["variant_index"]) in index_map
-                and selected_product_id
-                and str(state.get("variant_index_map_product_id"))
-                == str(selected_product_id)
-            ):
-                state_for_resolution = {
-                    **state,
-                    "selected_variant_id": None,
-                    "selected_attributes": {},
-                    "commerce_stage": "PRODUCT_SELECTED",
-                }
-
-        resolver = CommerceResolver(db=db)
-        if tool_name == "create_order_draft" and arguments.get("variant_index"):
-            selection_nlu = {
-                **nlu,
-                "intent": "variant_selection",
-                "intent_guess": "variant_selection",
-                "variant_index": arguments["variant_index"],
-            }
-            selection_state = state_for_resolution
-            if state.get("commerce_stage") == "VARIANT_SELECTED":
-                selection_state = {
-                    **state,
-                    "selected_variant_id": None,
-                    "selected_attributes": {},
-                    "commerce_stage": "PRODUCT_SELECTED",
-                }
-            selection_decision = resolver.resolve(
-                nlu_output=selection_nlu,
-                current_state=selection_state,
-                store_id=store_id,
-            )
-            if selection_decision.allowed_action != AllowedAction.RESOLVE_VARIANT.value:
-                return None
-            state_for_resolution = {
-                **selection_state,
-                "selected_variant_id": selection_decision.resolved_entities.get(
-                    "variant_id"
-                ),
-                "selected_attributes": selection_decision.context_updates.get(
-                    "selected_attributes", {}
-                ),
-                "commerce_stage": "VARIANT_SELECTED",
-            }
-        replacement_variant_id: uuid.UUID | None = None
-        if (
-            tool_name == "update_order_draft"
-            and arguments.get("action") == "replace"
-        ):
-            selection_decision = resolver.resolve(
-                nlu_output=nlu,
-                current_state=state_for_resolution,
-                store_id=store_id,
-            )
-            if (
-                selection_decision.allowed_action
-                != AllowedAction.RESOLVE_VARIANT.value
-            ):
-                return None
-            replacement_variant_id = CommerceResolver._parse_uuid(
-                selection_decision.resolved_entities.get("variant_id")
-            )
-            replacement_product_id = CommerceResolver._parse_uuid(
-                selection_decision.resolved_entities.get("product_id")
-            )
-            if replacement_variant_id is None or replacement_product_id is None:
-                return None
-            replacement_variant = (
-                db.query(ProductVariant)
-                .join(Product)
-                .filter(
-                    ProductVariant.id == replacement_variant_id,
-                    ProductVariant.product_id == replacement_product_id,
-                    Product.store_id == store_id,
-                    Product.is_active.is_(True),
+                state.get("commerce_stage")
+                not in {"PRODUCT_SELECTED", "VARIANT_SELECTED"}
+                or (
+                    isinstance(active_draft, dict)
+                    and bool(active_draft.get("items"))
                 )
-                .one_or_none()
-            )
-            if replacement_variant is None:
+            ):
                 return None
-            state_for_resolution = {
-                **state_for_resolution,
-                "selected_product_id": str(replacement_product_id),
-                "selected_variant_id": str(replacement_variant_id),
-                "selected_attributes": (
-                    replacement_variant.attributes_json
-                    if isinstance(replacement_variant.attributes_json, dict)
-                    else {}
-                ),
-            }
+            product = self._agent_product_for_tool(db, store_id, state, None)
+            if product is None:
+                return None
+            variant = self._agent_variant_for_tool(
+                db,
+                store_id,
+                state,
+                product,
+                arguments.get("variant_index"),
+            )
+            if variant is None:
+                return None
+            quantity = arguments["quantity"]
+
+            index_map = state.get("variant_index_map")
+            index = arguments.get("variant_index")
+            if index is None and isinstance(index_map, dict):
+                if str(state.get("variant_index_map_product_id")) == str(product.id):
+                    index = next(
+                        (
+                            int(key)
+                            for key, value in index_map.items()
+                            if str(value) == str(variant.id) and str(key).isdigit()
+                        ),
+                        None,
+                    )
+            if index is None:
+                index = self._ensure_variant_index_mapping(
+                    db=db,
+                    store_id=store_id,
+                    conversation=conversation,
+                    product_id=product.id,
+                    variant_id=str(variant.id),
+                )
+                index_map = dict(
+                    (conversation.metadata_json or {}).get("variant_index_map", {})
+                )
+            if (
+                index is None
+                or not isinstance(index_map, dict)
+                or str(index_map.get(str(index))) != str(variant.id)
+            ):
+                return None
             nlu.update(
                 intent="order_create",
                 intent_guess="order_create",
+                product_mention=product.name,
             )
-
-        decision = resolver.resolve(
-            nlu_output=nlu,
-            current_state=state_for_resolution,
-            store_id=store_id,
-        )
-        if decision.allowed_action != expected_action:
-            return None
-
-        safe_tool_name = tool_name
-        if tool_name == "search_products":
-            safe_arguments = self._prepare_safe_tool_args(
-                tool_name,
-                decision.resolved_entities,
-                nlu,
-            )
-        elif tool_name == "get_product_details":
-            safe_arguments = self._prepare_safe_tool_args(
-                tool_name,
-                decision.resolved_entities,
-                nlu,
-            )
-        elif tool_name == "check_inventory":
-            variant_id = decision.resolved_entities.get("variant_id")
-            if not variant_id:
-                return None
-            safe_arguments["variant_id"] = str(variant_id)
-        elif tool_name == "create_order_draft":
-            variant_id = str(decision.resolved_entities.get("variant_id") or "")
-            index = arguments.get("variant_index")
-            if index is None:
-                index_map = state_for_resolution.get("variant_index_map") or {}
-                index = next(
-                    (
-                        int(key)
-                        for key, value in index_map.items()
-                        if str(value) == variant_id and str(key).isdigit()
-                    ),
-                    None,
-                )
-                if index is None:
-                    index = self._ensure_variant_index_mapping(
-                        db=db,
-                        store_id=store_id,
-                        conversation=conversation,
-                        product_id=decision.resolved_entities.get("product_id"),
-                        variant_id=variant_id,
-                    )
-                    if index is not None:
-                        state_for_resolution = {
-                            **state_for_resolution,
-                            "variant_index_map": dict(
-                                conversation.metadata_json.get(
-                                    "variant_index_map", {}
-                                )
-                            ),
-                            "variant_index_map_product_id": str(
-                                decision.resolved_entities.get("product_id")
-                            ),
-                        }
-            index_map = state_for_resolution.get("variant_index_map") or index_map
-            if (
-                index is None
-                or str(index) not in index_map
-                or str(index_map[str(index)]) != variant_id
-            ):
-                return None
             safe_arguments = {
-                "items": [
-                    {
-                        "variant_index": int(index),
-                        "quantity": int(decision.resolved_entities["quantity"]),
-                    }
-                ]
+                "items": [{"variant_index": int(index), "quantity": quantity}]
             }
         elif tool_name == "update_order_draft":
-            active_draft = state_for_resolution.get("active_draft_json") or {}
+            active_draft = state.get("active_draft_json")
             draft_items = (
                 active_draft.get("items")
                 if isinstance(active_draft, dict)
                 else None
             )
-            action = arguments["action"]
-            variant_id = None
-            if action == "replace":
-                variant_id = replacement_variant_id
-            elif action == "add":
-                variant_id = state_for_resolution.get("selected_variant_id")
-            elif isinstance(draft_items, list):
-                position = arguments["item_index"] - 1
-                if 0 <= position < len(draft_items):
-                    item = draft_items[position]
-                    if isinstance(item, dict):
-                        variant_id = item.get("variant_id")
-            variant_uuid = CommerceResolver._parse_uuid(variant_id)
-            if variant_uuid is None:
+            if (
+                state.get("commerce_stage") != "DRAFT_PENDING"
+                or not isinstance(draft_items, list)
+                or not draft_items
+            ):
                 return None
-            variant = (
-                db.query(ProductVariant)
-                .join(Product)
-                .filter(
-                    ProductVariant.id == variant_uuid,
-                    Product.store_id == store_id,
-                    Product.is_active.is_(True),
+
+            update_action = arguments["action"]
+            item_index = arguments.get("item_index")
+            variant = None
+            if update_action in {"remove", "set"}:
+                if item_index is None or item_index > len(draft_items):
+                    return None
+                item = draft_items[item_index - 1]
+                variant_id = item.get("variant_id") if isinstance(item, dict) else None
+                variant_uuid = CommerceResolver._parse_uuid(variant_id)
+                if variant_uuid is not None:
+                    variant = (
+                        db.query(ProductVariant)
+                        .join(Product)
+                        .filter(
+                            ProductVariant.id == variant_uuid,
+                            Product.store_id == store_id,
+                            Product.is_active.is_(True),
+                        )
+                        .one_or_none()
+                    )
+            elif update_action == "replace":
+                product = self._agent_product_for_tool(db, store_id, state, None)
+                if product is None:
+                    return None
+                variant = self._agent_variant_for_tool(
+                    db,
+                    store_id,
+                    state,
+                    product,
+                    arguments["variant_index"],
                 )
-                .one_or_none()
-            )
+            else:
+                product = self._agent_product_for_tool(db, store_id, state, None)
+                if product is None:
+                    return None
+                variant = self._agent_variant_for_tool(db, store_id, state, product)
             if variant is None:
                 return None
             safe_arguments = {
-                "action": action,
+                "action": update_action,
                 "variant_id": str(variant.id),
             }
-            if action == "replace":
-                safe_arguments["item_index"] = arguments["item_index"]
+            if item_index is not None:
+                safe_arguments["item_index"] = item_index
             if "quantity" in arguments:
                 safe_arguments["quantity"] = arguments["quantity"]
-        else:
-            safe_arguments = {}
+
+        resolved_entities: dict[str, Any] = {}
+        if tool_name == "search_products":
+            resolved_entities["query"] = safe_arguments["query"]
+        elif tool_name == "get_product_details":
+            resolved_entities["product_id"] = safe_arguments["product_id"]
+        elif tool_name == "check_inventory":
+            resolved_entities.update(
+                variant_id=safe_arguments["variant_id"],
+                quantity=safe_arguments["quantity"],
+            )
+        elif tool_name == "create_order_draft":
+            resolved_entities.update(
+                product_id=str(product.id),
+                variant_id=str(variant.id),
+                quantity=arguments["quantity"],
+            )
+        elif tool_name == "update_order_draft":
+            resolved_entities.update(
+                variant_id=safe_arguments["variant_id"],
+                action=safe_arguments["action"],
+                item_index=safe_arguments.get("item_index"),
+                quantity=safe_arguments.get("quantity"),
+            )
+        elif tool_name == "confirm_order":
+            resolved_entities["confirmation_phrase"] = True
+        context_updates = {
+            "last_intent": nlu["intent"],
+            "last_nlu": nlu,
+        }
+        if tool_name in {"create_order_draft", "update_order_draft"}:
+            context_updates["commerce_stage"] = "DRAFT_PENDING"
+        elif tool_name == "confirm_order":
+            context_updates["commerce_stage"] = "ORDER_CONFIRMED"
+        decision = ResolutionResult(
+            allowed_action=action,
+            resolved_entities=resolved_entities,
+            context_updates=context_updates,
+        )
 
         tool_context = {
             "db": db,
@@ -1875,7 +1936,7 @@ class ConversationEngine:
             "conversation_id": conversation.id,
             "channel": channel,
         }
-        if safe_tool_name in {
+        if tool_name in {
             "create_order_draft",
             "update_order_draft",
             "confirm_order",
@@ -1883,7 +1944,7 @@ class ConversationEngine:
             try:
                 with db.begin_nested():
                     tool_result = await self.registry.aexecute(
-                        tool_name=safe_tool_name,
+                        tool_name=tool_name,
                         arguments=safe_arguments,
                         context=tool_context,
                     )
@@ -1891,7 +1952,7 @@ class ConversationEngine:
                 logger.exception(
                     "Agent mutating commerce tool failed; its savepoint was rolled back "
                     "(tool=%s)",
-                    safe_tool_name,
+                    tool_name,
                 )
                 tool_result = ToolResult(
                     success=False,
@@ -1903,7 +1964,7 @@ class ConversationEngine:
                 )
         else:
             tool_result = await self.registry.aexecute(
-                tool_name=safe_tool_name,
+                tool_name=tool_name,
                 arguments=safe_arguments,
                 context=tool_context,
             )
@@ -1941,7 +2002,7 @@ class ConversationEngine:
         product_id: Any,
         variant_id: str,
     ) -> int | None:
-        """Create an internal index map only for a resolver-verified variant."""
+        """Create an index map only for a database-verified variant."""
         product_uuid = CommerceResolver._parse_uuid(product_id)
         variant_uuid = CommerceResolver._parse_uuid(variant_id)
         if product_uuid is None or variant_uuid is None:
@@ -2456,16 +2517,11 @@ class ConversationEngine:
             selected_product_name=current_state.get("selected_product_name"),
             last_question_type=current_state.get("last_question_type"),
         )
-        has_active_draft = (
-            isinstance(current_state.get("active_draft_json"), dict)
-            and bool(current_state["active_draft_json"].get("items"))
+        # Ordinary chat and topic changes belong to Qwen; retain only the
+        # explicit restricted-content bypass as a pre-execution safety boundary.
+        bypass_agent_loop = (
+            classifier_result.intent == "UNSUPPORTED_OR_RESTRICTED"
         )
-        # Let Qwen resolve ambiguity unless a draft is pending.
-        bypass_agent_loop = classifier_result.intent in {
-            "GENERAL_CHAT",
-            "TOPIC_CHANGE",
-            "UNSUPPORTED_OR_RESTRICTED",
-        } or (classifier_result.intent == "AMBIGUOUS" and has_active_draft)
         if (
             post_confirmation_response is None
             and post_confirmation_nlu is None
@@ -2501,34 +2557,6 @@ class ConversationEngine:
                 agent_loop_result and agent_loop_result.get("accepted")
             )
             agent_loop_fallback = not agent_loop_accepted
-            if agent_loop_accepted:
-                validated_fallback_nlu = self._validate_nlu_context(
-                    fallback_nlu,
-                    user_message,
-                    current_state,
-                )
-                resolvable_intents = {
-                    "product_search",
-                    "product_details",
-                    "variant_selection",
-                    "order_create",
-                    "order_confirm",
-                    "catalog_browse",
-                }
-                intent = validated_fallback_nlu.get("intent")
-                last_agent_tool_result = agent_loop_result.get("tool_result")
-                if (
-                    intent in resolvable_intents
-                    and agent_loop_result.get("tool_name")
-                    != "get_customer_context"
-                    and (
-                        last_agent_tool_result is None
-                        or not last_agent_tool_result.success
-                    )
-                ):
-                    fallback_nlu = validated_fallback_nlu
-                    agent_loop_accepted = False
-                    agent_loop_fallback = True
         elif (
             unsupported_policy_topic
             or variant_availability_query
@@ -2539,43 +2567,6 @@ class ConversationEngine:
             or delivery_info_capture_turn
         ) and fallback_nlu is None:
             fallback_nlu = local_message_nlu
-
-        product_mention = (
-            fallback_nlu.get("product_mention")
-            if isinstance(fallback_nlu, dict)
-            else None
-        )
-        verified_search_candidate = bool(
-            isinstance(product_mention, str)
-            and product_mention
-            and db.query(Product.id)
-            .filter(
-                Product.store_id == store_id,
-                Product.is_active.is_(True),
-                Product.name == product_mention,
-            )
-            .first()
-        )
-        if (
-            self.agent_tool_loop_enabled
-            and agent_loop_result is not None
-            and agent_loop_result.get("tool_name") is None
-            and isinstance(fallback_nlu, dict)
-            and fallback_nlu.get("intent") == "product_search"
-            and not verified_search_candidate
-            and classifier_result.intent
-            in {"ORDER_STATUS", "AVAILABILITY_INQUIRY", "AMBIGUOUS"}
-        ):
-            # Do not turn an unresolved history question into a product search.
-            fallback_nlu = {
-                **fallback_nlu,
-                "intent": "unknown",
-                "intent_guess": "unknown",
-                "product_mention": None,
-                "confidence": 0.0,
-            }
-            agent_loop_accepted = False
-            agent_loop_fallback = True
 
         agent_draft_created = False
         agent_draft_question_type: str | None = None
