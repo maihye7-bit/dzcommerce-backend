@@ -26,6 +26,7 @@ from app.agent.tools.get_customer_context import GetCustomerContextTool
 from app.agent.tools.get_product_details import GetProductDetailsTool
 from app.agent.tools.list_catalog import ListCatalogProductsTool
 from app.agent.tools.registry import ToolRegistry
+from app.agent.tools.recommend_products import RecommendProductsTool
 from app.agent.tools.search_products import SearchProductsTool
 from app.agent.tools.update_order_draft import UpdateOrderDraftTool
 from app.agent.reply_composer import ReplyComposer
@@ -37,6 +38,7 @@ from app.models.conversation import (
     MessageRole,
 )
 from app.models.customer import Customer
+from app.models.customer_memory import CustomerMemory
 from app.models.inventory import InventoryItem
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant
@@ -175,6 +177,7 @@ def make_registry():
         UpdateOrderDraftTool(),
         ConfirmOrderTool(),
         GetCustomerContextTool(),
+        RecommendProductsTool(),
     ):
         registry.register(tool)
     return registry
@@ -324,31 +327,27 @@ async def test_required_confirmation_phrase_creates_order_and_one_reply(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("confirmation", ["نعم", "أكد", "confirme"])
-async def test_order_is_not_confirmed_without_required_phrase(
+async def test_natural_consent_confirms_pending_order_summary(
     db_session,
     confirmation,
 ):
-    store, _, conversation, product, _ = make_fixture(db_session, with_draft=True)
-    conversation.metadata_json = {
-        "commerce_stage": "DRAFT_PENDING",
-        "selected_product_id": str(product.id),
-        "last_question_type": "ORDER_CONFIRMATION",
-    }
+    store, _, conversation, product, variant = make_fixture(db_session)
+    prepare_pending_confirmation(conversation, product, variant)
     db_session.commit()
     engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
     engine.agent_tool_loop_enabled = False
 
     result = await run_turn(engine, db_session, conversation, confirmation)
 
-    assert result["turn_diagnostics"]["resolver_action"] != (
+    assert result["turn_diagnostics"]["resolver_action"] == (
         "EXECUTE_TOOL:confirm_order"
     )
-    assert conversation.active_draft_json["items"]
+    assert conversation.active_draft_json is None
     assert db_session.query(Order).filter(
         Order.conversation_id == conversation.id,
         Order.store_id == store.id,
         Order.status == OrderStatus.CONFIRMED,
-    ).count() == 0
+    ).count() == 1
 
 
 def test_confirmation_normalization_splits_pronouns_and_command_objects():
@@ -490,11 +489,250 @@ async def test_agent_tool_loop_executes_one_resolver_authorized_call(db_session)
         "update_order_draft",
         "confirm_order",
         "get_customer_context",
+        "recommend_products",
     ]
     tool_result = provider.calls[1][0][-1]
     assert tool_result.role == "tool"
     assert "Samsung Galaxy" in tool_result.content
     assert str(product.id) not in tool_result.content
+
+
+@pytest.mark.asyncio
+async def test_messenger_agent_can_recommend_only_in_stock_store_products(db_session):
+    store, _, conversation, product, _ = make_fixture(db_session)
+    product.description = "Android smartphone"
+    alternative = Product(
+        store_id=store.id,
+        name="Samsung Galaxy Lite",
+        description="Affordable Android smartphone",
+        base_price=Decimal("80.00"),
+        is_active=True,
+    )
+    unavailable = Product(
+        store_id=store.id,
+        name="Samsung Galaxy Ultra",
+        description="Android smartphone",
+        base_price=Decimal("70.00"),
+        is_active=True,
+    )
+    db_session.add_all([alternative, unavailable])
+    db_session.flush()
+    alternative_variant = ProductVariant(
+        product_id=alternative.id,
+        name="Standard",
+        price_adjustment=Decimal("5"),
+        attributes_json={},
+    )
+    unavailable_variant = ProductVariant(
+        product_id=unavailable.id,
+        name="Standard",
+        price_adjustment=Decimal("0"),
+        attributes_json={},
+    )
+    db_session.add_all([alternative_variant, unavailable_variant])
+    db_session.flush()
+    other_store = Store(
+        name="Other recommendation store",
+        slug=f"recommendation-{uuid.uuid4()}",
+    )
+    db_session.add(other_store)
+    db_session.flush()
+    other_store_product = Product(
+        store_id=other_store.id,
+        name="Samsung Galaxy Pro",
+        description="Android smartphone",
+        base_price=Decimal("50.00"),
+        is_active=True,
+    )
+    db_session.add(other_store_product)
+    db_session.flush()
+    other_store_variant = ProductVariant(
+        product_id=other_store_product.id,
+        name="Standard",
+        price_adjustment=Decimal("0"),
+        attributes_json={},
+    )
+    db_session.add(other_store_variant)
+    db_session.flush()
+    db_session.add_all(
+        [
+            InventoryItem(
+                store_id=store.id,
+                variant_id=alternative_variant.id,
+                quantity=3,
+            ),
+            InventoryItem(
+                store_id=store.id,
+                variant_id=unavailable_variant.id,
+                quantity=0,
+            ),
+            InventoryItem(
+                store_id=other_store.id,
+                variant_id=other_store_variant.id,
+                quantity=10,
+            ),
+        ]
+    )
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider(
+        [
+            tool_call(
+                "recommend_products",
+                {
+                    "customer_need": "Android smartphone",
+                    "reason": "cheaper_option",
+                },
+                "recommend",
+            ),
+            LLMResponse(
+                content=(
+                    "Samsung Galaxy Lite costs 85 DZD and is available."
+                )
+            ),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    result = await run_turn(engine, db_session, conversation, "It's too expensive.")
+
+    assert result["response"] == (
+        "Samsung Galaxy Lite costs 85 DZD and is available."
+    )
+    assert len(provider.calls) == 2
+    names = [entry["function"]["name"] for entry in provider.calls[0][1]]
+    assert "recommend_products" in names
+    recommendation_observation = provider.calls[1][0][-1]
+    assert recommendation_observation.role == "tool"
+    assert "Samsung Galaxy Lite" in recommendation_observation.content
+    assert "Samsung Galaxy Ultra" not in recommendation_observation.content
+    assert "Samsung Galaxy Pro" not in recommendation_observation.content
+    assert str(alternative.id) not in recommendation_observation.content
+    assert conversation.metadata_json["recommended_product_ids"] == [
+        str(alternative.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_replans_after_no_results_even_with_an_active_draft(db_session):
+    _, _, conversation, _, _ = make_fixture(db_session, with_draft=True)
+    provider = ScriptedToolProvider(
+        [
+            tool_call("search_products", {"query": "not a real product"}, "miss"),
+            tool_call("search_products", {"query": "Samsung"}, "retry"),
+            LLMResponse(
+                content="I found Samsung Galaxy for 100 DZD."
+            ),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "Can you find another phone?",
+    )
+
+    assert "Samsung Galaxy" in result["response"]
+    assert len(provider.calls) == 3
+    observations = [
+        message
+        for message in provider.calls[1][0]
+        if message.role == "tool"
+    ]
+    observations_by_id = {
+        message.tool_call_id: message
+        for message in observations
+    }
+    first_observation = observations_by_id["miss"]
+    assert first_observation.role == "tool"
+    assert "NO_RESULTS" in first_observation.content
+    assert observations_by_id["retry"].role == "tool"
+    assert conversation.active_draft_json["items"]
+
+
+@pytest.mark.asyncio
+async def test_agent_working_memory_is_validated_persisted_and_reused(db_session):
+    _, _, conversation, _, _ = make_fixture(db_session)
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(
+                content=json.dumps(
+                    {
+                        "reply": "I can help compare options within your budget.",
+                        "working_memory": {
+                            "customer_goal": "Find an affordable phone",
+                            "active_entity": "phone",
+                            "budget": "up to 20000 DZD",
+                            "preferences": {"category": "phone"},
+                            "objections": ["price"],
+                            "journey_stage": "considering",
+                            "next_step": "compare in-stock options",
+                            "product_id": str(uuid.uuid4()),
+                        },
+                    }
+                )
+            ),
+            LLMResponse(content="What features matter most to you?"),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    await run_turn(engine, db_session, conversation, "I need an affordable phone.")
+    await run_turn(engine, db_session, conversation, "I also care about battery.")
+
+    memory = conversation.metadata_json["agent_working_memory"]
+    assert memory["customer_goal"] == "Find an affordable phone"
+    assert memory["budget"] == "up to 20000 DZD"
+    assert "product_id" not in memory
+    context_message = provider.calls[1][0][1]
+    assert "agent_working_memory" in context_message.content
+    assert "Find an affordable phone" in context_message.content
+
+
+@pytest.mark.asyncio
+async def test_saved_customer_preferences_reach_agent_tool_observation(db_session):
+    _, customer, conversation, _, _ = make_fixture(db_session)
+    db_session.add(
+        CustomerMemory(
+            store_id=conversation.store_id,
+            customer_id=customer.id,
+            memory_type="preference",
+            key="preferred_category",
+            value="Android phones",
+            confidence=0.9,
+            source="customer_stated",
+        )
+    )
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            tool_call("get_customer_context", {}, "customer-context"),
+            LLMResponse(content="I can focus on Android phones you prefer."),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    await run_turn(engine, db_session, conversation, "Show me options.")
+
+    observation = next(
+        message
+        for message in provider.calls[1][0]
+        if message.role == "tool"
+    )
+    assert "Android phones" in observation.content
+    assert "customer_stated" not in observation.content
+    assert str(customer.id) not in observation.content
 
 
 @pytest.mark.asyncio
@@ -728,12 +966,12 @@ async def test_order_history_followup_retrieves_current_status_again(db_session)
 
     assert len(provider.calls) == 4
     assert result["response"] == "نعم، آخر طلب وصل إليك."
-    assert [
+    assert "get_customer_context" in [
         entry["function"]["name"] for entry in provider.calls[0][1]
-    ][-1] == "get_customer_context"
-    assert [
+    ]
+    assert "get_customer_context" in [
         entry["function"]["name"] for entry in provider.calls[2][1]
-    ][-1] == "get_customer_context"
+    ]
 
 
 @pytest.mark.asyncio
@@ -2633,7 +2871,7 @@ async def test_messenger_first_purchase_saves_draft_without_confirming(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_purchase_resumes_through_delivery_details_and_exact_confirmation(
+async def test_purchase_resumes_through_delivery_details_and_natural_confirmation(
     db_session,
 ):
     store, customer, conversation, product, variant = make_fixture(db_session)
@@ -2695,23 +2933,9 @@ async def test_purchase_resumes_through_delivery_details_and_exact_confirmation(
         conversation,
         "نعم",
     )
-    assert "EXECUTE_TOOL:confirm_order" != affirmative_result[
+    assert "EXECUTE_TOOL:confirm_order" == affirmative_result[
         "turn_diagnostics"
     ]["resolver_action"]
-    assert conversation.active_draft_json["items"]
-    assert db_session.query(Order).filter(
-        Order.conversation_id == conversation.id
-    ).count() == 0
-
-    confirmation_result = await run_turn(
-        engine,
-        db_session,
-        conversation,
-        "أكد الطلب",
-    )
-    assert confirmation_result["turn_diagnostics"]["resolver_action"] == (
-        "EXECUTE_TOOL:confirm_order"
-    )
     assert conversation.active_draft_json is None
     assert db_session.query(Order).filter(
         Order.conversation_id == conversation.id,

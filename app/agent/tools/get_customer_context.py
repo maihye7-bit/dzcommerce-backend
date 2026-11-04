@@ -21,10 +21,10 @@ class GetCustomerContextTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read the current customer's verified order history, including recent "
-            "orders, their statuses, totals, and purchased items. Use this for "
-            "order-history questions and follow-ups about the customer's orders. "
-            "The customer and store are resolved by the server."
+            "Read the current customer's verified order history and saved "
+            "preferences. Use this for order-history questions or when a relevant "
+            "stored preference could improve a requested recommendation; do not "
+            "call it on every turn. The customer and store are resolved by the server."
         )
 
     @property

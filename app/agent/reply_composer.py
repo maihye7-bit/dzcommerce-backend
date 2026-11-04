@@ -480,22 +480,17 @@ class ReplyComposer:
                     return False
 
         if _STOCK_CLAIM.search(normalized):
-            if len(stocks) != 1:
+            negative_claim = bool(_NEGATIVE_STOCK_CLAIM.search(normalized))
+            if availability_values:
+                if len(availability_values) != 1:
+                    return False
+                if negative_claim and availability_values == {True}:
+                    return False
+                if not negative_claim and availability_values == {False}:
+                    return False
+            elif len(stocks) != 1:
                 return False
-            if (
-                _NEGATIVE_STOCK_CLAIM.search(normalized)
-                and next(iter(stocks)) != 0
-            ):
-                return False
-            if (
-                availability_values == {False}
-                and not _NEGATIVE_STOCK_CLAIM.search(normalized)
-            ):
-                return False
-            if (
-                availability_values == {True}
-                and _NEGATIVE_STOCK_CLAIM.search(normalized)
-            ):
+            elif negative_claim and next(iter(stocks)) != 0:
                 return False
 
         for amount_match in re.finditer(r"\d+(?:[.,]\d+)*", normalized):
@@ -503,7 +498,7 @@ class ReplyComposer:
             if amount is None or amount not in permitted_numbers:
                 return False
 
-        if _STOCK_CLAIM.search(normalized):
+        if _STOCK_CLAIM.search(normalized) and stocks:
             if next(iter(stocks)) not in {
                 cls._parse_price(match.group())
                 for match in re.finditer(r"\d+(?:[.,]\d+)*", normalized)
