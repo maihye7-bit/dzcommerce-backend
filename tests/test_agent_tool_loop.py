@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +17,7 @@ from app.agent.classifier import (
 from app.agent.commerce_resolver import CommerceResolver, ResolutionResult
 from app.agent.conversation_engine import ConversationEngine
 from app.agent.providers.base import LLMResponse
+from app.agent.providers.freellm_provider import FreeLLMProvider
 from app.agent.tools.base import ToolResult
 from app.agent.tools.check_inventory import CheckInventoryTool
 from app.agent.tools.confirm_order import ConfirmOrderTool
@@ -52,6 +54,40 @@ class ScriptedToolProvider:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def openai_chat_response(*, content=None, tool_call=None):
+    message = SimpleNamespace(content=content, tool_calls=[])
+    finish_reason = "stop"
+    if tool_call is not None:
+        message.tool_calls = [
+            SimpleNamespace(
+                id=tool_call["id"],
+                function=SimpleNamespace(
+                    name=tool_call["name"],
+                    arguments=json.dumps(tool_call["arguments"]),
+                ),
+            )
+        ]
+        finish_reason = "tool_calls"
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+
+
+def make_mock_freellm_provider(responses):
+    provider = FreeLLMProvider.__new__(FreeLLMProvider)
+    provider.model = "auto"
+    provider.max_retries = 0
+    provider.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=AsyncMock(side_effect=responses),
+            )
+        )
+    )
+    return provider
 
 
 def tool_call(name, arguments, call_id=None):
@@ -1063,6 +1099,109 @@ async def test_agent_tool_loop_supports_two_tool_rounds(db_session):
     assert details_result.role == "tool"
     assert "variant_id_map" not in details_result.content
     assert str(product.id) not in details_result.content
+
+
+@pytest.mark.asyncio
+async def test_freellm_provider_runs_tool_call_round_trip(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.delenv("DZCOMMERCE_AGENT_TOOL_LOOP_ENABLED", raising=False)
+    provider = make_mock_freellm_provider(
+        [
+            openai_chat_response(
+                tool_call={
+                    "id": "search-call",
+                    "name": "search_products",
+                    "arguments": {"query": "Samsung"},
+                }
+            ),
+            openai_chat_response(content="وجدت Samsung Galaxy."),
+        ]
+    )
+    _, _, conversation, _, _ = make_fixture(db_session)
+    engine = ConversationEngine(provider, make_registry())
+    engine.reply_composer_enabled = False
+
+    assert engine.agent_tool_loop_enabled is True
+    result = await run_turn(engine, db_session, conversation, "Find Samsung")
+
+    assert result["response"] == "وجدت Samsung Galaxy."
+    create = provider.client.chat.completions.create
+    assert create.await_count == 2
+    first_request = create.await_args_list[0].kwargs
+    assert first_request["tools"]
+    assert first_request["tool_choice"] == "auto"
+    second_messages = create.await_args_list[1].kwargs["messages"]
+    assistant_call = next(
+        message
+        for message in second_messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    tool_result = next(
+        message for message in second_messages if message.get("role") == "tool"
+    )
+    assert assistant_call["tool_calls"][0]["id"] == "search-call"
+    assert tool_result["tool_call_id"] == "search-call"
+    assert json.loads(tool_result["content"])["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_freellm_tool_call_cannot_confirm_without_explicit_consent(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.delenv("DZCOMMERCE_AGENT_TOOL_LOOP_ENABLED", raising=False)
+    provider = make_mock_freellm_provider(
+        [
+            openai_chat_response(
+                tool_call={
+                    "id": "confirm-call",
+                    "name": "confirm_order",
+                    "arguments": {},
+                }
+            ),
+            openai_chat_response(content="كيف يمكنني مساعدتك؟"),
+        ]
+    )
+    store, _, conversation, product, variant = make_fixture(
+        db_session,
+        with_draft=True,
+    )
+    prepare_pending_confirmation(conversation, product, variant)
+    db_session.commit()
+    engine = ConversationEngine(provider, make_registry())
+    engine.reply_composer_enabled = False
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "قداش سعرها؟",
+    )
+
+    assert engine.agent_tool_loop_enabled is True
+    assert "تم تأكيد طلبك" not in result["response"]
+    assert conversation.active_draft_json["items"]
+    assert (
+        db_session.query(Order)
+        .filter(
+            Order.conversation_id == conversation.id,
+            Order.store_id == store.id,
+            Order.status == OrderStatus.CONFIRMED,
+        )
+        .count()
+        == 0
+    )
+    tool_result = next(
+        message
+        for message in provider.client.chat.completions.create.await_args_list[
+            1
+        ].kwargs["messages"]
+        if message.get("role") == "tool"
+    )
+    assert tool_result["tool_call_id"] == "confirm-call"
+    assert json.loads(tool_result["content"])["success"] is False
 
 
 @pytest.mark.asyncio

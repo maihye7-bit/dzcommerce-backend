@@ -95,7 +95,7 @@ class ConversationEngine:
             self.registry.register(StoreInfoTool())
         tool_loop_setting = os.getenv("DZCOMMERCE_AGENT_TOOL_LOOP_ENABLED")
         self.agent_tool_loop_enabled = (
-            type(llm_provider).__name__ == "QwenLLMProvider"
+            type(llm_provider).__name__ in {"QwenLLMProvider", "FreeLLMProvider"}
             if tool_loop_setting is None
             else tool_loop_setting.strip().lower() not in {"0", "false", "no", "off"}
         )
