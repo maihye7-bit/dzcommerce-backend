@@ -9,7 +9,11 @@ from typing import Any
 
 from app.channels.adapters.base_real import BaseRealAdapter
 from app.channels.base import ChannelAdapter
-from app.schemas.channel_events import InboundEvent, OutboundMessage
+from app.schemas.channel_events import (
+    InboundAttachment,
+    InboundEvent,
+    OutboundMessage,
+)
 
 
 class FacebookAdapter(BaseRealAdapter, ChannelAdapter):
@@ -36,6 +40,30 @@ class FacebookAdapter(BaseRealAdapter, ChannelAdapter):
             message_data = msg_event.get("message", {})
             sender_id = msg_event.get("sender", {}).get("id", "")
             text = message_data.get("text", "")
+            attachments = []
+            raw_attachments = message_data.get("attachments")
+            for attachment in (
+                raw_attachments if isinstance(raw_attachments, list) else []
+            ):
+                if not isinstance(attachment, dict):
+                    continue
+                payload = attachment.get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                attachments.append(
+                    InboundAttachment(
+                        type=str(attachment.get("type") or "unknown"),
+                        url=(
+                            payload.get("url")
+                            if isinstance(payload.get("url"), str)
+                            else None
+                        ),
+                        metadata=(
+                            {"external_attachment_id": str(attachment["id"])}
+                            if attachment.get("id")
+                            else {}
+                        ),
+                    )
+                )
 
             return InboundEvent(
                 channel=self.channel_name,
@@ -44,6 +72,7 @@ class FacebookAdapter(BaseRealAdapter, ChannelAdapter):
                 external_conversation_id=sender_id,
                 external_user_id=sender_id,
                 message_text=text,
+                attachments=attachments,
                 metadata={"raw_type": "messenger"},
             )
 

@@ -10,6 +10,7 @@ from app.agent.tools.list_catalog import ListCatalogProductsTool
 from app.agent.tools.store_info import StoreInfoTool
 from app.agent.tools.get_customer_context import GetCustomerContextTool
 from app.agent.tools.recommend_products import RecommendProductsTool
+from app.agent.tools.send_product_image import SendProductImageTool
 
 # Create global registry instance
 tool_registry = ToolRegistry()
@@ -26,6 +27,7 @@ _tools_to_register = [
     StoreInfoTool(),
     GetCustomerContextTool(),
     RecommendProductsTool(),
+    SendProductImageTool(),
 ]
 
 for tool in _tools_to_register:

@@ -121,6 +121,191 @@ def test_meta_webhook_uses_bound_store_and_preserves_idempotency(
     )
 
 
+def test_meta_webhook_receives_image_only_and_stores_it_once(
+    client, db_session, monkeypatch
+):
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+    store = Store(name="Image store", slug=f"image-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.flush()
+    db_session.add(
+        ChannelAccount(
+            store_id=store.id,
+            channel="facebook",
+            external_account_id="image-page",
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(webhooks, "_engine", engine)
+    attachment_calls = []
+
+    async def store_attachment(attachments):
+        attachment_calls.append(attachments)
+        return [
+            {
+                "type": "image",
+                "status": "stored",
+                "storage_key": "conversation-attachments/test.png",
+                "mime_type": "image/png",
+                "file_size": 24,
+            }
+        ]
+
+    monkeypatch.setattr(webhooks, "_store_inbound_attachments", store_attachment)
+    sent = []
+
+    async def send_text(recipient_id, text):
+        sent.append((recipient_id, text))
+        return SimpleNamespace(status_code=200, is_success=True, text="{}")
+
+    monkeypatch.setattr(webhooks, "_send_facebook_message", send_text)
+    body = json.dumps(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "image-page",
+                    "messaging": [
+                        {
+                            "sender": {"id": "image-customer"},
+                            "message": {
+                                "mid": "image-only-mid",
+                                "attachments": [
+                                    {
+                                        "type": "image",
+                                        "payload": {
+                                            "url": "https://lookaside.fbsbx.com/image"
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    ).encode()
+    headers = {"X-Hub-Signature-256": _signature(body, secret)}
+
+    first = client.post("/webhooks/meta", content=body, headers=headers)
+    duplicate = client.post("/webhooks/meta", content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert first.json()["count"] == 1
+    assert duplicate.json()["skipped"] == 1
+    assert engine.calls == []
+    assert len(attachment_calls) == 1
+    assert len(sent) == 1
+    assert "لا أستطيع تحليل" in sent[0][1]
+
+    inbound = (
+        db_session.query(Message)
+        .filter(Message.external_message_id == "image-only-mid")
+        .one()
+    )
+    assert inbound.message_type == "image"
+    assert inbound.content == ""
+    assert inbound.metadata_json["attachments"][0]["storage_key"].endswith("test.png")
+
+
+def test_meta_webhook_processes_text_with_image_and_reports_expired_image(
+    client, db_session, monkeypatch
+):
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+    store = Store(name="Mixed store", slug=f"mixed-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.flush()
+    db_session.add(
+        ChannelAccount(
+            store_id=store.id,
+            channel="facebook",
+            external_account_id="mixed-page",
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    engine = RecordingEngine()
+    monkeypatch.setattr(webhooks, "_engine", engine)
+
+    async def failed_attachment(_attachments):
+        return [
+            {
+                "type": "image",
+                "status": "failed",
+                "failure_code": "attachment_unavailable",
+            }
+        ]
+
+    monkeypatch.setattr(webhooks, "_store_inbound_attachments", failed_attachment)
+    sent = []
+
+    async def send_text(recipient_id, text):
+        sent.append(text)
+        return SimpleNamespace(status_code=200, is_success=True, text="{}")
+
+    monkeypatch.setattr(webhooks, "_send_facebook_message", send_text)
+    body = json.dumps(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "mixed-page",
+                    "messaging": [
+                        {
+                            "sender": {"id": "mixed-customer"},
+                            "message": {
+                                "mid": "text-image-mid",
+                                "text": "ما هو سعره؟",
+                                "attachments": [
+                                    {
+                                        "type": "image",
+                                        "payload": {
+                                            "url": "https://lookaside.fbsbx.com/expired"
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    ).encode()
+    response = client.post(
+        "/webhooks/meta",
+        content=body,
+        headers={"X-Hub-Signature-256": _signature(body, secret)},
+    )
+
+    assert response.status_code == 200
+    assert engine.calls[0]["user_message"] == "ما هو سعره؟"
+    assert "تعذر فتح الصورة" in sent[0]
+    inbound = (
+        db_session.query(Message)
+        .filter(Message.external_message_id == "text-image-mid")
+        .one()
+    )
+    assert inbound.message_type == "text_image"
+    assert inbound.metadata_json["attachments"][0]["failure_code"] == "attachment_unavailable"
+    assert (
+        db_session.query(Message)
+        .filter(
+            Message.conversation_id == inbound.conversation_id,
+            Message.role == MessageRole.AGENT,
+        )
+        .order_by(Message.created_at.desc())
+        .first()
+        .content
+        .endswith("تعذر فتح الصورة. أعد إرسالها من فضلك أو صف لي ما تحتاجه.")
+    )
+
+
 def test_meta_webhook_rejects_invalid_signature_before_database_access(
     client, monkeypatch
 ):
@@ -373,7 +558,7 @@ def test_meta_webhook_rolls_back_failed_turn_and_allows_retry(
     assert retry.json()["skipped"] == 0
     assert engine.calls == 2
     assert len(sent_replies) == 2
-    assert "حدث خطأ تقني مؤقت" in sent_replies[0][1]
+    assert "أعد إرسال رسالتك من فضلك" in sent_replies[0][1]
     assert (
         db_session.query(Message)
         .filter(
@@ -605,7 +790,9 @@ async def test_send_facebook_message_uses_page_token_and_v26_graph_api(monkeypat
     }
 
 
-def test_meta_webhook_rejects_unmapped_account(client, db_session, monkeypatch):
+def test_meta_webhook_ignores_unmapped_account_without_processing(
+    client, db_session, monkeypatch
+):
     secret = "test-meta-secret"
     monkeypatch.setenv("META_APP_SECRET", secret)
     body = json.dumps(
@@ -631,7 +818,8 @@ def test_meta_webhook_rejects_unmapped_account(client, db_session, monkeypatch):
         headers={"X-Hub-Signature-256": _signature(body, secret)},
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
     assert db_session.query(Message).count() == 0
 
 

@@ -38,6 +38,7 @@ class AllowedAction(str, Enum):
     SEARCH_PRODUCTS = "EXECUTE_TOOL:search_products"
     LIST_CATALOG_PRODUCTS = "EXECUTE_TOOL:list_catalog_products"
     GET_PRODUCT_DETAILS = "EXECUTE_TOOL:get_product_details"
+    SEND_PRODUCT_IMAGE = "EXECUTE_TOOL:send_product_image"
     CREATE_ORDER_DRAFT_TOOL = "EXECUTE_TOOL:create_order_draft"
     UPDATE_ORDER_DRAFT_TOOL = "EXECUTE_TOOL:update_order_draft"
     CREATE_DRAFT = "CALL_SERVICE:create_draft"
@@ -104,6 +105,42 @@ class CommerceResolver:
             "last_intent": intent,
             "last_nlu": nlu_output or {},
         }
+
+        if intent == "product_image_request":
+            selected_product_id = self._parse_uuid(state.get("selected_product_id"))
+            selected_product = (
+                self.db.query(Product)
+                .filter(
+                    Product.id == selected_product_id,
+                    Product.store_id == store_id,
+                    Product.is_active.is_(True),
+                )
+                .one_or_none()
+                if selected_product_id is not None
+                else None
+            )
+            if selected_product is None:
+                return ResolutionResult(
+                    allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
+                    resolved_entities={},
+                    context_updates=base_context,
+                    response_hint=text(
+                        "أي منتج تريد أن أرسل صورته؟",
+                        "Pour quel produit souhaitez-vous recevoir une photo ?",
+                    ),
+                )
+            return ResolutionResult(
+                allowed_action=AllowedAction.SEND_PRODUCT_IMAGE.value,
+                resolved_entities={
+                    "product_id": str(selected_product.id),
+                    "product_name": selected_product.name,
+                },
+                context_updates=base_context,
+                response_hint=text(
+                    "سأرسل لك صورة المنتج الآن.",
+                    "Je vous envoie la photo du produit.",
+                ),
+            )
 
         if (nlu_output or {}).get("availability_query") is True:
             return self._resolve_variant_availability(

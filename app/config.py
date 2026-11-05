@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     PRODUCT_IMAGE_STORAGE_DIR: str | None = None
     RAILWAY_VOLUME_MOUNT_PATH: str | None = None
     RAILWAY_ENVIRONMENT: str | None = None
+    RAILWAY_PUBLIC_DOMAIN: str | None = None
 
     @model_validator(mode="after")
     def require_secure_production_secret(self):

@@ -136,12 +136,38 @@ def handle_inbound_event(
     # Store the inbound message with external ID for idempotency
     from app.models.conversation import MessageRole
 
+    attachment_metadata = [
+        {
+            "type": attachment.type,
+            "status": "not_downloaded" if attachment.url else "unavailable",
+            **attachment.metadata,
+        }
+        for attachment in event.attachments
+    ]
+    has_image = any(
+        attachment.type == "image" for attachment in event.attachments
+    )
     msg = Message(
         conversation_id=conversation.id,
         role=MessageRole.CUSTOMER,
         content=event.message_text,
-        message_type=event.event_type,
+        message_type=(
+            "text_image"
+            if event.message_text.strip() and has_image
+            else "image"
+            if has_image
+            else "text_attachment"
+            if event.message_text.strip() and event.attachments
+            else "attachment"
+            if event.attachments
+            else event.event_type
+        ),
         external_message_id=event.external_message_id,
+        metadata_json=(
+            {"attachments": attachment_metadata}
+            if attachment_metadata
+            else None
+        ),
     )
     db.add(msg)
     db.commit()

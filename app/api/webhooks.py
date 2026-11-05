@@ -5,6 +5,7 @@ CRITICAL: Implements safe INSERT-or-SKIP logic for incoming messages.
 """
 import json
 import logging
+import re
 import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -21,6 +22,12 @@ from app.services.webhook_security import (
     verify_meta_verify_token,
     verify_whatsapp_verify_token,
 )
+from app.services.inbound_attachments import (
+    InboundAttachmentError,
+    download_and_store_meta_image,
+)
+from app.services import product_image_storage
+from app.services.exceptions import ImageStorageError
 
 # Imports for Phase 12-D Integration (FIXED: Added #)
 from app.agent.conversation_engine import ConversationEngine
@@ -86,6 +93,160 @@ async def _send_facebook_message(recipient_id: str, text: str) -> httpx.Response
             json=payload,
         )
 
+
+def _extract_message_attachments(message_data: dict) -> list[dict]:
+    attachments = message_data.get("attachments")
+    if not isinstance(attachments, list):
+        return []
+    extracted = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        payload = attachment.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        attachment_id = attachment.get("id")
+        extracted.append(
+            {
+                "type": str(attachment.get("type") or "unknown").casefold(),
+                "url": payload.get("url") if isinstance(payload.get("url"), str) else None,
+                "metadata": (
+                    {"external_attachment_id": str(attachment_id)}
+                    if attachment_id
+                    else {}
+                ),
+            }
+        )
+    return extracted
+
+
+async def _store_inbound_attachments(attachments: list[dict]) -> list[dict]:
+    stored = []
+    for attachment in attachments:
+        attachment_type = attachment["type"]
+        record = {"type": attachment_type, **attachment["metadata"]}
+        if attachment_type != "image":
+            record["status"] = "unsupported"
+        elif not attachment.get("url"):
+            record["status"] = "unavailable"
+        else:
+            try:
+                record.update(
+                    await download_and_store_meta_image(attachment["url"])
+                )
+            except InboundAttachmentError as exc:
+                record.update(status="failed", failure_code=exc.failure_code)
+                logger.warning(
+                    "meta_attachment_receive_failed type=%s failure_code=%s",
+                    attachment_type,
+                    exc.failure_code,
+                )
+            except Exception as exc:
+                record.update(
+                    status="failed",
+                    failure_code="attachment_processing_failed",
+                )
+                logger.error(
+                    "meta_attachment_receive_failed type=%s failure_type=%s",
+                    attachment_type,
+                    type(exc).__name__,
+                )
+        stored.append(record)
+    return stored
+
+
+def _attachment_notice(attachments: list[dict], language: str) -> str:
+    has_stored_image = any(
+        attachment.get("type") == "image"
+        and attachment.get("status") == "stored"
+        for attachment in attachments
+    )
+    has_failed_image = any(
+        attachment.get("type") == "image"
+        and attachment.get("status") != "stored"
+        for attachment in attachments
+    )
+    if has_failed_image:
+        return (
+            "تعذر فتح الصورة. أعد إرسالها من فضلك أو صف لي ما تحتاجه."
+            if language == "ar"
+            else "Je n'ai pas pu ouvrir la photo. Vous pouvez la renvoyer ou me décrire votre demande."
+            if language == "fr"
+            else "I couldn't open the image. Please resend it or describe what you need."
+        )
+    if has_stored_image:
+        return (
+            "وصلتني الصورة، لكن لا أستطيع تحليل محتواها بصرياً حالياً. صف لي ما تحتاجه وسأساعدك."
+            if language == "ar"
+            else "J'ai bien reçu la photo, mais je ne peux pas analyser son contenu visuellement pour le moment. Décrivez-moi votre besoin."
+            if language == "fr"
+            else "I received the image, but I can't analyze its visual contents right now. Please describe what you need."
+        )
+    return (
+        "وصلني المرفق، لكن لا يمكنني قراءته حالياً. أرسل صورة بصيغة مدعومة أو صف لي ما تحتاجه."
+        if language == "ar"
+        else "J'ai reçu la pièce jointe, mais je ne peux pas la lire pour le moment."
+        if language == "fr"
+        else "I received the attachment, but can't read it right now."
+    )
+
+
+def _message_language(text: str) -> str:
+    if re.search(r"[\u0600-\u06ff]", text or ""):
+        return "ar"
+    if re.search(
+        r"\b(?:bonjour|merci|photo|produit|envoyer|est-ce|vous)\b",
+        text or "",
+        re.IGNORECASE,
+    ):
+        return "fr"
+    return "ar"
+
+
+def _persist_webhook_reply(
+    db: Session,
+    conversation_id: uuid.UUID,
+    response: str,
+    previous_response: str | None = None,
+) -> None:
+    message = None
+    if previous_response:
+        message = (
+            db.query(Message)
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.role == MessageRole.AGENT,
+                Message.content == previous_response,
+            )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .first()
+        )
+    if message is not None:
+        message.content = response
+    else:
+        db.add(
+            Message(
+                conversation_id=conversation_id,
+                role=MessageRole.AGENT,
+                content=response,
+            )
+        )
+    db.commit()
+
+
+def _delete_stored_attachments(attachments: list[dict]) -> None:
+    for attachment in attachments:
+        storage_key = attachment.get("storage_key")
+        if attachment.get("status") != "stored" or not isinstance(storage_key, str):
+            continue
+        try:
+            product_image_storage.delete_image(storage_key)
+        except ImageStorageError as exc:
+            logger.error(
+                "meta_attachment_cleanup_failed failure_type=%s",
+                type(exc).__name__,
+            )
+
+
 def _persist_inbound_message(
     db: Session,
     conversation_id: uuid.UUID,
@@ -94,16 +255,42 @@ def _persist_inbound_message(
     sender_id: str,
     text: str,
     external_message_id: str | None,
+    attachments: list[dict] | None = None,
 ) -> bool:
     """Stage an inbound event; return False only for its scoped duplicate."""
-    db.add(
-        Message(
-            conversation_id=conversation_id,
-            role=MessageRole.CUSTOMER,
-            content=text,
-            external_message_id=external_message_id,
-        )
+    attachments = attachments or []
+    has_image = any(attachment["type"] == "image" for attachment in attachments)
+    initial_attachment_metadata = [
+        {
+            "type": attachment["type"],
+            "status": "pending" if attachment.get("url") else "unavailable",
+            **attachment["metadata"],
+        }
+        for attachment in attachments
+    ]
+    message = Message(
+        conversation_id=conversation_id,
+        role=MessageRole.CUSTOMER,
+        content=text,
+        message_type=(
+            "text_image"
+            if text.strip() and has_image
+            else "image"
+            if has_image
+            else "text_attachment"
+            if text.strip() and attachments
+            else "attachment"
+            if attachments
+            else "text"
+        ),
+        external_message_id=external_message_id,
+        metadata_json=(
+            {"attachments": initial_attachment_metadata}
+            if attachments
+            else None
+        ),
     )
+    db.add(message)
     try:
         db.flush()
     except IntegrityError as exc:
@@ -330,12 +517,14 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             if not sender_id:
                 continue
                 
-            if not isinstance(message_data, dict) or not isinstance(
-                message_data.get("text"), str
-            ):
+            if not isinstance(message_data, dict):
                 continue
-                
-            text = message_data["text"]
+            message_text = message_data.get("text")
+            text = message_text if isinstance(message_text, str) else ""
+            raw_attachments = _extract_message_attachments(message_data)
+            if not text.strip() and not raw_attachments:
+                continue
+
             external_mid = message_data.get("mid")
             delivery_trace_id = uuid.uuid4().hex
 
@@ -352,6 +541,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             customer = None
             turn_diagnostics = {}
             response_sent_count = 0
+            attachment_metadata = []
 
             try:
                 # 1. Resolve only the store bound to this signed Meta account.
@@ -405,6 +595,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     sender_id=sender_id,
                     text=text,
                     external_message_id=external_mid,
+                    attachments=raw_attachments,
                 )
 
                 # If duplicate, skip the rest of the processing for this event
@@ -422,29 +613,98 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     print("♻️ Duplicate inbound event skipped.")
                     continue
 
-                # 5. Process via Engine (Only for NEW messages)
-                result = await _engine.process_message(
-                    db=db,
-                    store_id=store.id,
-                    customer_id=customer.id,
-                    conversation_id=conv.id,
-                    channel=channel,
-                    user_message=text,
+                inbound_query = db.query(Message).filter(
+                    Message.conversation_id == conv.id,
+                    Message.role == MessageRole.CUSTOMER,
                 )
-                ai_reply = result.get("response", "")
-                turn_diagnostics = result.get("turn_diagnostics") or {}
-                processing_failed = bool(result.get("processing_failed"))
-                
-                logger.debug(
-                    "AGENT_REPLY delivery_id=%s reply_length=%d",
-                    delivery_trace_id,
-                    len(ai_reply),
+                if external_mid:
+                    inbound_query = inbound_query.filter(
+                        Message.external_message_id == external_mid
+                    )
+                else:
+                    inbound_query = inbound_query.filter(Message.content == text)
+                inbound_message = (
+                    inbound_query.order_by(
+                        Message.created_at.desc(),
+                        Message.id.desc(),
+                    )
+                    .first()
                 )
-                
-                # Log tool usage
-                if result.get("tool_calls"):
-                    tools_used = [tc['name'] for tc in result['tool_calls']]
-                    print(f"🔧 Tools Executed: {tools_used}")
+                if inbound_message is None:
+                    raise InboundMessagePersistenceError
+
+                if raw_attachments:
+                    attachment_metadata = await _store_inbound_attachments(
+                        raw_attachments
+                    )
+                if raw_attachments:
+                    has_image = any(
+                        attachment["type"] == "image"
+                        for attachment in raw_attachments
+                    )
+                    inbound_message.message_type = (
+                        "text_image"
+                        if text.strip() and has_image
+                        else "image"
+                        if has_image
+                        else "text_attachment"
+                        if text.strip()
+                        else "attachment"
+                    )
+                    inbound_message.metadata_json = {
+                        "attachments": attachment_metadata
+                    }
+
+                if raw_attachments and not text.strip():
+                    ai_reply = _attachment_notice(
+                        attachment_metadata,
+                        _message_language(text),
+                    )
+                    _persist_webhook_reply(db, conv.id, ai_reply)
+                    turn_diagnostics = {
+                        "intent": "image_received",
+                        "resolver_action": "RESPOND:text_only",
+                        "response_candidates": 1,
+                    }
+                else:
+                    result = await _engine.process_message(
+                        db=db,
+                        store_id=store.id,
+                        customer_id=customer.id,
+                        conversation_id=conv.id,
+                        channel=channel,
+                        user_message=text,
+                    )
+                    ai_reply = result.get("response", "")
+                    turn_diagnostics = result.get("turn_diagnostics") or {}
+                    processing_failed = bool(result.get("processing_failed"))
+
+                    if raw_attachments:
+                        previous_reply = ai_reply
+                        notice = _attachment_notice(
+                            attachment_metadata,
+                            _message_language(text),
+                        )
+                        ai_reply = f"{ai_reply}\n\n{notice}".strip()
+                        if processing_failed:
+                            _delete_stored_attachments(attachment_metadata)
+                        else:
+                            _persist_webhook_reply(
+                                db,
+                                conv.id,
+                                ai_reply,
+                                previous_response=previous_reply,
+                            )
+
+                    logger.debug(
+                        "AGENT_REPLY delivery_id=%s reply_length=%d",
+                        delivery_trace_id,
+                        len(ai_reply),
+                    )
+
+                    if result.get("tool_calls"):
+                        tools_used = [tc["name"] for tc in result["tool_calls"]]
+                        print(f"🔧 Tools Executed: {tools_used}")
 
             except InboundMessagePersistenceError as persistence_error:
                 raise HTTPException(
@@ -452,10 +712,19 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     detail="Failed to persist inbound message",
                 ) from persistence_error
             except Exception as engine_err:
-                print(f"❌ Engine/AI Error: {str(engine_err)}")
+                logger.error(
+                    "conversation_processing_failed error_type=%s",
+                    type(engine_err).__name__,
+                )
                 db.rollback()
+                _delete_stored_attachments(attachment_metadata)
                 # The complete turn was rolled back, so only an apology can be sent.
-                ai_reply = "عذراً، حدث خطأ تقني مؤقت. سأحاول مساعدتك لاحقاً."
+                ai_reply = "عذراً، حدث خطأ مؤقت. أعد إرسال رسالتك من فضلك."
+                if raw_attachments:
+                    ai_reply += "\n\n" + _attachment_notice(
+                        attachment_metadata,
+                        _message_language(text),
+                    )
                 processing_failed = True
 
             # Send Reply Logic
@@ -486,15 +755,13 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                             )
                         else:
                             logger.error(
-                                "SEND_FAIL status_code=%d response=%s",
+                                "SEND_FAIL status_code=%d",
                                 send_response.status_code,
-                                send_response.text,
                             )
                     except (httpx.HTTPError, RuntimeError) as send_err:
                         logger.error(
-                            "SEND_FAIL error_type=%s message=%s",
+                            "SEND_FAIL error_type=%s",
                             type(send_err).__name__,
-                            str(send_err),
                         )
 
             logger.info(

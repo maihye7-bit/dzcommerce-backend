@@ -11,6 +11,22 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+class InboundAttachment(BaseModel):
+    """Normalized attachment reference from an inbound channel event."""
+
+    type: str
+    url: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OutboundAttachment(BaseModel):
+    """Normalized media item for a channel adapter to send."""
+
+    type: str
+    url: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class InboundEvent(BaseModel):
     """
     Normalized representation of ANY incoming social event.
@@ -24,7 +40,8 @@ class InboundEvent(BaseModel):
     external_conversation_id: str  # Platform's conversation/thread ID
     external_user_id: str  # Platform's user/sender ID
     customer_name: Optional[str] = None  # Display name from platform
-    message_text: str  # The actual text content (Unicode safe)
+    message_text: str = ""  # The actual text content (Unicode safe)
+    attachments: list[InboundAttachment] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)  # Platform-specific extras
     received_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -38,6 +55,7 @@ class OutboundMessage(BaseModel):
     channel: str  # Target channel
     recipient_external_id: str  # Platform's user/conversation ID
     text: str  # Response text (Unicode safe)
+    attachments: list[OutboundAttachment] = Field(default_factory=list)
     reply_to_external_id: Optional[str] = None  # For comment replies
     metadata: dict[str, Any] = Field(default_factory=dict)
 

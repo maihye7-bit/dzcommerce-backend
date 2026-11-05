@@ -16,6 +16,27 @@ from app.models.webhook_log import WebhookLog
 from app.services import channel_service
 
 
+def _redact_webhook_payload(value: Any, key: str = "") -> Any:
+    normalized_key = key.casefold()
+    if normalized_key in {
+        "access_token",
+        "authorization",
+        "message",
+        "text",
+        "url",
+        "token",
+    } or "url" in normalized_key or normalized_key.endswith("_token"):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_webhook_payload(child_value, str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_webhook_payload(item) for item in value]
+    return value
+
+
 async def process_webhook_event(
     db: Session,
     adapter: ChannelAdapter,
@@ -35,8 +56,8 @@ async def process_webhook_event(
         channel=adapter.channel_name,
         event_type="unknown",
         payload_json=json.dumps(
-            raw_payload
-        ),  # Convert dict to JSON string for SQLite compatibility
+            _redact_webhook_payload(raw_payload)
+        ),
     )
     db.add(log_entry)
     db.flush()
@@ -85,8 +106,11 @@ async def process_webhook_event(
         return result
 
     except Exception as e:
-        log_entry.error_message = str(e)
+        log_entry.error_message = (
+            f"Webhook processing failed ({type(e).__name__})."
+        )
         db.commit()
         raise HTTPException(
-            status_code=500, detail=f"Webhook processing failed: {str(e)}"
+            status_code=500,
+            detail="Webhook processing failed.",
         )

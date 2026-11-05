@@ -30,6 +30,7 @@ from app.agent.tools.store_info import StoreInfoTool
 from app.agent.commerce_resolver import CommerceResolver, ResolutionResult, AllowedAction
 from app.agent.reply_composer import ReplyComposer
 from app.agent.classifier import ConversationClassifier, classify_message
+from app.agent.tools.send_product_image import is_product_image_request
 from app.core.config import QWEN_TIMEOUT
 from app.models.conversation import (
     Conversation,
@@ -42,6 +43,7 @@ from app.models.order import Order, OrderStatus
 from app.models.store import Store
 from app.models.inventory import InventoryItem
 from app.models.product import Product, ProductVariant
+from app.services.algerian_wilayas import resolve_delivery_wilaya
 from app.services import usage_service
 
 MAX_TOOL_ROUNDS = 3
@@ -2573,6 +2575,18 @@ class ConversationEngine:
                     "response_hint": delivery_info_reply,
                 }
                 current_state["_bypass_conversational"] = True
+        image_request = (
+            channel == "facebook" and is_product_image_request(user_message)
+        )
+        if image_request and not delivery_info_capture_turn:
+            local_message_nlu = {
+                **local_message_nlu,
+                "intent": "product_image_request",
+                "intent_guess": "product_image_request",
+                "product_mention": None,
+                "confirmation_phrase": False,
+            }
+            current_state.pop("_bypass_conversational", None)
         turn_plan = self._extract_turn_plan(user_message, current_state)
         if turn_plan["selection"] is not None:
             local_message_nlu = {
@@ -2649,7 +2663,7 @@ class ConversationEngine:
         )
         post_confirmation_response = None
         post_confirmation_nlu = None
-        if has_confirmed_order:
+        if has_confirmed_order and not image_request:
             post_confirmation_action, post_confirmation_nlu = (
                 self._classify_post_confirmation_message(
                     user_message,
@@ -2731,6 +2745,9 @@ class ConversationEngine:
                 else:
                     post_confirmation_nlu["intent"] = "product_search"
                     post_confirmation_nlu["intent_guess"] = "product_search"
+        if image_request:
+            post_confirmation_response = None
+            post_confirmation_nlu = None
         dialogue_context = self._recent_dialogue_context(
             db,
             conv_id,
@@ -2750,6 +2767,7 @@ class ConversationEngine:
                 or pending_purchase_request
                 or idempotent_order_request
                 or delivery_info_capture_turn
+                or image_request
                 or turn_plan["has_actions"]
             )
             else None
@@ -2785,6 +2803,7 @@ class ConversationEngine:
             and not variant_availability_query
             and not self._contains_sensitive_nlu_content(user_message)
             and not turn_plan["has_actions"]
+            and not image_request
         ):
             fallback_nlu = self._heuristic_nlu(user_message, current_state)
             if re.search(r"[\u0600-\u06ff]", user_message):
@@ -3041,6 +3060,7 @@ class ConversationEngine:
                 "customer_id": customer_id,
                 "conversation_id": conv_id,
                 "channel": channel,
+                "user_message": user_message,
             }
             if tool_name in {
                 "create_order_draft",
@@ -3094,23 +3114,33 @@ class ConversationEngine:
             
             # Generate natural language response from tool result
             if tool_result.success:
-                final_response_content = await self._generate_localized_final_text(
-                    tool_result.data,
-                    decision.response_hint,
-                    user_message,
-                    nlu_output.get("language", "ar"),
-                    nlu_output.get("intent", "unknown"),
-                    repeat_product=bool(
-                        isinstance(tool_result.data.get("products"), list)
-                        and current_state.get("selected_product_id")
-                        and any(
-                            isinstance(product, dict)
-                            and str(product.get("id"))
-                            == str(current_state.get("selected_product_id"))
-                            for product in tool_result.data["products"]
-                        )
-                    ),
-                )
+                if tool_name == "send_product_image":
+                    language = nlu_output.get("language", "ar")
+                    final_response_content = (
+                        "تفضل، أرسلت لك صورة المنتج."
+                        if language == "ar"
+                        else "Voici la photo du produit."
+                        if language == "fr"
+                        else "Here is the product photo."
+                    )
+                else:
+                    final_response_content = await self._generate_localized_final_text(
+                        tool_result.data,
+                        decision.response_hint,
+                        user_message,
+                        nlu_output.get("language", "ar"),
+                        nlu_output.get("intent", "unknown"),
+                        repeat_product=bool(
+                            isinstance(tool_result.data.get("products"), list)
+                            and current_state.get("selected_product_id")
+                            and any(
+                                isinstance(product, dict)
+                                and str(product.get("id"))
+                                == str(current_state.get("selected_product_id"))
+                                for product in tool_result.data["products"]
+                            )
+                        ),
+                    )
                 if (
                     tool_name in {"search_products", "list_catalog_products"}
                     and self.reply_composer_enabled
@@ -3151,6 +3181,27 @@ class ConversationEngine:
                     tool_result.error,
                 )
                 if (
+                    tool_name == "send_product_image"
+                    and error_code == "NO_IMAGE"
+                ):
+                    language = nlu_output.get("language", "ar")
+                    final_response_content = (
+                        "ما كايناش صورة مسجلة لهذا المنتج حالياً."
+                        if language == "ar"
+                        else "Aucune photo n'est enregistrée pour ce produit."
+                        if language == "fr"
+                        else "There is no image registered for this product yet."
+                    )
+                elif tool_name == "send_product_image":
+                    language = nlu_output.get("language", "ar")
+                    final_response_content = (
+                        "تعذر إرسال صورة المنتج الآن. يمكنني مساعدتك بمعلوماته."
+                        if language == "ar"
+                        else "Je n'ai pas pu envoyer la photo pour le moment."
+                        if language == "fr"
+                        else "I couldn't send the product photo right now."
+                    )
+                elif (
                     tool_name == "create_order_draft"
                     and error_code in {"VALIDATION_ERROR", "NOT_FOUND"}
                     and tool_result.error
@@ -4183,34 +4234,8 @@ class ConversationEngine:
             phone = f"0{digits[3:]}" if digits.startswith("213") else digits
             remainder = remainder[:phone_match.start()] + " " + remainder[phone_match.end():]
 
-        normalized_remainder = normalize_product_search_text(remainder)
-        configured_wilayas = [
-            item.strip()
-            for item in re.split(r"[,،;؛|/]+", served_wilayas or "")
-            if item.strip()
-        ]
-        wilaya = next(
-            (
-                item
-                for item in configured_wilayas
-                if normalize_product_search_text(item)
-                and normalize_product_search_text(item)
-                in normalized_remainder
-            ),
-            None,
-        )
-        if wilaya is None:
-            # Only trust an explicitly labeled wilaya when the store has no
-            # configured list; arbitrary Arabic text is not delivery data.
-            explicit_wilaya = re.search(
-                r"(?<!\w)(?:ولاية|[Ww]ilaya|[Oo]laya)\s*[:：،,-]?\s*"
-                r"([\u0600-\u06ffA-Za-z][\u0600-\u06ffA-Za-z\s'-]{1,39})",
-                remainder,
-            )
-            if explicit_wilaya:
-                wilaya = explicit_wilaya.group(1).strip(" ،,؛;:-")
-
-        return phone, wilaya
+        resolved_wilaya = resolve_delivery_wilaya(remainder, served_wilayas)
+        return phone, resolved_wilaya.name_ar if resolved_wilaya else None
 
     @classmethod
     def _draft_next_step_response(
@@ -6031,6 +6056,11 @@ Rules:
             
         elif tool_name == "get_product_details":
             # Product ID MUST come from resolver's DB lookup
+            pid = resolved_data.get("product_id")
+            if pid:
+                args["product_id"] = str(pid)
+
+        elif tool_name == "send_product_image":
             pid = resolved_data.get("product_id")
             if pid:
                 args["product_id"] = str(pid)
