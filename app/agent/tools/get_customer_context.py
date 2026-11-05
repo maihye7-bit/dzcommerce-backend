@@ -6,6 +6,7 @@ Uses CustomerContextService internally. Never accesses DB directly.
 import uuid
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
@@ -86,6 +87,8 @@ class GetCustomerContextTool(BaseTool):
             return ToolResult(success=False, error="Customer not found")
         except (ValueError, TypeError) as e:
             return ToolResult(success=False, error="Invalid arguments")
+        except SQLAlchemyError:
+            raise
         except Exception:
             return ToolResult(
                 success=False, error="Failed to retrieve customer context"

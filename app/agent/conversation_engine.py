@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.providers.base import LLMMessage
 from app.agent.tools.base import ToolResult
-from app.agent.tools.registry import ToolRegistry
+from app.agent.tools.registry import ToolRegistry, ToolSessionUnusableError
 from app.agent.tools.search_products import normalize_product_search_text
 from app.agent.tools.store_info import StoreInfoTool
 from app.agent.commerce_resolver import CommerceResolver, ResolutionResult, AllowedAction
@@ -58,6 +58,34 @@ AGENT_TOOL_NAMES = (
 )
 SAFE_FALLBACK_RESPONSE = "عذراً، لم أتمكن من إكمال طلبك حالياً. يرجى المحاولة مرة أخرى لاحقاً."
 logger = logging.getLogger(__name__)
+
+
+def _log_agent_tool_database_failure(
+    tool_name: str,
+    exc: SQLAlchemyError,
+    transaction_before: str,
+    db: Session,
+    *,
+    recovery_succeeded: bool,
+) -> None:
+    original = getattr(exc, "orig", None)
+    sqlstate = getattr(original, "pgcode", None) or getattr(
+        original, "sqlstate", None
+    )
+    logger.error(
+        "agent_tool_dispatch_database_failure tool=%s transaction_before=%s "
+        "transaction_after_active=%s transaction_after_in_transaction=%s "
+        "exception_class=%s dbapi_exception_class=%s sqlstate=%s "
+        "savepoint_recovery_succeeded=%s",
+        tool_name,
+        transaction_before,
+        db.is_active,
+        db.in_transaction(),
+        type(exc).__name__,
+        type(original).__name__ if original is not None else "unavailable",
+        sqlstate or "unavailable",
+        recovery_succeeded,
+    )
 
 
 class ConversationState(TypedDict, total=False):
@@ -257,8 +285,8 @@ class ConversationEngine:
                     "product_name": {
                         "type": "string",
                         "description": (
-                            "Optional exact product name when selecting from "
-                            "current search results."
+                            "Optional exact product name from the current search "
+                            "results or selected conversation context."
                         ),
                     }
                 },
@@ -790,10 +818,12 @@ class ConversationEngine:
             product = sanitized["product"]
             facts["products"] = [
                 {
-                    "name": product.get("name"),
+                    **product,
                     "price": product.get("base_price"),
                 }
             ]
+        if isinstance(sanitized.get("images"), list):
+            facts["product_images"] = sanitized["images"]
         if isinstance(sanitized.get("variants"), list):
             facts["variants"] = sanitized["variants"]
         if tool_name == "check_inventory":
@@ -978,6 +1008,19 @@ class ConversationEngine:
                     "availability, recommendations for relevant in-stock alternatives, "
                     "and customer context for order history or relevant saved "
                     "preferences.\n"
+                    "- When the customer asks about a product's description, features, "
+                    "sizes, colors, options, or photos, call get_product_details for "
+                    "the selected product before answering. If a single product is "
+                    "found and the customer is asking about its details, retrieve its "
+                    "details before answering. A short follow-up about a product refers "
+                    "to the selected product in the conversation unless the customer "
+                    "changes it. Do not call details for unrelated messages or repeat "
+                    "a details call already completed in this turn.\n"
+                    "- Use only fields present in the tool result. If the description, "
+                    "feature, option, or image is missing, say it is not recorded or "
+                    "ask a brief clarification; never infer or invent product facts. "
+                    "Image records provide URLs/metadata, not visual inspection of "
+                    "the image contents.\n"
                     "- After each result, reassess the goal. On NO_RESULTS or another "
                     "recoverable failure, do not stop automatically or repeat the same "
                     "request; try a meaningfully different query/tool if justified, "
@@ -1213,6 +1256,23 @@ class ConversationEngine:
                     last_tool_result,
                 )
 
+            transaction_before = (
+                f"active={db.is_active},in_transaction={db.in_transaction()}"
+            )
+            try:
+                savepoint = db.begin_nested()
+            except SQLAlchemyError as exc:
+                _log_agent_tool_database_failure(
+                    tool_name,
+                    exc,
+                    transaction_before,
+                    db,
+                    recovery_succeeded=False,
+                )
+                raise ToolSessionUnusableError(
+                    "Could not establish a savepoint for agent tool dispatch"
+                ) from exc
+
             try:
                 execution = await self._execute_agent_tool_call(
                     tool_name=tool_name,
@@ -1226,13 +1286,63 @@ class ConversationEngine:
                     channel=channel,
                     state=current_state,
                 )
+                savepoint.commit()
+            except ToolSessionUnusableError:
+                if savepoint.is_active:
+                    savepoint.rollback()
+                raise
             except Exception as exc:
-                logger.warning(
-                    "Agent tool dispatch failed (tool=%s, error_type=%s)",
-                    tool_name,
-                    type(exc).__name__,
-                )
-                execution = None
+                recovery_succeeded = False
+                try:
+                    if savepoint.is_active:
+                        savepoint.rollback()
+                        recovery_succeeded = db.is_active
+                except SQLAlchemyError:
+                    recovery_succeeded = False
+
+                if isinstance(exc, SQLAlchemyError):
+                    _log_agent_tool_database_failure(
+                        tool_name,
+                        exc,
+                        transaction_before,
+                        db,
+                        recovery_succeeded=recovery_succeeded,
+                    )
+                    if not recovery_succeeded:
+                        raise ToolSessionUnusableError(
+                            "Could not recover the database session after agent tool dispatch"
+                        ) from exc
+                    execution = (
+                        ResolutionResult(
+                            allowed_action=AllowedAction.NATURAL_RESPONSE.value
+                        ),
+                        {
+                            "intent": "unknown",
+                            "intent_guess": "unknown",
+                            "language": language,
+                            "confidence": 0.0,
+                        },
+                        tool_name,
+                        ToolResult(
+                            success=False,
+                            error=(
+                                "A temporary database error occurred; no result "
+                                "was produced. This is not a NO_RESULTS result."
+                            ),
+                            error_code="DATABASE_ERROR",
+                        ),
+                    )
+                else:
+                    if not recovery_succeeded:
+                        raise ToolSessionUnusableError(
+                            "Could not recover the database session after agent tool dispatch"
+                        ) from exc
+                    logger.warning(
+                        "Agent tool dispatch failed (tool=%s, error_type=%s)",
+                        tool_name,
+                        type(exc).__name__,
+                    )
+                    execution = None
 
             call_id = str(call.get("id") or uuid.uuid4())
             messages.append(
@@ -1289,6 +1399,13 @@ class ConversationEngine:
                 if tool_result.success
                 else {
                     "success": False,
+                    "category": (
+                        "technical_error"
+                        if tool_result.error_code == "DATABASE_ERROR"
+                        else "no_results"
+                        if tool_result.error_code == "NO_RESULTS"
+                        else "tool_error"
+                    ),
                     "error_code": tool_result.error_code or "TOOL_ERROR",
                     "message": self._tool_error_response(
                         executed_tool_name,
@@ -1305,6 +1422,10 @@ class ConversationEngine:
                     content=json.dumps(safe_result, ensure_ascii=False),
                 )
             )
+            if not db.is_active:
+                raise ToolSessionUnusableError(
+                    "Refusing to refresh conversation using an inactive database session"
+                )
             db.flush()
             db.refresh(
                 conversation,
@@ -2089,38 +2210,11 @@ class ConversationEngine:
             "conversation_id": conversation.id,
             "channel": channel,
         }
-        if tool_name in {
-            "create_order_draft",
-            "update_order_draft",
-            "confirm_order",
-        }:
-            try:
-                with db.begin_nested():
-                    tool_result = await self.registry.aexecute(
-                        tool_name=tool_name,
-                        arguments=safe_arguments,
-                        context=tool_context,
-                    )
-            except Exception:
-                logger.exception(
-                    "Agent mutating commerce tool failed; its savepoint was rolled back "
-                    "(tool=%s)",
-                    tool_name,
-                )
-                tool_result = ToolResult(
-                    success=False,
-                    error=(
-                        "The commerce operation failed and was rolled back. "
-                        "The existing order state is unchanged."
-                    ),
-                    error_code="TOOL_ERROR",
-                )
-        else:
-            tool_result = await self.registry.aexecute(
-                tool_name=tool_name,
-                arguments=safe_arguments,
-                context=tool_context,
-            )
+        tool_result = await self.registry.aexecute(
+            tool_name=tool_name,
+            arguments=safe_arguments,
+            context=tool_context,
+        )
         if (
             tool_name == "get_product_details"
             and tool_result.success
@@ -2761,6 +2855,7 @@ class ConversationEngine:
                 agent_draft_created = True
             if (
                 tool_name == "get_product_details"
+                and nlu_output.get("intent") in {"order_create", "variant_selection"}
                 and tool_result is not None
                 and tool_result.success
                 and isinstance(tool_result.data, dict)
@@ -4454,6 +4549,16 @@ class ConversationEngine:
     ) -> str:
         is_french = language == "fr"
         is_english = language == "en"
+        if error_code == "DATABASE_ERROR":
+            return (
+                "Une erreur temporaire de base de données s’est produite; aucun résultat "
+                "n’a été obtenu. Ce n’est pas une recherche sans résultat."
+                if is_french
+                else "حدث خطأ مؤقت في قاعدة البيانات ولم تُسترجع نتيجة. هذا ليس دليلاً على عدم وجود نتائج."
+                if not is_english
+                else "A temporary database error occurred and no result was retrieved. "
+                "This is not a no-results response."
+            )
         if tool_name == "search_products":
             if error_code == "NO_RESULTS":
                 return (
@@ -4472,12 +4577,6 @@ class ConversationEngine:
                     else "لم يصلني اسم المنتج بوضوح. ما المنتج الذي تريد البحث عنه؟"
                     if not is_english
                     else "I couldn't identify the product name. Which product should I look for?"
-                )
-            if error_code == "DATABASE_ERROR":
-                return (
-                    "Une erreur temporaire est survenue pendant la recherche. Réessayez."
-                    if is_french
-                    else "حدث خطأ مؤقت أثناء البحث. حاول مرة أخرى."
                 )
             return (
                 "La recherche a échoué temporairement. Réessayez."
@@ -6152,6 +6251,55 @@ Rules:
             title = product_name or (
                 "ce produit" if is_french else "this product" if is_english else "هذا المنتج"
             )
+            description = (
+                product.get("description")
+                if isinstance(product, dict)
+                else None
+            )
+            images = tool_result_data.get("images")
+            images = images if isinstance(images, list) else []
+            images_status = tool_result_data.get("images_status")
+
+            def additional_product_details() -> str:
+                if intent != "product_details":
+                    return ""
+                if is_french:
+                    description_label = "Description enregistrée"
+                    missing_description = "Aucune description n’est enregistrée."
+                    image_summary = (
+                        f"{len(images)} image(s) du produit sont enregistrées."
+                        if images
+                        else "Aucune image du produit n’est enregistrée."
+                        if images_status == "none"
+                        else "Les informations sur les images sont indisponibles."
+                    )
+                elif is_english:
+                    description_label = "Recorded description"
+                    missing_description = "No product description is recorded."
+                    image_summary = (
+                        f"{len(images)} product image(s) are registered."
+                        if images
+                        else "No product images are registered."
+                        if images_status == "none"
+                        else "Product image information is unavailable."
+                    )
+                else:
+                    description_label = "الوصف المسجل"
+                    missing_description = "ما كاينش وصف مسجل لهذا المنتج."
+                    image_summary = (
+                        f"كاينين {len(images)} صور مسجلة للمنتج."
+                        if images
+                        else "ما كاين حتى صورة مسجلة للمنتج."
+                        if images_status == "none"
+                        else "معلومات الصور غير متاحة حالياً."
+                    )
+                description_text = (
+                    f"{description_label}: {description.strip()}."
+                    if isinstance(description, str) and description.strip()
+                    else missing_description
+                )
+                return f"\n{description_text}\n{image_summary}"
+
             auto_selected_variant = tool_result_data.get("auto_selected_variant")
             if isinstance(auto_selected_variant, dict):
                 variant_name = auto_selected_variant.get("name")
@@ -6194,7 +6342,7 @@ Rules:
                     and not isinstance(selected_stock, bool)
                     else ""
                 )
-                return (
+                response = (
                     f"The only available option was selected automatically: "
                     f"{details}.{base_price_note}{stock_note} "
                     "Say “place the order” to prepare the draft."
@@ -6207,6 +6355,7 @@ Rules:
                     f"{details}.{base_price_note}{stock_note} "
                     "قل «دير طلب» لإعداد مسودة الطلب."
                 )
+                return response + additional_product_details()
             asks_price = intent == "product_details"
 
             formatted_base_price = self._format_verified_price(base_price)
@@ -6332,8 +6481,12 @@ Rules:
                 options_heading = (
                     "Options :" if is_french else "Available options:" if is_english else "الخيارات:"
                 )
-                return f"{prompt}\n{options_heading}\n" + "\n".join(rendered_variants)
-            return prompt
+                return (
+                    f"{prompt}\n{options_heading}\n"
+                    + "\n".join(rendered_variants)
+                    + additional_product_details()
+                )
+            return prompt + additional_product_details()
             
         if "draft_summary" in tool_result_data:
             summary = tool_result_data.get("draft_summary")

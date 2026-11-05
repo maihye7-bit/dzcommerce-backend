@@ -6,6 +6,7 @@ Used by the Sales Agent to decide whether to ask for prepayment or confirm COD.
 import uuid
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
@@ -74,6 +75,8 @@ class CheckCODRiskTool(BaseTool):
                 },
             )
 
+        except SQLAlchemyError:
+            raise
         except Exception as e:
             return ToolResult(
                 success=False, error=f"Failed to check COD risk: {str(e)}"

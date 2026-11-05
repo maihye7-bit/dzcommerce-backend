@@ -5,6 +5,7 @@ get_order tool: retrieves order details including items and totals.
 import uuid
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
@@ -76,5 +77,7 @@ class GetOrderTool(BaseTool):
             return ToolResult(success=False, error=str(e))
         except (ValueError, KeyError):
             return ToolResult(success=False, error="Invalid order_id format")
+        except SQLAlchemyError:
+            raise
         except Exception:
             return ToolResult(success=False, error="Failed to get order")

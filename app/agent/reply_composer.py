@@ -359,6 +359,26 @@ class ReplyComposer:
                         verified_terms.add(key.strip())
                     if isinstance(attribute_value, str) and attribute_value.strip():
                         verified_terms.add(attribute_value.strip())
+                        for match in re.finditer(
+                            r"\d+(?:[.,]\d+)*", attribute_value
+                        ):
+                            parsed = cls._parse_price(match.group())
+                            if parsed is not None:
+                                permitted_numbers.add(parsed)
+            for text_field in ("description", "features"):
+                text_value = value.get(text_field)
+                text_values = (
+                    text_value
+                    if isinstance(text_value, list)
+                    else [text_value]
+                )
+                for text_value in text_values:
+                    if not isinstance(text_value, str):
+                        continue
+                    for match in re.finditer(r"\d+(?:[.,]\d+)*", text_value):
+                        parsed = cls._parse_price(match.group())
+                        if parsed is not None:
+                            permitted_numbers.add(parsed)
             for key in ("price", "base_price", "final_price", "total_price"):
                 parsed = add_number(value.get(key))
                 if parsed is not None:

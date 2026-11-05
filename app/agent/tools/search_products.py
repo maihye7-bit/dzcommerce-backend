@@ -72,9 +72,9 @@ class SearchProductsTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Searches for products by name or description. "
-            "Returns a list of matching products with their IDs. "
-            "Use this first when the customer asks about availability."
+            "Find a short list of products by name or description, including each "
+            "matching product's name and base price. Use get_product_details for "
+            "descriptions, options, sizes, colors, or images."
         )
 
     @property
@@ -199,8 +199,7 @@ class SearchProductsTool(BaseTool):
                 {
                     "id": str(product.id),
                     "name": product.name,
-                    "price": float(product.base_price),
-                    "sku": product.sku,
+                    "price": str(product.base_price),
                 }
                 for product in products
             ]
@@ -209,8 +208,7 @@ class SearchProductsTool(BaseTool):
                 data={"products": product_list, "count": len(product_list)},
             )
 
-        except SQLAlchemyError as e:
-            logger.exception("Database error while searching products")
+        except SQLAlchemyError:
             raise
         except Exception as e:
             logger.exception("Unexpected error while searching products")

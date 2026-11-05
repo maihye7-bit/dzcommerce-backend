@@ -6,6 +6,7 @@ Helps the agent or merchant identify customers who need follow-up.
 import uuid
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
@@ -77,6 +78,8 @@ class GetLostSalesOpportunitiesTool(BaseTool):
                 },
             )
 
+        except SQLAlchemyError:
+            raise
         except Exception as e:
             return ToolResult(
                 success=False, error=f"Failed to get opportunities: {str(e)}"

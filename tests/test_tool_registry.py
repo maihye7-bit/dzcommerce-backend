@@ -70,12 +70,11 @@ class TestToolRegistry:
         assert registry.get("nonexistent_tool") is None
 
     @pytest.mark.asyncio
-    async def test_aexecute_passes_through_caller_database_session(self):
+    async def test_aexecute_passes_through_caller_database_session(self, db_session):
         registry = ToolRegistry()
         tool = CapturingTool()
         registry.register(tool)
-        db = object()
-        context = {"db": db, "store_id": uuid.uuid4()}
+        context = {"db": db_session, "store_id": uuid.uuid4()}
 
         result = await registry.aexecute(
             tool_name=tool.name,
@@ -85,7 +84,7 @@ class TestToolRegistry:
 
         assert result.success
         assert tool.context is context
-        assert tool.context["db"] is db
+        assert tool.context["db"] is db_session
 
     @pytest.mark.asyncio
     async def test_aexecute_requires_database_session(self):

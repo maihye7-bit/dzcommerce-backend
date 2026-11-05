@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from app.agent.classifier import (
@@ -18,14 +19,14 @@ from app.agent.commerce_resolver import CommerceResolver, ResolutionResult
 from app.agent.conversation_engine import ConversationEngine
 from app.agent.providers.base import LLMResponse
 from app.agent.providers.freellm_provider import FreeLLMProvider
-from app.agent.tools.base import ToolResult
+from app.agent.tools.base import BaseTool, ToolResult
 from app.agent.tools.check_inventory import CheckInventoryTool
 from app.agent.tools.confirm_order import ConfirmOrderTool
 from app.agent.tools.create_order_draft import CreateOrderDraftTool
 from app.agent.tools.get_customer_context import GetCustomerContextTool
 from app.agent.tools.get_product_details import GetProductDetailsTool
 from app.agent.tools.list_catalog import ListCatalogProductsTool
-from app.agent.tools.registry import ToolRegistry
+from app.agent.tools.registry import ToolRegistry, ToolSessionUnusableError
 from app.agent.tools.recommend_products import RecommendProductsTool
 from app.agent.tools.search_products import SearchProductsTool
 from app.agent.tools.update_order_draft import UpdateOrderDraftTool
@@ -42,6 +43,7 @@ from app.models.customer_memory import CustomerMemory
 from app.models.inventory import InventoryItem
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant
+from app.models.product_image import ProductImage
 from app.models.store import Store
 
 
@@ -181,6 +183,182 @@ def make_registry():
     ):
         registry.register(tool)
     return registry
+
+
+@pytest.mark.asyncio
+async def test_tool_database_error_rolls_back_savepoint_and_next_tool_succeeds(
+    db_session,
+):
+    class BrokenQueryTool(BaseTool):
+        name = "broken_query"
+        description = "Runs a query against a missing table."
+        input_schema = {}
+
+        async def execute(self, store_id, arguments, context=None):
+            context["db"].execute(text("SELECT * FROM missing_agent_test_table"))
+            return ToolResult(success=True)
+
+    class HealthyQueryTool(BaseTool):
+        name = "healthy_query"
+        description = "Runs a harmless query."
+        input_schema = {}
+
+        async def execute(self, store_id, arguments, context=None):
+            value = context["db"].execute(text("SELECT 1")).scalar_one()
+            return ToolResult(success=True, data={"value": value})
+
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    registry = ToolRegistry()
+    registry.register(BrokenQueryTool())
+    registry.register(HealthyQueryTool())
+    context = {
+        "db": db_session,
+        "store_id": store.id,
+        "customer_id": customer.id,
+        "conversation_id": conversation.id,
+    }
+
+    failed_result = await registry.aexecute("broken_query", {}, context)
+    assert failed_result.success is False
+    assert failed_result.error_code == "DATABASE_ERROR"
+    assert "NO_RESULTS" in failed_result.error
+    assert db_session.is_active
+
+    next_result = await registry.aexecute("healthy_query", {}, context)
+    assert next_result.success is True
+    assert next_result.data == {"value": 1}
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_reports_database_failure_as_technical_observation(
+    db_session,
+):
+    class BrokenSearchTool(SearchProductsTool):
+        async def execute(self, store_id, arguments, context=None):
+            context["db"].execute(text("SELECT * FROM missing_agent_test_table"))
+            return ToolResult(success=True)
+
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    registry = make_registry()
+    registry._tools["search_products"] = BrokenSearchTool()
+    provider = ScriptedToolProvider(
+        [
+            tool_call("search_products", {"query": "shoes"}, "broken-search"),
+            tool_call("list_catalog_products", {}, "list-catalog"),
+            LLMResponse(content="The database search failed temporarily."),
+        ]
+    )
+    engine = ConversationEngine(provider, registry)
+    result = await engine._run_agent_tool_loop(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation=conversation,
+        channel="test",
+        user_message="Find shoes",
+        current_state=engine._normalize_current_state(conversation, store.id),
+        dialogue_context=[],
+        language="en",
+    )
+
+    assert result is not None
+    observations = [
+        json.loads(message.content)
+        for message in provider.calls[1][0]
+        if message.role == "tool"
+    ]
+    observation = next(
+        item for item in observations if item.get("error_code") == "DATABASE_ERROR"
+    )
+    assert observation["category"] == "technical_error"
+    assert observation["error_code"] == "DATABASE_ERROR"
+    assert len(provider.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_savepoint_preserves_successful_draft_change(db_session):
+    class SaveDraftTool(BaseTool):
+        name = "save_test_draft"
+        description = "Persists a draft for the test conversation."
+        input_schema = {}
+
+        async def execute(self, store_id, arguments, context=None):
+            conversation = context["db"].get(
+                Conversation, context["conversation_id"]
+            )
+            conversation.active_draft_json = {
+                "items": [{"quantity": 1}],
+                "total_price": 100,
+            }
+            context["db"].flush()
+            return ToolResult(success=True)
+
+    class BrokenQueryTool(BaseTool):
+        name = "broken_query"
+        description = "Runs a query against a missing table."
+        input_schema = {}
+
+        async def execute(self, store_id, arguments, context=None):
+            context["db"].execute(text("SELECT * FROM missing_agent_test_table"))
+            return ToolResult(success=True)
+
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    registry = ToolRegistry()
+    registry.register(SaveDraftTool())
+    registry.register(BrokenQueryTool())
+    context = {
+        "db": db_session,
+        "store_id": store.id,
+        "customer_id": customer.id,
+        "conversation_id": conversation.id,
+    }
+
+    saved = await registry.aexecute("save_test_draft", {}, context)
+    failed = await registry.aexecute("broken_query", {}, context)
+
+    assert saved.success is True
+    assert failed.error_code == "DATABASE_ERROR"
+    db_session.expire(conversation, ["active_draft_json"])
+    assert conversation.active_draft_json == {
+        "items": [{"quantity": 1}],
+        "total_price": 100,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unrecoverable_tool_session_does_not_refresh_conversation(
+    db_session, monkeypatch
+):
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    engine = ConversationEngine(
+        ScriptedToolProvider(
+            [tool_call("search_products", {"query": "shoes"})]
+        ),
+        make_registry(),
+    )
+    engine._execute_agent_tool_call = AsyncMock(
+        side_effect=ToolSessionUnusableError("session is unusable")
+    )
+    monkeypatch.setattr(
+        db_session,
+        "refresh",
+        lambda *args, **kwargs: pytest.fail(
+            "must not refresh a conversation after an unrecoverable tool failure"
+        ),
+    )
+
+    with pytest.raises(ToolSessionUnusableError):
+        await engine._run_agent_tool_loop(
+            db=db_session,
+            store_id=store.id,
+            customer_id=customer.id,
+            conversation=conversation,
+            channel="test",
+            user_message="Find shoes",
+            current_state=engine._normalize_current_state(conversation, store.id),
+            dialogue_context=[],
+            language="en",
+        )
 
 
 async def run_turn(engine, db_session, conversation, text):
@@ -1091,6 +1269,188 @@ async def test_get_product_details_preserves_resolved_variant_selection(db_sessi
 
     assert result.success is True
     assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+
+
+@pytest.mark.asyncio
+async def test_product_search_is_compact_and_product_details_return_catalog_data(
+    db_session,
+):
+    store, _, conversation, product, variant = make_fixture(db_session)
+    product.description = "حذاء رياضي خفيف مع نعل مقاوم."
+    variant.attributes_json = {"color": "black", "size": "42"}
+    product_image = ProductImage(
+        store_id=store.id,
+        product_id=product.id,
+        storage_key=f"stores/{store.id}/{uuid.uuid4()}.jpg",
+        image_url=f"https://cdn.example.test/{uuid.uuid4()}.jpg",
+        thumbnail_url="https://cdn.example.test/thumb.jpg",
+        mime_type="image/jpeg",
+        file_size=1024,
+        width=800,
+        height=600,
+        is_primary=True,
+        display_order=0,
+    )
+    db_session.add(product_image)
+    db_session.flush()
+
+    search = await SearchProductsTool().execute(
+        store_id=store.id,
+        arguments={"query": product.name},
+        context={"db": db_session, "conversation_id": conversation.id},
+    )
+    details = await GetProductDetailsTool().execute(
+        store_id=store.id,
+        arguments={"product_id": str(product.id)},
+        context={"db": db_session, "conversation_id": conversation.id},
+    )
+
+    assert search.success is True
+    assert search.data["products"] == [
+        {
+            "id": str(product.id),
+            "name": product.name,
+            "price": str(product.base_price),
+        }
+    ]
+    assert details.success is True
+    assert details.data["product"]["description"] == product.description
+    assert details.data["variants"][0]["attributes"] == {
+        "color": "black",
+        "size": "42",
+    }
+    assert details.data["variants"][0]["stock_available"] == 5
+    assert details.data["variants"][0]["final_price"] == 100
+    assert details.data["images"] == [
+        {
+            "url": product_image.image_url,
+            "thumbnail_url": product_image.thumbnail_url,
+            "is_primary": True,
+            "width": 800,
+            "height": 600,
+        }
+    ]
+    assert conversation.metadata_json["selected_product_id"] == str(product.id)
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+    verified = ConversationEngine._agent_result_facts("get_product_details", details.data)
+    assert verified["products"][0]["description"] == product.description
+    assert verified["product_images"][0]["url"] == product_image.image_url
+    assert ReplyComposer.is_safe_agent_reply(
+        "Samsung Galaxy, black, size 42, has 5 in stock.",
+        "en",
+        verified,
+    )
+
+
+@pytest.mark.asyncio
+async def test_details_without_description_or_images_do_not_invent_data(db_session):
+    store, _, conversation, product, _ = make_fixture(db_session)
+    product.description = None
+    db_session.flush()
+
+    details = await GetProductDetailsTool().execute(
+        store_id=store.id,
+        arguments={"product_id": str(product.id)},
+        context={"db": db_session, "conversation_id": conversation.id},
+    )
+
+    assert details.success is True
+    assert details.data["product"]["description"] is None
+    assert details.data["images"] == []
+    assert details.data["images_status"] == "none"
+    fallback = await ConversationEngine(
+        ScriptedToolProvider([]),
+        make_registry(),
+    )._generate_localized_final_text(
+        details.data,
+        "",
+        "واش مميزاتو؟",
+        "ar",
+        "product_details",
+    )
+    assert "ما كاينش وصف مسجل" in fallback
+    assert "ما كاين حتى صورة مسجلة" in fallback
+
+
+@pytest.mark.asyncio
+async def test_product_details_remain_available_when_image_table_is_missing(db_session):
+    store, _, conversation, product, _ = make_fixture(db_session)
+    db_session.execute(text("DROP TABLE product_images"))
+
+    details = await GetProductDetailsTool().execute(
+        store_id=store.id,
+        arguments={"product_id": str(product.id)},
+        context={"db": db_session, "conversation_id": conversation.id},
+    )
+
+    assert details.success is True
+    assert details.data["product"]["name"] == product.name
+    assert details.data["images"] == []
+    assert details.data["images_status"] == "schema_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_product_details_resolve_selected_candidate_and_reach_agent(
+    db_session,
+):
+    store, _, conversation, product, _ = make_fixture(db_session)
+    image = ProductImage(
+        store_id=store.id,
+        product_id=product.id,
+        storage_key=f"stores/{store.id}/{uuid.uuid4()}.jpg",
+        image_url="https://cdn.example.test/product.jpg",
+        mime_type="image/jpeg",
+        file_size=1024,
+        is_primary=True,
+    )
+    db_session.add(image)
+    conversation.metadata_json = {
+        "commerce_stage": "PRODUCT_CANDIDATES",
+        "candidate_product_ids": [str(product.id)],
+        "selected_product_id": None,
+    }
+    db_session.flush()
+    provider = ScriptedToolProvider(
+        [
+            tool_call(
+                "get_product_details",
+                {"product_name": product.name},
+                "details-call",
+            ),
+            LLMResponse(content="Samsung Galaxy: الوصف المسجل Test product."),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    result = await run_turn(engine, db_session, conversation, "واش مميزاتو؟")
+
+    assert result["response"] == "Samsung Galaxy: الوصف المسجل Test product."
+    assert conversation.metadata_json["selected_product_id"] == str(product.id)
+    assert provider.calls[1][0][-1].role == "tool"
+    details_observation = json.loads(provider.calls[1][0][-1].content)
+    assert details_observation["product"]["description"] == "Test product"
+    assert details_observation["variants"][0]["attributes"] == {"color": "black"}
+    assert details_observation["images"][0]["url"] == image.image_url
+    assert "get_product_details" in {
+        tool["function"]["name"] for tool in provider.calls[0][1]
+    }
+    assert "photos" in provider.calls[0][0][0].content.casefold()
+
+
+@pytest.mark.asyncio
+async def test_product_details_cannot_read_another_store_product(db_session):
+    store_a, _, conversation_a, _, _ = make_fixture(db_session)
+    store_b, _, _, product_b, _ = make_fixture(db_session)
+
+    result = await GetProductDetailsTool().execute(
+        store_id=store_a.id,
+        arguments={"product_id": str(product_b.id)},
+        context={"db": db_session, "conversation_id": conversation_a.id},
+    )
+
+    assert result.success is False
+    assert result.data == {}
 
 
 @pytest.mark.asyncio

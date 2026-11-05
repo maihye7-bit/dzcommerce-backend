@@ -4,6 +4,7 @@ Fast lookup before creating drafts or confirming orders.
 """
 import uuid
 from typing import Any
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from app.agent.tools.base import BaseTool, ToolResult
 from app.models.inventory import InventoryItem
@@ -83,5 +84,7 @@ class CheckInventoryTool(BaseTool):
                 },
             )
 
+        except SQLAlchemyError:
+            raise
         except Exception as e:
             return ToolResult(success=False, error=f"Inventory check failed: {str(e)}")
