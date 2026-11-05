@@ -44,7 +44,10 @@ class InstagramAdapter(BaseRealAdapter, ChannelAdapter):
                 external_conversation_id=sender_id,
                 external_user_id=sender_id,
                 message_text=text,
-                metadata={"raw_type": "dm"},
+                metadata={
+                    "raw_type": "dm",
+                    "external_account_id": str(entry.get("id") or ""),
+                },
             )
 
         # --- Comment Event ---
@@ -77,6 +80,7 @@ class InstagramAdapter(BaseRealAdapter, ChannelAdapter):
         ig_account_id = message.metadata.get("ig_account_id", "")
         if not ig_account_id:
             raise ValueError("metadata.ig_account_id required for Instagram send")
+        self.require_account_credentials(ig_account_id)
 
         payload = {
             "recipient": {"id": message.recipient_external_id},
@@ -88,6 +92,12 @@ class InstagramAdapter(BaseRealAdapter, ChannelAdapter):
         """Reply to an Instagram comment."""
         if not message.reply_to_external_id:
             raise ValueError("reply_to_external_id required for comment reply")
+        ig_account_id = message.metadata.get("ig_account_id", "")
+        if not ig_account_id:
+            raise ValueError(
+                "metadata.ig_account_id is required for Instagram comment reply"
+            )
+        self.require_account_credentials(ig_account_id)
 
         payload = {"message": message.text}
         return await self._post(f"{message.reply_to_external_id}/replies", payload)

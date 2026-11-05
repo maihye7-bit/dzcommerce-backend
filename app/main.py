@@ -1,4 +1,6 @@
 import hashlib
+import asyncio
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -34,10 +36,21 @@ from app.config import settings
 async def lifespan(app: FastAPI):
     # Startup: tools are registered in app/agent/tools/__init__.py
     from app.services.product_image_storage import ensure_storage_ready
+    from app.services.outbound_delivery import run_delivery_worker
 
     ensure_storage_ready()
-    yield
-    # Shutdown: cleanup if needed
+    worker = None
+    if os.getenv("PYTEST_CURRENT_TEST") is None:
+        worker = asyncio.create_task(run_delivery_worker())
+    try:
+        yield
+    finally:
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

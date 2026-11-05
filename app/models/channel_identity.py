@@ -7,8 +7,15 @@ Strict tenant isolation via store_id.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import (DateTime, ForeignKey, Index, String, UniqueConstraint,
-                        func)
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,12 +30,26 @@ class ChannelIdentity(Base):
         UniqueConstraint(
             "store_id",
             "channel",
+            "external_account_id",
             "external_user_id",
             name="uq_channel_identity_store_channel_ext_user",
         ),
         Index("ix_channel_identities_customer", "store_id", "customer_id"),
         Index(
-            "ix_channel_identities_lookup", "store_id", "channel", "external_user_id"
+            "ix_channel_identities_lookup",
+            "store_id",
+            "channel",
+            "external_account_id",
+            "external_user_id",
+        ),
+        Index(
+            "uq_channel_identity_legacy_user",
+            "store_id",
+            "channel",
+            "external_user_id",
+            unique=True,
+            postgresql_where=text("external_account_id IS NULL"),
+            sqlite_where=text("external_account_id IS NULL"),
         ),
     )
 
@@ -44,6 +65,9 @@ class ChannelIdentity(Base):
         nullable=False,
     )
     channel: Mapped[ChannelType] = mapped_column(String(20), nullable=False)
+    external_account_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
     external_user_id: Mapped[str] = mapped_column(String(255), nullable=False)
     external_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

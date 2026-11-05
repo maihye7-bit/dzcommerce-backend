@@ -73,7 +73,10 @@ class FacebookAdapter(BaseRealAdapter, ChannelAdapter):
                 external_user_id=sender_id,
                 message_text=text,
                 attachments=attachments,
-                metadata={"raw_type": "messenger"},
+                metadata={
+                    "raw_type": "messenger",
+                    "external_account_id": str(entry.get("id") or ""),
+                },
             )
 
         # --- Comment Event ---
@@ -107,6 +110,7 @@ class FacebookAdapter(BaseRealAdapter, ChannelAdapter):
         page_id = message.metadata.get("page_id", "")
         if not page_id:
             raise ValueError("metadata.page_id is required for Facebook send")
+        self.require_account_credentials(page_id)
 
         payload = {
             "recipient": {"id": message.recipient_external_id},
@@ -118,6 +122,10 @@ class FacebookAdapter(BaseRealAdapter, ChannelAdapter):
         """Reply to a Facebook comment."""
         if not message.reply_to_external_id:
             raise ValueError("reply_to_external_id required for comment reply")
+        page_id = message.metadata.get("page_id", "")
+        if not page_id:
+            raise ValueError("metadata.page_id is required for Facebook comment reply")
+        self.require_account_credentials(page_id)
 
         payload = {"message": message.text}
         return await self._post(f"{message.reply_to_external_id}/comments", payload)

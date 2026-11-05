@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
+from app.models.channel_identity import ChannelIdentity
 from app.models.conversation import Conversation
 from app.models.customer import Customer
 from app.models.product import Product
@@ -16,8 +17,8 @@ from app.services import product_image_storage
 from app.services.exceptions import ImageStorageError
 from app.services.messenger_media import (
     build_public_product_image_url,
-    send_messenger_image,
 )
+from app.services.outbound_delivery import enqueue_delivery
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,9 @@ class SendProductImageTool(BaseTool):
             product_id = uuid.UUID(str(arguments.get("product_id")))
             conversation_id = uuid.UUID(str(context.get("conversation_id")))
             customer_id = uuid.UUID(str(context.get("customer_id")))
-        except (ValueError, TypeError, AttributeError):
+            external_account_id = str(context["external_account_id"])
+            external_user_id = str(context["external_user_id"])
+        except (ValueError, TypeError, AttributeError, KeyError):
             return ToolResult(
                 success=False,
                 error="The selected product or conversation context is unavailable.",
@@ -123,6 +126,29 @@ class SendProductImageTool(BaseTool):
             )
 
         state = conversation.metadata_json or {}
+        if state.get("external_account_id") != external_account_id:
+            return ToolResult(
+                success=False,
+                error="The channel account context is unavailable.",
+                error_code="NOT_FOUND",
+            )
+        identity = (
+            db.query(ChannelIdentity)
+            .filter(
+                ChannelIdentity.store_id == store_id,
+                ChannelIdentity.channel == "facebook",
+                ChannelIdentity.external_account_id == external_account_id,
+                ChannelIdentity.external_user_id == external_user_id,
+                ChannelIdentity.customer_id == customer_id,
+            )
+            .one_or_none()
+        )
+        if identity is None:
+            return ToolResult(
+                success=False,
+                error="The Messenger recipient identity is unavailable.",
+                error_code="NOT_FOUND",
+            )
         selected_product_id = state.get("selected_product_id")
         try:
             selected_product_uuid = uuid.UUID(str(selected_product_id))
@@ -152,10 +178,10 @@ class SendProductImageTool(BaseTool):
             )
             .one_or_none()
         )
-        if product is None or customer is None or not customer.phone:
+        if product is None or customer is None:
             return ToolResult(
                 success=False,
-                error="The selected product or Messenger recipient is unavailable.",
+                error="The selected product or customer is unavailable.",
                 error_code="NOT_FOUND",
             )
 
@@ -195,27 +221,34 @@ class SendProductImageTool(BaseTool):
                 error_code="IMAGE_UNAVAILABLE",
             )
 
-        delivery = await send_messenger_image(str(customer.phone), public_url)
-        if not delivery.delivered:
-            logger.warning(
-                "messenger_product_image_send_failed store_id=%s status_code=%s "
-                "failure_code=%s",
-                str(store_id),
-                delivery.status_code or "unavailable",
-                delivery.failure_code or "unknown",
-            )
-            return ToolResult(
-                success=False,
-                error="Messenger could not deliver the product image.",
-                error_code="DELIVERY_FAILED",
-            )
-
+        delivery = enqueue_delivery(
+            db,
+            conversation_id=conversation.id,
+            channel="facebook",
+            external_account_id=external_account_id,
+            recipient_external_id=identity.external_user_id,
+            payload_type="image",
+            payload={
+                "url": public_url,
+                "fallback_text": (
+                    "تعذر إرسال صورة المنتج الآن. يمكنني مساعدتك بمعلوماته."
+                    if context.get("language", "ar") == "ar"
+                    else "Je n'ai pas pu envoyer la photo pour le moment."
+                    if context.get("language") == "fr"
+                    else "I couldn't send the product photo right now."
+                ),
+            },
+        )
         logger.info(
-            "messenger_product_image_sent store_id=%s status_code=%s",
+            "messenger_product_image_queued store_id=%s delivery_id=%s",
             str(store_id),
-            delivery.status_code or "unavailable",
+            str(delivery.id),
         )
         return ToolResult(
             success=True,
-            data={"delivered": True, "product_name": product.name},
+            data={
+                "queued": True,
+                "delivery_id": str(delivery.id),
+                "product_name": product.name,
+            },
         )

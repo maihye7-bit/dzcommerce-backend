@@ -1,8 +1,8 @@
 import io
+import json
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -16,14 +16,15 @@ from app.agent.tools.send_product_image import (
     is_product_image_request,
 )
 from app.config import settings
+from app.models.channel_identity import ChannelIdentity
 from app.models.conversation import Conversation, ConversationStatus
 from app.models.customer import Customer
+from app.models.outbound_delivery import OutboundDelivery
 from app.models.product import Product
 from app.models.product_image import ProductImage
 from app.models.store import Store
 from app.services import inbound_attachments, messenger_media, product_image_storage
 from app.services.inbound_attachments import InboundAttachmentError
-from app.services.messenger_media import MessengerDeliveryResult
 from app.services.webhook_processor import _redact_webhook_payload
 
 
@@ -106,13 +107,12 @@ def test_public_product_image_url_requires_configured_https_host(monkeypatch):
 async def test_messenger_graph_api_sends_image_attachment_and_checks_delivery(
     monkeypatch,
 ):
-    monkeypatch.setattr(messenger_media, "FACEBOOK_PAGE_ACCESS_TOKEN", "test-token")
     captured = {}
     real_async_client = httpx.AsyncClient
 
     def handle(request):
         captured["url"] = request.url
-        captured["payload"] = request.read().decode()
+        captured["payload"] = json.loads(request.read())
         return httpx.Response(200, json={"recipient_id": "psid", "message_id": "m-1"})
 
     transport = httpx.MockTransport(handle)
@@ -125,21 +125,67 @@ async def test_messenger_graph_api_sends_image_attachment_and_checks_delivery(
     result = await messenger_media.send_messenger_image(
         "psid",
         "https://shop.example.test/api/product-images/image-id/content",
+        "test-token",
     )
 
     assert result.delivered is True
     assert result.status_code == 200
     assert captured["url"].host == "graph.facebook.com"
-    assert '"type":"image"' in captured["payload"]
-    assert '"url":"https://shop.example.test/api/product-images/image-id/content"' in captured[
-        "payload"
-    ]
+    assert str(captured["url"].copy_with(query=None)) == (
+        "https://graph.facebook.com/v26.0/me/messages"
+    )
+    assert captured["url"].params["access_token"] == "test-token"
+    assert captured["payload"] == {
+        "recipient": {"id": "psid"},
+        "message": {
+            "attachment": {
+                "type": "image",
+                "payload": {
+                    "url": "https://shop.example.test/api/product-images/image-id/content"
+                },
+            }
+        },
+    }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivered", [True, False])
-async def test_send_product_image_tool_is_contextual_and_falls_back_on_api_failure(
-    db_session, monkeypatch, delivered
+async def test_instagram_text_uses_account_scoped_graph_endpoint(monkeypatch):
+    captured = {}
+    real_async_client = httpx.AsyncClient
+
+    def handle(request):
+        captured["url"] = request.url
+        captured["payload"] = json.loads(request.read())
+        return httpx.Response(200, json={"recipient_id": "ig-user", "message_id": "m-2"})
+
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        messenger_media.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport, **kwargs),
+    )
+
+    result = await messenger_media.send_instagram_text(
+        "ig-account",
+        "ig-user",
+        "تم استلام رسالتك.",
+        "test-token",
+    )
+
+    assert result.delivered is True
+    assert str(captured["url"].copy_with(query=None)) == (
+        "https://graph.facebook.com/v26.0/ig-account/messages"
+    )
+    assert captured["url"].params["access_token"] == "test-token"
+    assert captured["payload"] == {
+        "recipient": {"id": "ig-user"},
+        "message": {"text": "تم استلام رسالتك."},
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_product_image_queues_the_meta_identity_without_claiming_delivery(
+    db_session, monkeypatch
 ):
     store = Store(name="Messenger image store", slug=f"messenger-image-{uuid.uuid4()}")
     db_session.add(store)
@@ -147,7 +193,7 @@ async def test_send_product_image_tool_is_contextual_and_falls_back_on_api_failu
     customer = Customer(
         store_id=store.id,
         name="Messenger customer",
-        phone="customer-psid",
+        phone="0550123456",
     )
     db_session.add(customer)
     db_session.flush()
@@ -164,13 +210,24 @@ async def test_send_product_image_tool_is_contextual_and_falls_back_on_api_failu
         customer_id=customer.id,
         channel="facebook",
         status=ConversationStatus.ACTIVE,
+        external_conversation_id="customer-psid",
         metadata_json={
             "commerce_stage": "PRODUCT_SELECTED",
             "selected_product_id": str(product.id),
             "selected_product_name": product.name,
+            "external_account_id": "messenger-page",
         },
     )
     db_session.add(conversation)
+    db_session.add(
+        ChannelIdentity(
+            store_id=store.id,
+            customer_id=customer.id,
+            channel="facebook",
+            external_account_id="messenger-page",
+            external_user_id="customer-psid",
+        )
+    )
     image = ProductImage(
         store_id=store.id,
         product_id=product.id,
@@ -190,18 +247,6 @@ async def test_send_product_image_tool_is_contextual_and_falls_back_on_api_failu
         "read_image",
         lambda _storage_key: SimpleNamespace(is_file=lambda: True),
     )
-    send_image = AsyncMock(
-        return_value=MessengerDeliveryResult(
-            delivered=delivered,
-            status_code=200 if delivered else 400,
-            failure_code=None if delivered else "graph_api_rejected",
-        )
-    )
-    monkeypatch.setattr(
-        "app.agent.tools.send_product_image.send_messenger_image",
-        send_image,
-    )
-
     engine = ConversationEngine(None, tool_registry)
     engine.agent_tool_loop_enabled = False
     engine.reply_composer_enabled = False
@@ -212,20 +257,25 @@ async def test_send_product_image_tool_is_contextual_and_falls_back_on_api_failu
         conversation_id=conversation.id,
         channel="facebook",
         user_message="ممكن صور المنتج",
+        external_account_id="messenger-page",
+        external_user_id="customer-psid",
     )
 
     assert response["turn_diagnostics"]["resolver_action"] == (
         "EXECUTE_TOOL:send_product_image"
     )
-    assert response["response"] == (
-        "تفضل، أرسلت لك صورة المنتج."
-        if delivered
-        else "تعذر إرسال صورة المنتج الآن. يمكنني مساعدتك بمعلوماته."
+    assert response["response"] == "سأرسل لك صورة المنتج الآن."
+    image_delivery = (
+        db_session.query(OutboundDelivery)
+        .filter(OutboundDelivery.payload_type == "image")
+        .one()
     )
-    send_image.assert_awaited_once_with(
-        "customer-psid",
-        f"https://shop.example.test{image.image_url}",
+    assert image_delivery.recipient_external_id == "customer-psid"
+    assert image_delivery.payload_json["url"] == (
+        f"https://shop.example.test{image.image_url}"
     )
+    assert image_delivery.status == "pending"
+    assert customer.phone == "0550123456"
 
 
 @pytest.mark.asyncio

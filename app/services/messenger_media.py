@@ -7,7 +7,6 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from app.config import settings
-from app.core.config import FACEBOOK_PAGE_ACCESS_TOKEN
 
 
 @dataclass(frozen=True)
@@ -15,6 +14,7 @@ class MessengerDeliveryResult:
     delivered: bool
     status_code: int | None = None
     failure_code: str | None = None
+    retryable: bool = False
 
 
 def _configured_public_host() -> str:
@@ -90,10 +90,9 @@ def build_public_product_image_url(image_url: str | None) -> str:
 async def send_messenger_image(
     recipient_id: str,
     image_url: str,
+    access_token: str,
 ) -> MessengerDeliveryResult:
     """Send one image and require Meta's successful message ID response."""
-    if not FACEBOOK_PAGE_ACCESS_TOKEN:
-        return MessengerDeliveryResult(False, failure_code="missing_page_token")
     payload = {
         "recipient": {"id": recipient_id},
         "message": {
@@ -103,24 +102,85 @@ async def send_messenger_image(
             }
         },
     }
+    return await _send_graph_message(
+        "https://graph.facebook.com/v26.0/me/messages",
+        payload,
+        access_token,
+    )
+
+
+async def send_messenger_text(
+    recipient_id: str,
+    text: str,
+    access_token: str,
+) -> MessengerDeliveryResult:
+    """Send a Messenger text and verify Meta returned a message ID."""
+    return await _send_graph_message(
+        "https://graph.facebook.com/v26.0/me/messages",
+        {
+            "recipient": {"id": recipient_id},
+            "message": {"text": text},
+        },
+        access_token,
+    )
+
+
+async def send_instagram_text(
+    instagram_account_id: str,
+    recipient_id: str,
+    text: str,
+    access_token: str,
+) -> MessengerDeliveryResult:
+    """Send a text-only Instagram DM through its account-scoped endpoint."""
+    return await _send_graph_message(
+        f"https://graph.facebook.com/v26.0/{instagram_account_id}/messages",
+        {
+            "recipient": {"id": recipient_id},
+            "message": {"text": text},
+        },
+        access_token,
+    )
+
+
+async def _send_graph_message(
+    url: str,
+    payload: dict,
+    access_token: str,
+) -> MessengerDeliveryResult:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                "https://graph.facebook.com/v26.0/me/messages",
-                params={"access_token": FACEBOOK_PAGE_ACCESS_TOKEN},
+                url,
+                params={"access_token": access_token},
                 json=payload,
             )
     except httpx.HTTPError as exc:
         return MessengerDeliveryResult(
             False,
             failure_code=f"transport_{type(exc).__name__}",
+            retryable=True,
         )
 
     if not response.is_success:
+        graph_code = None
+        try:
+            graph_code = response.json().get("error", {}).get("code")
+        except (ValueError, AttributeError):
+            pass
+        retryable = (
+            response.status_code in {408, 425, 429}
+            or response.status_code >= 500
+            or graph_code in {4, 17, 32, 613}
+        )
         return MessengerDeliveryResult(
             False,
             status_code=response.status_code,
-            failure_code="graph_api_rejected",
+            failure_code=(
+                f"graph_error_{graph_code}"
+                if isinstance(graph_code, int)
+                else "graph_api_rejected"
+            ),
+            retryable=retryable,
         )
     try:
         message_id = response.json().get("message_id")
@@ -131,5 +191,6 @@ async def send_messenger_image(
             False,
             status_code=response.status_code,
             failure_code="graph_response_missing_message_id",
+            retryable=False,
         )
     return MessengerDeliveryResult(True, status_code=response.status_code)

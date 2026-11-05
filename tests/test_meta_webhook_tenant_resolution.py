@@ -1,9 +1,11 @@
 import hashlib
 import hmac
 import json
+import asyncio
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -13,11 +15,38 @@ from sqlalchemy.orm import sessionmaker
 from app.config import Settings
 from app.database import Base
 from app.models.channel_account import ChannelAccount
+from app.models.channel_identity import ChannelIdentity
 from app.models.conversation import Conversation, Message, MessageRole
 from app.models.customer import Customer
+from app.models.outbound_delivery import OutboundDelivery
 from app.models.store import Store
+from app.services import outbound_delivery
+from app.services.messenger_media import MessengerDeliveryResult
 from app.services.webhook_security import verify_meta_verify_token
 import app.api.webhooks as webhooks
+
+
+@pytest.fixture(autouse=True)
+def use_test_meta_sender_for_outbox(monkeypatch):
+    monkeypatch.setattr(
+        outbound_delivery,
+        "_resolve_access_token",
+        lambda _db, _delivery: "test-page-token",
+    )
+
+    async def send_text(_recipient_id, _text, _access_token):
+        return MessengerDeliveryResult(delivered=True, status_code=200)
+
+    monkeypatch.setattr(outbound_delivery, "send_messenger_text", send_text)
+
+    async def send_instagram_text(_account_id, _recipient_id, _text, _access_token):
+        return MessengerDeliveryResult(delivered=True, status_code=200)
+
+    async def send_image(_recipient_id, _url, _access_token):
+        return MessengerDeliveryResult(delivered=True, status_code=200)
+
+    monkeypatch.setattr(outbound_delivery, "send_instagram_text", send_instagram_text)
+    monkeypatch.setattr(outbound_delivery, "send_messenger_image", send_image)
 
 
 class RecordingEngine:
@@ -68,14 +97,6 @@ def test_meta_webhook_uses_bound_store_and_preserves_idempotency(
     engine = RecordingEngine()
     monkeypatch.setattr(webhooks, "_engine", engine)
 
-    async def fake_send_facebook_message(recipient_id, text):
-        return SimpleNamespace(status_code=200, is_success=True, text="{}")
-
-    monkeypatch.setattr(
-        webhooks,
-        "_send_facebook_message",
-        fake_send_facebook_message,
-    )
     body = json.dumps(
         {
             "object": platform_object,
@@ -158,11 +179,11 @@ def test_meta_webhook_receives_image_only_and_stores_it_once(
     monkeypatch.setattr(webhooks, "_store_inbound_attachments", store_attachment)
     sent = []
 
-    async def send_text(recipient_id, text):
+    async def send_text(recipient_id, text, _access_token):
         sent.append((recipient_id, text))
-        return SimpleNamespace(status_code=200, is_success=True, text="{}")
+        return MessengerDeliveryResult(delivered=True, status_code=200)
 
-    monkeypatch.setattr(webhooks, "_send_facebook_message", send_text)
+    monkeypatch.setattr(outbound_delivery, "send_messenger_text", send_text)
     body = json.dumps(
         {
             "object": "page",
@@ -212,6 +233,146 @@ def test_meta_webhook_receives_image_only_and_stores_it_once(
     assert inbound.metadata_json["attachments"][0]["storage_key"].endswith("test.png")
 
 
+def test_facebook_followup_reuses_channel_identity_after_phone_capture(
+    client, db_session, monkeypatch
+):
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+    store = Store(name="Identity store", slug=f"identity-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.flush()
+    db_session.add(
+        ChannelAccount(
+            store_id=store.id,
+            channel="facebook",
+            external_account_id="identity-page",
+            is_active=True,
+        )
+    )
+    db_session.commit()
+    engine = RecordingEngine()
+    monkeypatch.setattr(webhooks, "_engine", engine)
+
+    def post_message(mid):
+        body = json.dumps(
+            {
+                "object": "page",
+                "entry": [
+                    {
+                        "id": "identity-page",
+                        "messaging": [
+                            {
+                                "sender": {"id": "messenger-psid"},
+                                "message": {"mid": mid, "text": "سلام"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ).encode()
+        return client.post(
+            "/webhooks/meta",
+            content=body,
+            headers={"X-Hub-Signature-256": _signature(body, secret)},
+        )
+
+    assert post_message("identity-first").status_code == 200
+    identity = (
+        db_session.query(ChannelIdentity)
+        .filter(
+            ChannelIdentity.store_id == store.id,
+            ChannelIdentity.channel == "facebook",
+            ChannelIdentity.external_account_id == "identity-page",
+            ChannelIdentity.external_user_id == "messenger-psid",
+        )
+        .one()
+    )
+    customer = db_session.query(Customer).filter_by(id=identity.customer_id).one()
+    customer.phone = "0550123456"
+    db_session.commit()
+
+    assert post_message("identity-followup").status_code == 200
+    conversations = (
+        db_session.query(Conversation)
+        .filter(
+            Conversation.store_id == store.id,
+            Conversation.customer_id == customer.id,
+            Conversation.channel == "facebook",
+        )
+        .all()
+    )
+    assert len(conversations) == 1
+    assert len(engine.calls) == 2
+    assert engine.calls[0]["conversation_id"] == engine.calls[1]["conversation_id"]
+    assert db_session.query(Customer).filter_by(store_id=store.id).count() == 1
+    assert customer.phone == "0550123456"
+
+
+def test_outbox_retry_after_duplicate_event_does_not_reenter_engine(
+    client, db_session, monkeypatch
+):
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+    store = Store(name="Retry store", slug=f"retry-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.flush()
+    db_session.add(
+        ChannelAccount(
+            store_id=store.id,
+            channel="facebook",
+            external_account_id="retry-page",
+            is_active=True,
+        )
+    )
+    db_session.commit()
+    engine = RecordingEngine()
+    monkeypatch.setattr(webhooks, "_engine", engine)
+    send_attempts = []
+
+    async def fail_once(_recipient_id, _text, _access_token):
+        send_attempts.append("attempt")
+        status = 503 if len(send_attempts) == 1 else 200
+        return MessengerDeliveryResult(
+            delivered=status == 200,
+            status_code=status,
+            failure_code="test_graph_rejected" if status != 200 else None,
+            retryable=status >= 500,
+        )
+
+    monkeypatch.setattr(outbound_delivery, "send_messenger_text", fail_once)
+    body = json.dumps(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "retry-page",
+                    "messaging": [
+                        {
+                            "sender": {"id": "retry-psid"},
+                            "message": {"mid": "retry-mid", "text": "hello"},
+                        }
+                    ],
+                }
+            ],
+        }
+    ).encode()
+    headers = {"X-Hub-Signature-256": _signature(body, secret)}
+
+    assert client.post("/webhooks/meta", content=body, headers=headers).status_code == 200
+    pending = db_session.query(OutboundDelivery).filter_by(status="pending").one()
+    pending.next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+    duplicate = client.post("/webhooks/meta", content=body, headers=headers)
+    assert duplicate.json()["skipped"] == 1
+
+    assert asyncio.run(outbound_delivery.dispatch_due_deliveries(db_session)) == 1
+    sent = db_session.query(OutboundDelivery).filter_by(id=pending.id).one()
+    assert sent.status == "sent"
+    assert sent.attempt_count == 2
+    assert len(engine.calls) == 1
+    assert len(send_attempts) == 2
+
+
 def test_meta_webhook_processes_text_with_image_and_reports_expired_image(
     client, db_session, monkeypatch
 ):
@@ -245,11 +406,11 @@ def test_meta_webhook_processes_text_with_image_and_reports_expired_image(
     monkeypatch.setattr(webhooks, "_store_inbound_attachments", failed_attachment)
     sent = []
 
-    async def send_text(recipient_id, text):
+    async def send_text(_recipient_id, text, _access_token):
         sent.append(text)
-        return SimpleNamespace(status_code=200, is_success=True, text="{}")
+        return MessengerDeliveryResult(delivered=True, status_code=200)
 
-    monkeypatch.setattr(webhooks, "_send_facebook_message", send_text)
+    monkeypatch.setattr(outbound_delivery, "send_messenger_text", send_text)
     body = json.dumps(
         {
             "object": "page",
@@ -485,12 +646,11 @@ def test_meta_webhook_does_not_skip_message_id_from_another_scope(
     )
 
 
-def test_meta_webhook_rolls_back_failed_turn_and_allows_retry(
+def test_meta_webhook_persists_failed_turn_reply_for_outbox_delivery(
     client, db_session, monkeypatch
 ):
     secret = "test-meta-secret"
     monkeypatch.setenv("META_APP_SECRET", secret)
-    monkeypatch.setattr(webhooks, "FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
     store = Store(name="Failure store", slug=f"failure-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
@@ -516,19 +676,11 @@ def test_meta_webhook_rolls_back_failed_turn_and_allows_retry(
     monkeypatch.setattr(webhooks, "_engine", engine)
     sent_replies = []
 
-    async def fake_send_facebook_message(recipient_id, text):
+    async def fake_send_facebook_message(recipient_id, text, _access_token):
         sent_replies.append((recipient_id, text))
-        return SimpleNamespace(
-            status_code=200,
-            is_success=True,
-            text="{}",
-        )
+        return MessengerDeliveryResult(delivered=True, status_code=200)
 
-    monkeypatch.setattr(
-        webhooks,
-        "_send_facebook_message",
-        fake_send_facebook_message,
-    )
+    monkeypatch.setattr(outbound_delivery, "send_messenger_text", fake_send_facebook_message)
     body = json.dumps(
         {
             "object": "page",
@@ -555,9 +707,9 @@ def test_meta_webhook_rolls_back_failed_turn_and_allows_retry(
 
     assert first.status_code == 200
     assert retry.status_code == 200
-    assert retry.json()["skipped"] == 0
-    assert engine.calls == 2
-    assert len(sent_replies) == 2
+    assert retry.json()["skipped"] == 1
+    assert engine.calls == 1
+    assert len(sent_replies) == 1
     assert "أعد إرسال رسالتك من فضلك" in sent_replies[0][1]
     assert (
         db_session.query(Message)
@@ -566,7 +718,7 @@ def test_meta_webhook_rolls_back_failed_turn_and_allows_retry(
             Message.role == MessageRole.CUSTOMER,
         )
         .count()
-        == 0
+        == 1
     )
 
 
@@ -588,7 +740,14 @@ def test_concurrent_inbound_message_claim_uses_database_unique_constraint(tmp_pa
                 id=customer_id,
                 store_id=store_id,
                 name="Concurrent customer",
-                phone="synthetic-sender",
+            )
+        )
+        session.add(
+            ChannelIdentity(
+                store_id=store_id,
+                customer_id=customer_id,
+                channel="facebook",
+                external_user_id="synthetic-sender",
             )
         )
         session.add(
@@ -647,7 +806,7 @@ def test_concurrent_inbound_message_claim_uses_database_unique_constraint(tmp_pa
 
 @pytest.mark.parametrize(
     ("send_status", "expected_log"),
-    [(200, "SEND_OK status_code=200"), (400, "SEND_FAIL status_code=400")],
+    [(200, "SEND_OK delivered_count=1"), (400, "SEND_FAIL")],
 )
 def test_meta_webhook_sends_reply_to_customer_psid_and_ignores_non_messages(
     client, db_session, monkeypatch, caplog, send_status, expected_log
@@ -671,20 +830,16 @@ def test_meta_webhook_sends_reply_to_customer_psid_and_ignores_non_messages(
     monkeypatch.setattr(webhooks, "_engine", engine)
     sent_messages = []
 
-    async def fake_send_facebook_message(recipient_id, text):
+    async def fake_send_facebook_message(recipient_id, text, _access_token):
         sent_messages.append((recipient_id, text))
-        return SimpleNamespace(
+        return MessengerDeliveryResult(
+            delivered=send_status < 400,
             status_code=send_status,
-            is_success=send_status < 400,
-            text='{"error":{"message":"test send result"}}',
+            failure_code="test_graph_rejected" if send_status >= 400 else None,
+            retryable=send_status >= 500,
         )
 
-    monkeypatch.setattr(
-        webhooks,
-        "_send_facebook_message",
-        fake_send_facebook_message,
-    )
-    monkeypatch.setattr(webhooks, "FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
+    monkeypatch.setattr(outbound_delivery, "send_messenger_text", fake_send_facebook_message)
 
     body = json.dumps(
         {
@@ -753,7 +908,7 @@ def test_meta_webhook_sends_reply_to_customer_psid_and_ignores_non_messages(
 
 
 @pytest.mark.asyncio
-async def test_send_facebook_message_uses_page_token_and_v26_graph_api(monkeypatch):
+async def test_facebook_comment_reply_uses_explicit_account_token(monkeypatch):
     request_details = {}
 
     class FakeAsyncClient:
@@ -775,18 +930,17 @@ async def test_send_facebook_message_uses_page_token_and_v26_graph_api(monkeypat
             return SimpleNamespace(status_code=200, is_success=True, text="{}")
 
     monkeypatch.setattr(webhooks.httpx, "AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr(webhooks, "FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
-
-    await webhooks._send_facebook_message("customer-psid", "مرحبا")
+    await webhooks._send_facebook_comment_reply(
+        "comment-id",
+        "مرحبا",
+        "test-page-token",
+    )
 
     assert request_details == {
         "timeout": 30.0,
-        "url": "https://graph.facebook.com/v26.0/me/messages",
+        "url": "https://graph.facebook.com/v26.0/comment-id/comments",
         "params": {"access_token": "test-page-token"},
-        "json": {
-            "recipient": {"id": "customer-psid"},
-            "message": {"text": "مرحبا"},
-        },
+        "json": {"message": "مرحبا"},
     }
 
 

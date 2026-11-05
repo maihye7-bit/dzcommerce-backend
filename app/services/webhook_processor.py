@@ -70,7 +70,8 @@ async def process_webhook_event(
 
         # 3. Resolve Store (Find which store owns this external account)
         account_id = (
-            event.metadata.get("page_id")
+            event.metadata.get("external_account_id")
+            or event.metadata.get("page_id")
             or event.metadata.get("ig_account_id")
             or event.metadata.get("phone_number")
         )

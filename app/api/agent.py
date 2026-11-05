@@ -29,11 +29,11 @@ from app.core.config import AGENT_PROVIDER
 from app.core.deps import get_current_user
 from app.database import get_db
 from app.models.customer import Customer
-from app.models.channel_identity import ChannelIdentity
 from app.models.store_user import StoreUser
 from app.models.user import User
 from app.schemas.conversation import (AgentChatRequest, AgentChatResponse,
                                       ToolCallInfo)
+from app.services.channel_service import resolve_channel_customer
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -95,41 +95,21 @@ async def agent_chat(
 
     customer = None
     if payload.customer_external_id:
-        identity = (
-            db.query(ChannelIdentity)
-            .filter(
-                ChannelIdentity.store_id == store_id,
-                ChannelIdentity.channel == payload.channel,
-                ChannelIdentity.external_user_id == payload.customer_external_id,
-            )
-            .first()
+        customer = resolve_channel_customer(
+            db=db,
+            store_id=store_id,
+            channel=payload.channel,
+            external_account_id=None,
+            external_user_id=payload.customer_external_id,
+            display_name="API Customer",
         )
-        if identity:
-            customer = (
-                db.query(Customer)
-                .filter(
-                    Customer.id == identity.customer_id,
-                    Customer.store_id == store_id,
-                )
-                .first()
-            )
-    if not customer:
+    else:
         customer = Customer(
             store_id=store_id,
             name="API Customer",
         )
         db.add(customer)
         db.flush()
-        if payload.customer_external_id:
-            db.add(
-                ChannelIdentity(
-                    store_id=store_id,
-                    customer_id=customer.id,
-                    channel=payload.channel,
-                    external_user_id=payload.customer_external_id,
-                )
-            )
-            db.flush()
 
     engine = _build_engine()
     result = await engine.process_message(

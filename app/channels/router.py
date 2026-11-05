@@ -16,7 +16,12 @@ class ChannelRouter:
 
     Usage:
         router = ChannelRouter()
-        router.register(FacebookAdapter())
+        router.register(
+            FacebookAdapter(
+                access_token=page_access_token,
+                external_account_id=page_id,
+            )
+        )
         router.register(WhatsAppAdapter())
 
         event = router.normalize("facebook", raw_webhook_payload)

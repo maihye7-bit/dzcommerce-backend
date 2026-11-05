@@ -20,52 +20,87 @@ from app.models.channel_identity import ChannelIdentity
 from app.models.conversation import Conversation, ConversationStatus, Message
 from app.models.customer import Customer
 from app.schemas.channel_events import InboundEvent
-from app.services.exceptions import NotFoundError
+from sqlalchemy.exc import IntegrityError
 
 
-def _resolve_customer(
-    db: Session, store_id: uuid.UUID, event: InboundEvent
+def resolve_channel_customer(
+    db: Session,
+    store_id: uuid.UUID,
+    channel: str,
+    external_account_id: str | None,
+    external_user_id: str,
+    display_name: str | None = None,
 ) -> Customer:
-    """
-    Find or create a Customer for this inbound event.
-    Uses ChannelIdentity to map external user IDs to internal customers.
-    """
-    identity = (
-        db.query(ChannelIdentity)
-        .filter(
-            ChannelIdentity.store_id == store_id,
-            ChannelIdentity.channel == event.channel,
-            ChannelIdentity.external_user_id == event.external_user_id,
-        )
-        .first()
+    """Resolve a tenant- and account-scoped external user identity."""
+    identity_filter = (
+        ChannelIdentity.store_id == store_id,
+        ChannelIdentity.channel == channel,
+        ChannelIdentity.external_account_id == external_account_id,
+        ChannelIdentity.external_user_id == external_user_id,
     )
+    def find_identity() -> ChannelIdentity | None:
+        identities = db.query(ChannelIdentity).filter(*identity_filter).all()
+        if len(identities) > 1:
+            raise ValueError(
+                "Multiple legacy channel identities match this account-less user"
+            )
+        return identities[0] if identities else None
+
+    identity = find_identity()
 
     if identity:
-        return (
+        customer = (
             db.query(Customer)
             .filter(Customer.id == identity.customer_id, Customer.store_id == store_id)
-            .first()
+            .one_or_none()
         )
+        if customer is None:
+            raise ValueError("Channel identity is not attached to a customer in this store")
+        return customer
 
-    # No identity found -> create new customer + identity
-    customer = Customer(
-        store_id=store_id,
-        name=event.customer_name or f"{event.channel} User",
-    )
-    db.add(customer)
-    db.flush()
-
-    new_identity = ChannelIdentity(
-        store_id=store_id,
-        customer_id=customer.id,
-        channel=event.channel,
-        external_user_id=event.external_user_id,
-        external_username=event.customer_name,
-    )
-    db.add(new_identity)
-    db.flush()
+    try:
+        with db.begin_nested():
+            customer = Customer(
+                store_id=store_id,
+                name=display_name or f"{channel} User",
+            )
+            db.add(customer)
+            db.flush()
+            db.add(
+                ChannelIdentity(
+                    store_id=store_id,
+                    customer_id=customer.id,
+                    channel=channel,
+                    external_account_id=external_account_id,
+                    external_user_id=external_user_id,
+                    external_username=display_name,
+                )
+            )
+            db.flush()
+    except IntegrityError:
+        identity = find_identity()
+        if identity is None:
+            raise
+        customer = (
+            db.query(Customer)
+            .filter(Customer.id == identity.customer_id, Customer.store_id == store_id)
+            .one_or_none()
+        )
+        if customer is None:
+            raise ValueError("Channel identity is not attached to a customer in this store")
 
     return customer
+
+
+def _resolve_customer(db: Session, store_id: uuid.UUID, event: InboundEvent) -> Customer:
+    return resolve_channel_customer(
+        db=db,
+        store_id=store_id,
+        channel=event.channel,
+        external_account_id=event.metadata.get("external_account_id"),
+        external_user_id=event.external_user_id,
+        display_name=event.customer_name,
+    )
 
 
 def _find_or_create_conversation(

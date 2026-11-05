@@ -12,9 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.core.config import AGENT_PROVIDER, FACEBOOK_PAGE_ACCESS_TOKEN
+from app.core.config import AGENT_PROVIDER
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageRole
-from app.models.customer import Customer
+from app.models.channel_identity import ChannelIdentity
+from app.models.outbound_delivery import OutboundDelivery
 from app.models.store import Store
 from app.models.channel_account import ChannelAccount
 from app.services.webhook_security import (
@@ -28,6 +29,12 @@ from app.services.inbound_attachments import (
 )
 from app.services import product_image_storage
 from app.services.exceptions import ImageStorageError
+from app.services.channel_service import resolve_channel_customer
+from app.services.outbound_delivery import (
+    dispatch_due_deliveries,
+    enqueue_delivery,
+    resolve_meta_access_token,
+)
 
 # Imports for Phase 12-D Integration (FIXED: Added #)
 from app.agent.conversation_engine import ConversationEngine
@@ -49,50 +56,37 @@ def _build_llm_provider():
         return FreeLLMProvider()
     return MockLLMProvider()
 
-async def _send_facebook_comment_reply(comment_id: str, text: str) -> httpx.Response:
-    if not FACEBOOK_PAGE_ACCESS_TOKEN:
-        raise RuntimeError("FACEBOOK_PAGE_ACCESS_TOKEN is not configured")
+async def _send_facebook_comment_reply(
+    comment_id: str,
+    text: str,
+    access_token: str,
+) -> httpx.Response:
     url = f"https://graph.facebook.com/v26.0/{comment_id}/comments"
     payload = {"message": text}
     async with httpx.AsyncClient(timeout=30.0) as client:
         return await client.post(
             url,
-            params={"access_token": FACEBOOK_PAGE_ACCESS_TOKEN},
+            params={"access_token": access_token},
             json=payload,
         )
 
-async def _send_instagram_comment_reply(comment_id: str, text: str) -> httpx.Response:
-    if not FACEBOOK_PAGE_ACCESS_TOKEN:
-        raise RuntimeError("FACEBOOK_PAGE_ACCESS_TOKEN is not configured")
+async def _send_instagram_comment_reply(
+    comment_id: str,
+    text: str,
+    access_token: str,
+) -> httpx.Response:
     url = f"https://graph.facebook.com/v26.0/{comment_id}/replies"
     payload = {"message": text}
     async with httpx.AsyncClient(timeout=30.0) as client:
         return await client.post(
             url,
-            params={"access_token": FACEBOOK_PAGE_ACCESS_TOKEN},
+            params={"access_token": access_token},
             json=payload,
         )
 
 # Initialize Components Once at Module Load Time (FIXED: Added #)
 _llm_provider = _build_llm_provider()
 _engine = ConversationEngine(llm_provider=_llm_provider, tool_registry=tool_registry)
-
-async def _send_facebook_message(recipient_id: str, text: str) -> httpx.Response:
-    """Send a Messenger reply using the configured Facebook Page access token."""
-    if not FACEBOOK_PAGE_ACCESS_TOKEN:
-        raise RuntimeError("FACEBOOK_PAGE_ACCESS_TOKEN is not configured")
-    url = "https://graph.facebook.com/v26.0/me/messages"
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text},
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        return await client.post(
-            url,
-            params={"access_token": FACEBOOK_PAGE_ACCESS_TOKEN},
-            json=payload,
-        )
-
 
 def _extract_message_attachments(message_data: dict) -> list[dict]:
     attachments = message_data.get("attachments")
@@ -207,6 +201,9 @@ def _persist_webhook_reply(
     conversation_id: uuid.UUID,
     response: str,
     previous_response: str | None = None,
+    channel: str | None = None,
+    external_account_id: str | None = None,
+    recipient_external_id: str | None = None,
 ) -> None:
     message = None
     if previous_response:
@@ -222,14 +219,51 @@ def _persist_webhook_reply(
         )
     if message is not None:
         message.content = response
-    else:
-        db.add(
-            Message(
-                conversation_id=conversation_id,
-                role=MessageRole.AGENT,
-                content=response,
+        db.flush()
+        queued_deliveries = (
+            db.query(OutboundDelivery)
+            .filter(
+                OutboundDelivery.message_id == message.id,
+                OutboundDelivery.payload_type == "text",
             )
+            .all()
         )
+        pending_delivery = next(
+            (delivery for delivery in queued_deliveries if delivery.status == "pending"),
+            None,
+        )
+        if pending_delivery is not None:
+            pending_delivery.payload_json = {"text": response}
+        elif not queued_deliveries and channel and external_account_id and recipient_external_id:
+            enqueue_delivery(
+                db,
+                conversation_id=conversation_id,
+                message_id=message.id,
+                channel=channel,
+                external_account_id=external_account_id,
+                recipient_external_id=recipient_external_id,
+                payload_type="text",
+                payload={"text": response},
+            )
+    else:
+        message = Message(
+            conversation_id=conversation_id,
+            role=MessageRole.AGENT,
+            content=response,
+        )
+        db.add(message)
+        db.flush()
+        if channel and external_account_id and recipient_external_id:
+            enqueue_delivery(
+                db,
+                conversation_id=conversation_id,
+                message_id=message.id,
+                channel=channel,
+                external_account_id=external_account_id,
+                recipient_external_id=recipient_external_id,
+                payload_type="text",
+                payload={"text": response},
+            )
     db.commit()
 
 
@@ -256,6 +290,7 @@ def _persist_inbound_message(
     text: str,
     external_message_id: str | None,
     attachments: list[dict] | None = None,
+    external_account_id: str | None = None,
 ) -> bool:
     """Stage an inbound event; return False only for its scoped duplicate."""
     attachments = attachments or []
@@ -301,12 +336,17 @@ def _persist_inbound_message(
         existing_message = (
             db.query(Message.id)
             .join(Conversation, Message.conversation_id == Conversation.id)
-            .join(Customer, Conversation.customer_id == Customer.id)
+            .join(
+                ChannelIdentity,
+                (ChannelIdentity.customer_id == Conversation.customer_id)
+                & (ChannelIdentity.store_id == Conversation.store_id),
+            )
             .filter(
                 Message.external_message_id == external_message_id,
                 Conversation.store_id == store_id,
                 Conversation.channel == channel,
-                Customer.phone == sender_id,
+                ChannelIdentity.external_account_id == external_account_id,
+                ChannelIdentity.external_user_id == sender_id,
             )
             .first()
         )
@@ -476,10 +516,26 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 
             reply_text = "شكرًا على تعليقك. سنرد عليك قريبًا من متجرنا."
             try:
+                access_token = resolve_meta_access_token(
+                    db,
+                    store_id=store_id,
+                    channel=channel,
+                    external_account_id=str(entry.get("id") or ""),
+                )
+                if access_token is None:
+                    raise RuntimeError("Meta account credential unavailable")
                 if channel == "facebook":
-                    await _send_facebook_comment_reply(str(comment_id), reply_text)
+                    await _send_facebook_comment_reply(
+                        str(comment_id),
+                        reply_text,
+                        access_token,
+                    )
                 else:
-                    await _send_instagram_comment_reply(str(comment_id), reply_text)
+                    await _send_instagram_comment_reply(
+                        str(comment_id),
+                        reply_text,
+                        access_token,
+                    )
                 processed_count += 1
                 logger.info(
                     "auto_comment_reply sent channel=%s store_id=%s comment_id=%s",
@@ -516,6 +572,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             sender_id = (event.get("sender") or {}).get("id")
             if not sender_id:
                 continue
+            sender_id = str(sender_id)
                 
             if not isinstance(message_data, dict):
                 continue
@@ -554,19 +611,15 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     continue
 
                 # 2. Identify/Create Customer
-                customer = db.query(Customer).filter(
-                    Customer.phone == sender_id,
-                    Customer.store_id == store.id
-                ).first()
-                if not customer:
-                    customer = Customer(
-                        store_id=store.id,
-                        name=f"FB User {sender_id[-6:]}",
-                        phone=sender_id,
-                        email=None,
-                    )
-                    db.add(customer)
-                    db.flush()
+                external_account_id = str(entry.get("id") or "")
+                customer = resolve_channel_customer(
+                    db=db,
+                    store_id=store.id,
+                    channel=channel,
+                    external_account_id=external_account_id,
+                    external_user_id=str(sender_id),
+                    display_name=f"{channel.upper()} User {str(sender_id)[-6:]}",
+                )
 
                 # 3. Identify/Create Active Conversation
                 conv = db.query(Conversation).filter(
@@ -584,6 +637,9 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     )
                     db.add(conv)
                     db.flush()
+                conv_metadata = dict(conv.metadata_json or {})
+                conv_metadata["external_account_id"] = external_account_id
+                conv.metadata_json = conv_metadata
                 
                 conv_id_for_log = conv.id
 
@@ -593,6 +649,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     store_id=store.id,
                     channel=channel,
                     sender_id=sender_id,
+                    external_account_id=external_account_id,
                     text=text,
                     external_message_id=external_mid,
                     attachments=raw_attachments,
@@ -633,6 +690,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 if inbound_message is None:
                     raise InboundMessagePersistenceError
 
+                db.commit()
                 if raw_attachments:
                     attachment_metadata = await _store_inbound_attachments(
                         raw_attachments
@@ -660,13 +718,28 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                         attachment_metadata,
                         _message_language(text),
                     )
-                    _persist_webhook_reply(db, conv.id, ai_reply)
+                    _persist_webhook_reply(
+                        db,
+                        conv.id,
+                        ai_reply,
+                        channel=channel,
+                        external_account_id=external_account_id,
+                        recipient_external_id=sender_id,
+                    )
                     turn_diagnostics = {
                         "intent": "image_received",
                         "resolver_action": "RESPOND:text_only",
                         "response_candidates": 1,
                     }
                 else:
+                    attachment_suffix = (
+                        _attachment_notice(
+                            attachment_metadata,
+                            _message_language(text),
+                        )
+                        if raw_attachments
+                        else None
+                    )
                     result = await _engine.process_message(
                         db=db,
                         store_id=store.id,
@@ -674,27 +747,34 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                         conversation_id=conv.id,
                         channel=channel,
                         user_message=text,
+                        external_account_id=external_account_id,
+                        external_user_id=sender_id,
+                        outbound_suffix=attachment_suffix,
                     )
                     ai_reply = result.get("response", "")
                     turn_diagnostics = result.get("turn_diagnostics") or {}
                     processing_failed = bool(result.get("processing_failed"))
 
                     if raw_attachments:
-                        previous_reply = ai_reply
-                        notice = _attachment_notice(
-                            attachment_metadata,
-                            _message_language(text),
-                        )
-                        ai_reply = f"{ai_reply}\n\n{notice}".strip()
                         if processing_failed:
-                            _delete_stored_attachments(attachment_metadata)
-                        else:
-                            _persist_webhook_reply(
-                                db,
-                                conv.id,
-                                ai_reply,
-                                previous_response=previous_reply,
+                            ai_reply = (
+                                f"{ai_reply}\n\n{attachment_suffix}".strip()
                             )
+                            _delete_stored_attachments(attachment_metadata)
+                        elif attachment_suffix and not ai_reply.endswith(
+                            attachment_suffix
+                        ):
+                            ai_reply = f"{ai_reply}\n\n{attachment_suffix}".strip()
+                    if ai_reply and not processing_failed:
+                        _persist_webhook_reply(
+                            db,
+                            conv.id,
+                            ai_reply,
+                            previous_response=result.get("response"),
+                            channel=channel,
+                            external_account_id=external_account_id,
+                            recipient_external_id=sender_id,
+                        )
 
                     logger.debug(
                         "AGENT_REPLY delivery_id=%s reply_length=%d",
@@ -727,42 +807,29 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     )
                 processing_failed = True
 
-            # Send Reply Logic
-            if ai_reply and conv_id_for_log:
-                if not processing_failed:
-                    processed_count += 1
-                    
-                if channel == "facebook":
-                    recipient_id = str(sender_id)
-                    logger.debug(
-                        "SEND_ATTEMPT delivery_id=%s",
+            if ai_reply and processing_failed and conv_id_for_log:
+                _persist_webhook_reply(
+                    db,
+                    conv_id_for_log,
+                    ai_reply,
+                    channel=channel,
+                    external_account_id=external_account_id,
+                    recipient_external_id=sender_id,
+                )
+
+            # The durable outbox, not the webhook event, owns response delivery.
+            if ai_reply and conv_id_for_log and not processing_failed:
+                processed_count += 1
+            if conv_id_for_log:
+                logger.debug("SEND_ATTEMPT delivery_id=%s", delivery_trace_id)
+                response_sent_count = await dispatch_due_deliveries(db, limit=20)
+                if response_sent_count:
+                    logger.debug("SEND_OK delivered_count=%d", response_sent_count)
+                elif ai_reply:
+                    logger.error(
+                        "SEND_FAIL delivery_id=%s reply remains pending_or_failed",
                         delivery_trace_id,
                     )
-                    try:
-                        if not recipient_id:
-                            raise RuntimeError(
-                                "Customer.phone does not contain the Messenger PSID"
-                            )
-                        send_response = await _send_facebook_message(
-                            recipient_id=recipient_id,
-                            text=ai_reply,
-                        )
-                        if send_response.is_success:
-                            response_sent_count = 1
-                            logger.debug(
-                                "SEND_OK status_code=%d",
-                                send_response.status_code,
-                            )
-                        else:
-                            logger.error(
-                                "SEND_FAIL status_code=%d",
-                                send_response.status_code,
-                            )
-                    except (httpx.HTTPError, RuntimeError) as send_err:
-                        logger.error(
-                            "SEND_FAIL error_type=%s",
-                            type(send_err).__name__,
-                        )
 
             logger.info(
                 (

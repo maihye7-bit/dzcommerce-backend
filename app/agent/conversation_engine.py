@@ -2437,6 +2437,9 @@ class ConversationEngine:
         conversation_id: uuid.UUID | None,
         channel: str,
         user_message: str,
+        external_account_id: str | None = None,
+        external_user_id: str | None = None,
+        outbound_suffix: str | None = None,
     ) -> dict:
         try:
             return await self._process_message(
@@ -2446,6 +2449,9 @@ class ConversationEngine:
                 conversation_id=conversation_id,
                 channel=channel,
                 user_message=user_message,
+                external_account_id=external_account_id,
+                external_user_id=external_user_id,
+                outbound_suffix=outbound_suffix,
             )
         except Exception as exc:
             logger.exception(
@@ -2469,6 +2475,9 @@ class ConversationEngine:
         conversation_id: uuid.UUID | None,
         channel: str,
         user_message: str,
+        external_account_id: str | None = None,
+        external_user_id: str | None = None,
+        outbound_suffix: str | None = None,
     ) -> dict:
         turn_id = uuid.uuid4().hex
         conv_id = conversation_id or uuid.uuid4()
@@ -3061,6 +3070,9 @@ class ConversationEngine:
                 "conversation_id": conv_id,
                 "channel": channel,
                 "user_message": user_message,
+                "external_account_id": external_account_id,
+                "external_user_id": external_user_id,
+                "language": nlu_output.get("language", "ar"),
             }
             if tool_name in {
                 "create_order_draft",
@@ -3117,11 +3129,11 @@ class ConversationEngine:
                 if tool_name == "send_product_image":
                     language = nlu_output.get("language", "ar")
                     final_response_content = (
-                        "تفضل، أرسلت لك صورة المنتج."
+                        "سأرسل لك صورة المنتج الآن."
                         if language == "ar"
-                        else "Voici la photo du produit."
+                        else "Je prépare l'envoi de la photo du produit."
                         if language == "fr"
-                        else "Here is the product photo."
+                        else "I'm preparing the product photo for delivery."
                     )
                 else:
                     final_response_content = await self._generate_localized_final_text(
@@ -3658,13 +3670,33 @@ class ConversationEngine:
         ):
             conversation.metadata_json["last_question_type"] = next_question_type
 
-        db.add(
-            Message(
-                conversation_id=conv_id,
-                role=MessageRole.AGENT,
-                content=final_response_content,
-            )
+        if final_response_content and outbound_suffix:
+            final_response_content = f"{final_response_content}\n\n{outbound_suffix}"
+        agent_message = Message(
+            conversation_id=conv_id,
+            role=MessageRole.AGENT,
+            content=final_response_content,
         )
+        db.add(agent_message)
+        db.flush()
+        if (
+            final_response_content
+            and channel in {"facebook", "instagram"}
+            and external_account_id
+            and external_user_id
+        ):
+            from app.services.outbound_delivery import enqueue_delivery
+
+            enqueue_delivery(
+                db,
+                conversation_id=conv_id,
+                message_id=agent_message.id,
+                channel=channel,
+                external_account_id=external_account_id,
+                recipient_external_id=external_user_id,
+                payload_type="text",
+                payload={"text": final_response_content},
+            )
         db.commit()
 
         response_candidates = [final_response_content] if final_response_content else []

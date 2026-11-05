@@ -12,7 +12,10 @@ from app.models.product_image import ProductImage
 from app.models.inventory import InventoryItem
 from app.models.order import Order, OrderItem
 from app.models.channel_account import ChannelAccount
+from app.models.channel_identity import ChannelIdentity
 from app.models.ai_usage_event import AIUsageEvent
+from app.models.outbound_delivery import OutboundDelivery
+from app.models.store_meta_token import StoreMetaToken
 
 __all__ = [
     "User",
@@ -29,5 +32,8 @@ __all__ = [
     "Order",
     "OrderItem",
     "ChannelAccount",
+    "ChannelIdentity",
     "AIUsageEvent",
+    "OutboundDelivery",
+    "StoreMetaToken",
 ]
