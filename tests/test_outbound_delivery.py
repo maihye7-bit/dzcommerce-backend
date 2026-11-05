@@ -4,18 +4,31 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 import pytest
+from cryptography.fernet import Fernet
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
+from app.config import settings
 from app.models.channel_identity import ChannelIdentity
+from app.models.channel_account import ChannelAccount
 from app.models.conversation import Conversation, ConversationStatus
 from app.models.customer import Customer
 from app.models.outbound_delivery import OutboundDelivery
 from app.models.store import Store
 from app.models.store_meta_token import StoreMetaToken
 from app.services import channel_service, outbound_delivery
+from app.services.meta_token_security import encrypt_meta_token
 from app.services.messenger_media import MessengerDeliveryResult
+
+
+@pytest.fixture(autouse=True)
+def use_test_meta_encryption_key(monkeypatch):
+    monkeypatch.setattr(
+        settings,
+        "SOCIAL_TOKEN_ENCRYPTION_KEY",
+        Fernet.generate_key().decode("ascii"),
+    )
 
 
 def _create_channel_customer(db, external_account_id, external_user_id):
@@ -47,12 +60,20 @@ def _queue_text(
     db.add(customer)
     db.flush()
     db.add(
+        ChannelAccount(
+            store_id=store.id,
+            channel=channel,
+            external_account_id=external_account_id,
+            is_active=True,
+        )
+    )
+    db.add(
         StoreMetaToken(
             store_id=store.id,
             page_id=external_account_id,
             instagram_page_id=external_account_id,
             page_name="Test page",
-            access_token="test-token",
+            access_token=encrypt_meta_token("test-token"),
         )
     )
     conversation = Conversation(
@@ -237,11 +258,19 @@ async def test_permanent_image_failure_queues_a_text_fallback(db_session, monkey
     db_session.add(customer)
     db_session.flush()
     db_session.add(
+        ChannelAccount(
+            store_id=store.id,
+            channel="facebook",
+            external_account_id="page-id",
+            is_active=True,
+        )
+    )
+    db_session.add(
         StoreMetaToken(
             store_id=store.id,
             page_id="page-id",
             page_name="Test page",
-            access_token="test-token",
+            access_token=encrypt_meta_token("test-token"),
         )
     )
     conversation = Conversation(
@@ -394,8 +423,8 @@ async def test_facebook_deliveries_use_each_stores_exact_page_token(
         .filter(StoreMetaToken.store_id == second_store_id)
         .one()
     )
-    first_credentials.access_token = "store-one-token"
-    second_credentials.access_token = "store-two-token"
+    first_credentials.access_token = encrypt_meta_token("store-one-token")
+    second_credentials.access_token = encrypt_meta_token("store-two-token")
     db_session.commit()
     used_tokens = {}
 
@@ -426,7 +455,7 @@ async def test_instagram_requires_matching_store_account_token(db_session, monke
         .one()
     )
     credentials.instagram_page_id = "ig-account"
-    credentials.access_token = "instagram-page-token"
+    credentials.access_token = encrypt_meta_token("instagram-page-token")
     db_session.commit()
     received = []
 
@@ -456,7 +485,7 @@ async def test_missing_or_foreign_account_token_fails_without_global_fallback(
         .one()
     )
     credentials.page_id = "different-page"
-    credentials.access_token = "must-not-be-used"
+    credentials.access_token = encrypt_meta_token("must-not-be-used")
     other_store = Store(name="Other credential store", slug=f"other-token-{uuid.uuid4()}")
     db_session.add(other_store)
     db_session.flush()
@@ -465,7 +494,7 @@ async def test_missing_or_foreign_account_token_fails_without_global_fallback(
             store_id=other_store.id,
             page_id="unmatched-page",
             page_name="Foreign page",
-            access_token="foreign-store-token",
+            access_token=encrypt_meta_token("foreign-store-token"),
         )
     )
     db_session.commit()

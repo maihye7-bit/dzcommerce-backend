@@ -20,6 +20,7 @@ from app.models.conversation import Conversation, Message, MessageRole
 from app.models.customer import Customer
 from app.models.outbound_delivery import OutboundDelivery
 from app.models.store import Store
+from app.models.store_meta_token import StoreMetaToken
 from app.services import outbound_delivery
 from app.services.messenger_media import MessengerDeliveryResult
 from app.services.webhook_security import verify_meta_verify_token
@@ -71,6 +72,25 @@ def _signature(body: bytes, secret: str) -> str:
     return f"sha256={digest}"
 
 
+def _link_facebook_page(db, store_id, page_id):
+    db.add(
+        ChannelAccount(
+            store_id=store_id,
+            channel="facebook",
+            external_account_id=page_id,
+            is_active=True,
+        )
+    )
+    db.add(
+        StoreMetaToken(
+            store_id=store_id,
+            page_id=page_id,
+            page_name="Connected Page",
+            access_token="fernet:v1:encrypted-test-token",
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("platform_object", "channel"),
     [("page", "facebook"), ("instagram", "instagram")],
@@ -92,6 +112,15 @@ def test_meta_webhook_uses_bound_store_and_preserves_idempotency(
             is_active=True,
         )
     )
+    if channel == "facebook":
+        db_session.add(
+            StoreMetaToken(
+                store_id=connected_store.id,
+                page_id="account-target",
+                page_name="Connected Page",
+                access_token="fernet:v1:encrypted-test-token",
+            )
+        )
     db_session.commit()
 
     engine = RecordingEngine()
@@ -125,7 +154,6 @@ def test_meta_webhook_uses_bound_store_and_preserves_idempotency(
     assert len(engine.calls) == 1
     assert engine.calls[0]["store_id"] == connected_store.id
     assert engine.calls[0]["channel"] == channel
-
     conversations = (
         db_session.query(Conversation)
         .filter(Conversation.customer_id == engine.calls[0]["customer_id"])
@@ -142,6 +170,50 @@ def test_meta_webhook_uses_bound_store_and_preserves_idempotency(
     )
 
 
+def test_facebook_webhook_does_not_auto_link_to_the_only_active_store(
+    client, db_session, monkeypatch
+):
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+    store = Store(name="Unlinked store", slug=f"unlinked-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.commit()
+    engine = RecordingEngine()
+    monkeypatch.setattr(webhooks, "_engine", engine)
+
+    body = json.dumps(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "unverified-page",
+                    "messaging": [
+                        {
+                            "sender": {"id": "customer"},
+                            "message": {"mid": "unverified-message", "text": "hello"},
+                        }
+                    ],
+                }
+            ],
+        }
+    ).encode()
+    response = client.post(
+        "/webhooks/meta",
+        content=body,
+        headers={"X-Hub-Signature-256": _signature(body, secret)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+    assert (
+        db_session.query(ChannelAccount)
+        .filter_by(channel="facebook", external_account_id="unverified-page")
+        .count()
+        == 0
+    )
+    assert engine.calls == []
+
+
 def test_meta_webhook_receives_image_only_and_stores_it_once(
     client, db_session, monkeypatch
 ):
@@ -150,14 +222,7 @@ def test_meta_webhook_receives_image_only_and_stores_it_once(
     store = Store(name="Image store", slug=f"image-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="image-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "image-page")
     db_session.commit()
 
     engine = RecordingEngine()
@@ -241,14 +306,7 @@ def test_facebook_followup_reuses_channel_identity_after_phone_capture(
     store = Store(name="Identity store", slug=f"identity-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="identity-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "identity-page")
     db_session.commit()
     engine = RecordingEngine()
     monkeypatch.setattr(webhooks, "_engine", engine)
@@ -316,14 +374,7 @@ def test_outbox_retry_after_duplicate_event_does_not_reenter_engine(
     store = Store(name="Retry store", slug=f"retry-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="retry-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "retry-page")
     db_session.commit()
     engine = RecordingEngine()
     monkeypatch.setattr(webhooks, "_engine", engine)
@@ -381,14 +432,7 @@ def test_meta_webhook_processes_text_with_image_and_reports_expired_image(
     store = Store(name="Mixed store", slug=f"mixed-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="mixed-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "mixed-page")
     db_session.commit()
 
     engine = RecordingEngine()
@@ -488,14 +532,7 @@ def test_meta_webhook_does_not_treat_unrelated_integrity_error_as_duplicate(
     store = Store(name="Constraint store", slug=f"constraint-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="constraint-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "constraint-page")
     customer = Customer(store_id=store.id, name="Existing customer")
     db_session.add(customer)
     db_session.flush()
@@ -577,14 +614,7 @@ def test_meta_webhook_does_not_skip_message_id_from_another_scope(
     if other_store is not connected_store:
         db_session.add(other_store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=connected_store.id,
-            channel="facebook",
-            external_account_id="target-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, connected_store.id, "target-page")
     other_customer = Customer(store_id=other_store.id, name="Other customer")
     db_session.add(other_customer)
     db_session.flush()
@@ -654,14 +684,7 @@ def test_meta_webhook_persists_failed_turn_reply_for_outbox_delivery(
     store = Store(name="Failure store", slug=f"failure-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="failure-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "failure-page")
     db_session.commit()
 
     class FailOnceEngine:
@@ -816,14 +839,7 @@ def test_meta_webhook_sends_reply_to_customer_psid_and_ignores_non_messages(
     store = Store(name="Messenger store", slug=f"messenger-{uuid.uuid4()}")
     db_session.add(store)
     db_session.flush()
-    db_session.add(
-        ChannelAccount(
-            store_id=store.id,
-            channel="facebook",
-            external_account_id="messenger-page",
-            is_active=True,
-        )
-    )
+    _link_facebook_page(db_session, store.id, "messenger-page")
     db_session.commit()
 
     engine = RecordingEngine()

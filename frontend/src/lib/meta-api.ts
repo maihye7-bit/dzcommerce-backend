@@ -6,9 +6,17 @@ export interface MetaAppConfig {
 }
 
 export interface StoreMetaConnection {
+  status: "incomplete" | "connected";
   connected: boolean;
+  verified: boolean;
   pageId: string | null;
   pageName: string | null;
+}
+
+export interface FacebookPageCredentials {
+  pageName: string;
+  pageId: string;
+  pageAccessToken: string;
 }
 
 /**
@@ -35,12 +43,16 @@ export async function fetchStoreMetaConnection(storeId: string): Promise<StoreMe
 }
 
 /**
- * Initiate the Meta connection flow for a store.
- * In a real implementation, this would return a URL to redirect the user to for OAuth.
- * For simplicity, we assume the backend handles the OAuth flow and just toggles the connection status.
+ * Verify and link a Facebook Page to a store.
  */
-export async function connectStoreMeta(storeId: string): Promise<StoreMetaConnection> {
-  const response = await api.post<StoreMetaConnection>(`/api/stores/${storeId}/meta-connection`, {});
+export async function connectStoreMeta(
+  storeId: string,
+  credentials: FacebookPageCredentials,
+): Promise<StoreMetaConnection> {
+  const response = await api.post<StoreMetaConnection>(
+    `/api/stores/${storeId}/meta-connection`,
+    credentials,
+  );
   return response.data;
 }
 

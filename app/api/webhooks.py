@@ -18,6 +18,7 @@ from app.models.channel_identity import ChannelIdentity
 from app.models.outbound_delivery import OutboundDelivery
 from app.models.store import Store
 from app.models.channel_account import ChannelAccount
+from app.models.store_meta_token import StoreMetaToken
 from app.services.webhook_security import (
     verify_meta_signature,
     verify_meta_verify_token,
@@ -424,7 +425,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
             )
 
         # Try to find existing active store link
-        store_ids = (
+        store_query = (
             db.query(ChannelAccount.store_id)
             .join(Store, Store.id == ChannelAccount.store_id)
             .filter(
@@ -433,8 +434,14 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 ChannelAccount.is_active.is_(True),
                 Store.is_active.is_(True),
             )
-            .all()
         )
+        if channel == "facebook":
+            store_query = store_query.join(
+                StoreMetaToken,
+                (StoreMetaToken.store_id == ChannelAccount.store_id)
+                & (StoreMetaToken.page_id == ChannelAccount.external_account_id),
+            )
+        store_ids = store_query.all()
 
         target_store_id = None
         if store_ids:
@@ -445,7 +452,20 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 )
             target_store_id = store_ids[0][0]
         else:
-            # Fallback mechanism: Graceful Auto-Provisioning for dev/initial setup
+            if channel == "facebook":
+                logger.warning(
+                    "UNLINKED_FACEBOOK_PAGE_RECEIVED: Page has not completed "
+                    "store verification"
+                )
+                return {
+                    "status": "ignored",
+                    "reason": (
+                        "This Facebook Page is not connected to a store. "
+                        "Complete Page verification in the store settings."
+                    ),
+                }
+
+            # Keep the existing Instagram account discovery behavior unchanged.
             active_stores = db.query(Store).filter(Store.is_active.is_(True)).all()
             
             if len(active_stores) == 1:

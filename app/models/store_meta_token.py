@@ -4,8 +4,7 @@ StoreMetaToken: Stores the Meta (Facebook) connection details for a store.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import (DateTime, ForeignKey, Index, String, UniqueConstraint,
-                        func)
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,7 +22,7 @@ class StoreMetaToken(Base):
     )
     page_id: Mapped[str] = mapped_column(String(255), nullable=False)
     page_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    access_token: Mapped[str] = mapped_column(String(255), nullable=False)  # Should be encrypted in production
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
     instagram_page_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(

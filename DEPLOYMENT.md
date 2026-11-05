@@ -29,12 +29,9 @@
 | `QWEN_TIMEOUT` | اختياري | `60` ثانية | مهلة طلبات المزود. |
 | `QWEN_RECENT_MESSAGES_LIMIT` | اختياري | `10` | الحد الأقصى للرسائل الحديثة في السياق. |
 | `QWEN_MAX_CONTEXT_TOKENS` | اختياري | `32000` | الحد الأقصى لرموز السياق. |
-| `META_APP_ID` | اختياري | فارغ | معرّف تطبيق Meta. |
-| `FACEBOOK_APP_ID` | اختياري، بديل | — | اسم بديل لـ`META_APP_ID`. |
-| `META_APP_SECRET` | مطلوب لتوقيع Webhook في الإنتاج | فارغ | سر تطبيق Meta المستخدم للتحقق من توقيع الطلبات. |
-| `FACEBOOK_APP_SECRET` | اختياري، بديل | — | اسم بديل لـ`META_APP_SECRET`. |
-| `META_ACCESS_TOKEN` | اختياري حسب تكامل القناة | فارغ | رمز الوصول المستخدم لتكامل Meta. |
-| `FACEBOOK_PAGE_ACCESS_TOKEN` | اختياري، بديل | — | اسم بديل لـ`META_ACCESS_TOKEN`. |
+| `META_APP_ID` | مطلوب لربط صفحة Facebook | فارغ | معرّف تطبيق Meta المستخدم للتحقق من Page Access Token. |
+| `META_APP_SECRET` | مطلوب لربط الصفحة وWebhook | فارغ | سر التطبيق المستخدم للتحقق من الرمز وتوقيع Webhook. |
+| `SOCIAL_TOKEN_ENCRYPTION_KEY` | مطلوب لتخزين توكنات Meta | فارغ | مفتاح Fernet ثابت لتشفير وفك تشفير اعتمادات المتاجر. |
 | `META_VERIFY_TOKEN` | مطلوب عند إعداد تحقق Meta Webhook | فارغ | رمز التحقق الذي يجب أن يطابق القيمة المسجلة في إعداد Meta Webhook. |
 | `FACEBOOK_VERIFY_TOKEN` | اختياري، بديل | — | اسم بديل لـ`META_VERIFY_TOKEN`. |
 | `WHATSAPP_ACCESS_TOKEN` | مخطط — غير نشط | فارغ | متغير تكامل WhatsApp؛ مسار الرسائل الواردة غير مفعّل. |
@@ -95,7 +92,7 @@ npm run build
 
 ## إعداد Meta Webhook
 
-راجع [META_SETUP.md](./META_SETUP.md) لخطوات إنشاء تطبيق Meta وربط صفحة Facebook بالمتجر. استخدم القيمة `facebook` للقناة التي تمثل Facebook Messenger. يتطلب الإعداد الإنتاجي عنوان HTTPS، و`META_APP_SECRET` للتحقق من التوقيع، و`META_VERIFY_TOKEN` للتحقق الأولي من Webhook.
+راجع [META_SETUP.md](./META_SETUP.md) لخطوات إنشاء تطبيق Meta وربط صفحة Facebook بالمتجر. يتطلب ربط الصفحة `META_APP_ID` و`META_APP_SECRET` و`SOCIAL_TOKEN_ENCRYPTION_KEY`، ويتطلب إعداد Webhook عنوان HTTPS و`META_VERIFY_TOKEN`. لا يعتمد الإرسال على توكن Meta عام.
 
 ## قائمة التحقق الإنتاجية
 
@@ -103,7 +100,8 @@ npm run build
 - [ ] `JWT_SECRET_KEY` قوي، لا يقل عن 32 محرفًا، وليس القيمة الافتراضية.
 - [ ] `DATABASE_URL` يشير إلى PostgreSQL الإنتاجي بحساب محدود الصلاحيات.
 - [ ] إعداد `AGENT_PROVIDER` و`QWEN_API_KEY` صالح عند تفعيل مزود Qwen.
-- [ ] `META_APP_SECRET` و`META_VERIFY_TOKEN` مضبوطتان في بيئة التشغيل عند تفعيل Meta Webhook.
+- [ ] `META_APP_ID` و`META_APP_SECRET` و`SOCIAL_TOKEN_ENCRYPTION_KEY` مضبوطون قبل ربط صفحة Facebook.
+- [ ] `META_APP_SECRET` و`META_VERIFY_TOKEN` مضبوطتان عند تفعيل Meta Webhook.
 - [ ] نقطة Webhook متاحة عبر HTTPS.
 - [ ] `.env` غير موجود في صورة Docker؛ قواعد `.dockerignore` مطبقة.
 - [ ] النسخ الاحتياطي لقاعدة البيانات ومراقبة الاستعادة مفعّلان.

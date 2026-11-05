@@ -8,8 +8,7 @@ Sensitive config comes from environment variables at runtime.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import (DateTime, ForeignKey, Index, String, UniqueConstraint,
-                        func)
+from sqlalchemy import DateTime, ForeignKey, Index, String, text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,6 +23,13 @@ class ChannelAccount(Base):
             "store_id", "channel", name="uq_channel_account_store_channel"
         ),
         Index("ix_channel_accounts_external", "channel", "external_account_id"),
+        Index(
+            "uq_channel_accounts_facebook_external",
+            "external_account_id",
+            unique=True,
+            postgresql_where=text("channel = 'facebook'"),
+            sqlite_where=text("channel = 'facebook'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

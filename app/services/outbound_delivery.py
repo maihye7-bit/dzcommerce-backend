@@ -10,6 +10,7 @@ from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
+from app.models.channel_account import ChannelAccount
 from app.models.conversation import Conversation
 from app.models.outbound_delivery import OutboundDelivery
 from app.models.store_meta_token import StoreMetaToken
@@ -18,6 +19,10 @@ from app.services.messenger_media import (
     send_instagram_text,
     send_messenger_image,
     send_messenger_text,
+)
+from app.services.meta_token_security import (
+    MetaTokenEncryptionError,
+    decrypt_meta_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -189,6 +194,20 @@ def resolve_meta_access_token(
     channel: str,
     external_account_id: str,
 ) -> str | None:
+    if channel == "facebook":
+        active_account = (
+            db.query(ChannelAccount.id)
+            .filter(
+                ChannelAccount.store_id == store_id,
+                ChannelAccount.channel == channel,
+                ChannelAccount.external_account_id == external_account_id,
+                ChannelAccount.is_active.is_(True),
+            )
+            .first()
+        )
+        if active_account is None:
+            return None
+
     credentials = (
         db.query(StoreMetaToken)
         .filter(StoreMetaToken.store_id == store_id)
@@ -198,12 +217,28 @@ def resolve_meta_access_token(
         return None
 
     if channel == "facebook" and credentials.page_id == external_account_id:
-        return credentials.access_token
+        try:
+            return decrypt_meta_token(credentials.access_token)
+        except MetaTokenEncryptionError:
+            logger.error(
+                "meta_account_credential_unavailable store_id=%s channel=%s",
+                str(store_id),
+                channel,
+            )
+            return None
     if (
         channel == "instagram"
         and credentials.instagram_page_id == external_account_id
     ):
-        return credentials.access_token
+        try:
+            return decrypt_meta_token(credentials.access_token)
+        except MetaTokenEncryptionError:
+            logger.error(
+                "meta_account_credential_unavailable store_id=%s channel=%s",
+                str(store_id),
+                channel,
+            )
+            return None
     return None
 
 

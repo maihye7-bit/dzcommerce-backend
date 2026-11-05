@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     RAILWAY_VOLUME_MOUNT_PATH: str | None = None
     RAILWAY_ENVIRONMENT: str | None = None
     RAILWAY_PUBLIC_DOMAIN: str | None = None
+    META_APP_ID: str = ""
+    META_APP_SECRET: str = ""
+    SOCIAL_TOKEN_ENCRYPTION_KEY: str = ""
 
     @model_validator(mode="after")
     def require_secure_production_secret(self):
