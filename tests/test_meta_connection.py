@@ -1,3 +1,4 @@
+import json
 import uuid
 
 import pytest
@@ -204,6 +205,65 @@ async def test_failed_meta_verification_never_persists_partial_connection(
     assert error.value.status_code == expected_status
     assert db_session.query(ChannelAccount).filter_by(store_id=store.id).count() == 0
     assert db_session.query(StoreMetaToken).filter_by(store_id=store.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_debug_token_error_details_are_logged_without_credentials(
+    monkeypatch, caplog
+):
+    _set_credentials(monkeypatch)
+    page_token = "page-token-must-not-be-logged"
+    app_secret = "test-meta-app-secret"
+    error_message = (
+        f"Invalid token {page_token}; app token test-meta-app|{app_secret}"
+    )
+    _set_responses(
+        monkeypatch,
+        [
+            MockMetaResponse(
+                400,
+                {
+                    "error": {
+                        "code": 190,
+                        "error_subcode": 1234567,
+                        "type": "OAuthException",
+                        "message": error_message,
+                    }
+                },
+            )
+        ],
+    )
+
+    with pytest.raises(meta_connection.MetaConnectionError):
+        await meta_connection.verify_facebook_page(
+            page_id="page-123",
+            page_name="My Shop",
+            page_access_token=page_token,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.event == "meta_page_token_debug_failed"
+    )
+    logged = json.loads(record.message)
+    assert logged["event"] == "meta_page_token_debug_failed"
+    assert logged["http_status"] == 400
+    assert logged["meta_error_code"] == 190
+    assert logged["meta_error_subcode"] == 1234567
+    assert logged["meta_error_type"] == "OAuthException"
+    assert logged["meta_error_message"] == (
+        "Invalid token [REDACTED]; app token [REDACTED]"
+    )
+    assert record.http_status == 400
+    assert record.meta_error_code == 190
+    assert record.meta_error_subcode == 1234567
+    assert record.meta_error_type == "OAuthException"
+    assert record.meta_error_message == (
+        "Invalid token [REDACTED]; app token [REDACTED]"
+    )
+    assert page_token not in caplog.text
+    assert app_secret not in caplog.text
 
 
 @pytest.mark.asyncio

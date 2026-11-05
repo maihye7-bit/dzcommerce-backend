@@ -1,5 +1,6 @@
 """Facebook Page credential verification using Meta Graph API."""
 
+import json
 import logging
 from dataclasses import dataclass
 
@@ -24,6 +25,17 @@ class MetaConnectionError(Exception):
         super().__init__(detail)
         self.detail = detail
         self.status_code = status_code
+
+
+def _redact_meta_error_value(value: object, secrets: tuple[str, ...]) -> object:
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if not isinstance(value, str):
+        return None
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    return value
 
 
 async def verify_facebook_page(
@@ -51,9 +63,43 @@ async def verify_facebook_page(
                 },
             )
             if not debug_response.is_success:
+                try:
+                    error_response = debug_response.json()
+                except (ValueError, TypeError):
+                    error_response = None
+                error_data = (
+                    error_response.get("error")
+                    if isinstance(error_response, dict)
+                    else None
+                )
+                if not isinstance(error_data, dict):
+                    error_data = {}
+                redaction_secrets = (
+                    page_access_token,
+                    app_access_token,
+                    app_secret,
+                )
+                log_fields = {
+                    "http_status": debug_response.status_code,
+                    "meta_error_code": _redact_meta_error_value(
+                        error_data.get("code"), redaction_secrets
+                    ),
+                    "meta_error_subcode": _redact_meta_error_value(
+                        error_data.get("error_subcode"), redaction_secrets
+                    ),
+                    "meta_error_type": _redact_meta_error_value(
+                        error_data.get("type"), redaction_secrets
+                    ),
+                    "meta_error_message": _redact_meta_error_value(
+                        error_data.get("message"), redaction_secrets
+                    ),
+                }
                 logger.warning(
-                    "meta_page_token_debug_failed status=%d",
-                    debug_response.status_code,
+                    json.dumps(
+                        {"event": "meta_page_token_debug_failed", **log_fields},
+                        separators=(",", ":"),
+                    ),
+                    extra={"event": "meta_page_token_debug_failed", **log_fields},
                 )
                 if debug_response.status_code >= 500:
                     raise MetaConnectionError(
