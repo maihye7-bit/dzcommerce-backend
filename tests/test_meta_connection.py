@@ -8,8 +8,10 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.api import stores
 from app.config import settings
+from app.core.deps import get_current_store_owner
 from app.models.channel_account import ChannelAccount
 from app.models.store import Store
+from app.models.store_user import StoreRole, StoreUser
 from app.models.store_meta_token import StoreMetaToken
 from app.schemas.store_meta_connection import StoreMetaConnectionRequest
 from app.services import meta_connection
@@ -51,13 +53,14 @@ def _verified_responses(
     page_id="page-123",
     page_name="My Shop",
     token_type="PAGE",
+    app_id="test-meta-app",
 ):
     debug = MockMetaResponse(
         debug_status,
         {
             "data": {
                 "is_valid": True,
-                "app_id": "test-meta-app",
+                "app_id": app_id,
                 "type": token_type,
                 "scopes": scopes
                 if scopes is not None
@@ -85,8 +88,8 @@ def _payload(
     )
 
 
-def _set_credentials(monkeypatch):
-    monkeypatch.setattr(settings, "META_APP_ID", "test-meta-app")
+def _set_credentials(monkeypatch, app_id="test-meta-app"):
+    monkeypatch.setattr(settings, "META_APP_ID", app_id)
     monkeypatch.setattr(settings, "META_APP_SECRET", "test-meta-app-secret")
     monkeypatch.setattr(
         settings,
@@ -103,6 +106,120 @@ def _set_responses(monkeypatch, responses):
         lambda **_kwargs: client,
     )
     return client
+
+
+def test_meta_connection_request_accepts_snake_case_fields():
+    request = StoreMetaConnectionRequest.model_validate(
+        {
+            "page_name": "DzCommerce Page",
+            "page_id": "787421191421688",
+            "page_access_token": "page-access-token-that-must-not-leak",
+        }
+    )
+
+    assert request.page_name == "DzCommerce Page"
+    assert request.page_id == "787421191421688"
+
+
+def test_post_accepts_frontend_json_and_preserves_other_store(
+    client, db_session, monkeypatch, caplog, recwarn
+):
+    app_id = "1656044335910188"
+    _set_credentials(monkeypatch, app_id=app_id)
+    target_store = Store(name="Meta connect", slug=f"meta-connect-{uuid.uuid4()}")
+    other_store = Store(name="Other Meta", slug=f"other-meta-{uuid.uuid4()}")
+    db_session.add_all([target_store, other_store])
+    db_session.flush()
+    existing_account = ChannelAccount(
+        store_id=target_store.id,
+        channel="facebook",
+        external_account_id="787421191421688",
+        external_account_name="Previous Page Name",
+        is_active=False,
+    )
+    existing_token = StoreMetaToken(
+        store_id=target_store.id,
+        page_id="787421191421688",
+        page_name="Previous Page Name",
+        access_token=encrypt_meta_token("previous-target-token"),
+    )
+    other_account = ChannelAccount(
+        store_id=other_store.id,
+        channel="facebook",
+        external_account_id="other-page-id",
+        external_account_name="Other Page",
+        is_active=True,
+    )
+    other_token = StoreMetaToken(
+        store_id=other_store.id,
+        page_id="other-page-id",
+        page_name="Other Page",
+        access_token=encrypt_meta_token("other-store-token"),
+    )
+    db_session.add_all([existing_account, existing_token, other_account, other_token])
+    db_session.commit()
+
+    client.app.dependency_overrides[get_current_store_owner] = lambda: StoreUser(
+        store_id=target_store.id,
+        user_id=uuid.uuid4(),
+        role=StoreRole.OWNER,
+    )
+    meta_client = _set_responses(
+        monkeypatch,
+        _verified_responses(
+            page_id="787421191421688",
+            page_name="DzCommerce Page",
+            app_id=app_id,
+        ),
+    )
+    page_access_token = "page-access-token-that-must-not-leak"
+    try:
+        response = client.post(
+            f"/api/stores/{target_store.id}/meta-connection",
+            json={
+                "pageName": "DzCommerce Page",
+                "pageId": "787421191421688",
+                "pageAccessToken": page_access_token,
+            },
+        )
+    finally:
+        client.app.dependency_overrides.pop(get_current_store_owner, None)
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert response_data["connected"] is True
+    assert response_data["pageId"] == "787421191421688"
+    assert response_data["pageName"] == "DzCommerce Page"
+    assert meta_client.requests[0][1]["input_token"] == page_access_token
+    assert meta_client.requests[0][1]["access_token"] == (
+        f"{app_id}|test-meta-app-secret"
+    )
+    assert meta_client.requests[1][0].endswith("/787421191421688")
+    assert meta_client.requests[1][1] == {
+        "fields": "id,name",
+        "access_token": page_access_token,
+    }
+    db_session.refresh(existing_account)
+    db_session.refresh(existing_token)
+    db_session.refresh(other_account)
+    db_session.refresh(other_token)
+    assert existing_account.is_active is True
+    assert existing_account.external_account_name == "DzCommerce Page"
+    assert db_session.query(ChannelAccount).filter_by(
+        store_id=target_store.id, channel="facebook"
+    ).count() == 1
+    assert db_session.query(StoreMetaToken).filter_by(store_id=target_store.id).count() == 1
+    assert decrypt_meta_token(existing_token.access_token) == page_access_token
+    assert other_account.is_active is True
+    assert other_account.external_account_name == "Other Page"
+    assert decrypt_meta_token(other_token.access_token) == "other-store-token"
+    assert page_access_token not in response.text
+    assert page_access_token not in caplog.text
+    assert not [
+        warning
+        for warning in recwarn
+        if "UnsupportedFieldAttributeWarning" in warning.category.__name__
+    ]
 
 
 @pytest.mark.asyncio
@@ -181,6 +298,22 @@ async def test_valid_page_token_and_matching_page_are_saved_atomically(
             [MockMetaResponse(503, {"error": {"message": "unavailable"}})],
             _payload(),
             502,
+        ),
+        (
+            [
+                MockMetaResponse(
+                    400,
+                    {
+                        "error": {
+                            "code": 190,
+                            "type": "OAuthException",
+                            "message": "Invalid token",
+                        }
+                    },
+                )
+            ],
+            _payload(),
+            422,
         ),
     ],
 )

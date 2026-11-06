@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class StoreMetaConnection(BaseModel):
@@ -12,13 +12,24 @@ class StoreMetaConnection(BaseModel):
 
 
 class StoreMetaConnectionRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    page_name: str = Field(min_length=1, max_length=255)
+    page_id: str = Field(min_length=1, max_length=255)
+    page_access_token: str = Field(min_length=20, max_length=4096)
 
-    page_name: str = Field(alias="pageName", min_length=1, max_length=255)
-    page_id: str = Field(alias="pageId", min_length=1, max_length=255)
-    page_access_token: str = Field(
-        alias="pageAccessToken", min_length=20, max_length=4096
-    )
+    @model_validator(mode="before")
+    @classmethod
+    def accept_camel_case_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        value = value.copy()
+        for field_name, alias in (
+            ("page_name", "pageName"),
+            ("page_id", "pageId"),
+            ("page_access_token", "pageAccessToken"),
+        ):
+            if alias in value:
+                value[field_name] = value.pop(alias)
+        return value
 
     @field_validator("page_name", "page_id", "page_access_token")
     @classmethod
