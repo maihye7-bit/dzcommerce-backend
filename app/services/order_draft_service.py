@@ -413,6 +413,12 @@ def save_draft_safe(
         })
 
     draft_data = {
+        "draft_id": (
+            existing_draft.get("draft_id")
+            if isinstance(existing_draft, dict)
+            and isinstance(existing_draft.get("draft_id"), str)
+            else str(uuid.uuid4())
+        ),
         "items": validated_items,
         "shipping_info": shipping_info or {},
         "total_price": float(total_price),

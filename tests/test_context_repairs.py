@@ -342,15 +342,19 @@ async def test_yes_without_active_draft_does_not_confirm(db_session):
 
 @pytest.mark.asyncio
 async def test_yes_after_order_confirmation_does_not_confirm(db_session):
+    draft_id = str(uuid.uuid4())
     conversation = make_conversation(
         db_session,
         metadata={
             "commerce_stage": "DRAFT_PENDING",
             "last_question_type": "ORDER_CONFIRMATION",
+            "confirmation_pending": {"draft_id": str(uuid.uuid4())},
         },
         draft={
+            "draft_id": draft_id,
             "items": [{"variant_id": str(uuid.uuid4()), "quantity": 1}],
             "total_price": 100,
+            "shipping_info": {"phone": "0550123456", "wilaya": "الجزائر"},
         },
     )
     registry = ToolRegistry()
@@ -444,20 +448,24 @@ async def test_order_confirm_intent_without_affirmative_reply_is_rejected(db_ses
 
 @pytest.mark.asyncio
 async def test_real_confirmation_and_duplicate_do_not_deduct_twice(db_session):
+    draft_id = str(uuid.uuid4())
     conversation = make_conversation(
         db_session,
         metadata={
             "commerce_stage": "DRAFT_PENDING",
             "last_question_type": "ORDER_CONFIRMATION",
+            "confirmation_pending": {"draft_id": draft_id},
         },
-        draft={"items": [], "total_price": 100},
+        draft={"draft_id": draft_id, "items": [], "total_price": 100},
     )
     _, variant, inventory = add_product_inventory(
         db_session, conversation.store_id
     )
     conversation.active_draft_json = {
+        "draft_id": draft_id,
         "items": [{"variant_id": str(variant.id), "quantity": 1}],
         "total_price": 100,
+        "shipping_info": {"phone": "0550123456", "wilaya": "الجزائر"},
     }
     db_session.commit()
 
@@ -484,15 +492,19 @@ async def test_real_confirmation_and_duplicate_do_not_deduct_twice(db_session):
 
 @pytest.mark.asyncio
 async def test_successful_confirmation_stays_in_confirmed_stage(db_session):
+    draft_id = str(uuid.uuid4())
     conversation = make_conversation(
         db_session,
         metadata={
             "commerce_stage": "DRAFT_PENDING",
             "last_question_type": "ORDER_CONFIRMATION",
+            "confirmation_pending": {"draft_id": draft_id},
         },
         draft={
+            "draft_id": draft_id,
             "items": [{"variant_id": str(uuid.uuid4()), "quantity": 1}],
             "total_price": 100,
+            "shipping_info": {"phone": "0550123456", "wilaya": "الجزائر"},
         },
     )
     registry = ToolRegistry()
@@ -530,15 +542,19 @@ async def test_successful_confirmation_stays_in_confirmed_stage(db_session):
 
 @pytest.mark.asyncio
 async def test_failed_confirmation_does_not_mark_order_confirmed(db_session):
+    draft_id = str(uuid.uuid4())
     conversation = make_conversation(
         db_session,
         metadata={
             "commerce_stage": "DRAFT_PENDING",
             "last_question_type": "ORDER_CONFIRMATION",
+            "confirmation_pending": {"draft_id": draft_id},
         },
         draft={
+            "draft_id": draft_id,
             "items": [{"variant_id": str(uuid.uuid4()), "quantity": 1}],
             "total_price": 100,
+            "shipping_info": {"phone": "0550123456", "wilaya": "الجزائر"},
         },
     )
     registry = ToolRegistry()
@@ -550,7 +566,7 @@ async def test_failed_confirmation_does_not_mark_order_confirmed(db_session):
         )
     )
 
-    await process(
+    result = await process(
         make_engine(
             {"intent": "order_confirm", "confirmation_phrase": True},
             registry,
@@ -561,6 +577,14 @@ async def test_failed_confirmation_does_not_mark_order_confirmed(db_session):
     )
 
     assert conversation.metadata_json["commerce_stage"] == "DRAFT_PENDING"
+    assert conversation.active_draft_json["draft_id"] == draft_id
+    assert conversation.metadata_json["confirmation_pending"] == {
+        "draft_id": draft_id
+    }
+    registry.aexecute.assert_awaited_once()
+    assert result["turn_diagnostics"]["resolver_action"] == (
+        "EXECUTE_TOOL:confirm_order"
+    )
 
 
 @pytest.mark.asyncio

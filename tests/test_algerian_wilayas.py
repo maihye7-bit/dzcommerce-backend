@@ -104,9 +104,14 @@ async def test_canonical_wilaya_persists_from_delivery_capture_to_confirmed_orde
         store.served_wilayas,
     )
     assert wilaya == "قالمة"
+    draft_id = str(uuid.uuid4())
     conversation.active_draft_json = {
+        "draft_id": draft_id,
         "items": [{"variant_id": str(variant.id), "quantity": 1}],
         "shipping_info": {"phone": "0550000000", "wilaya": wilaya},
+    }
+    conversation.metadata_json = {
+        "confirmation_pending": {"draft_id": draft_id},
     }
     db_session.commit()
 

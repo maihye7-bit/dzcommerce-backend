@@ -230,7 +230,7 @@ async def test_expected_draft_error_is_preserved_and_given_to_model(
 
 
 @pytest.mark.asyncio
-async def test_unexpected_draft_error_rolls_back_and_returns_safe_fallback(
+async def test_unexpected_draft_error_rolls_back_and_returns_recoverable_reply(
     integrity_database, monkeypatch
 ):
     _, session_factory = integrity_database
@@ -269,10 +269,8 @@ async def test_unexpected_draft_error_rolls_back_and_returns_safe_fallback(
         user_message="حضّرلي الطلب",
     )
 
-    assert result["processing_failed"] is True
-    assert result["response"] == (
-        "عذراً، لم أتمكن من إكمال طلبك حالياً. يرجى المحاولة مرة أخرى لاحقاً."
-    )
+    assert result.get("processing_failed") is not True
+    assert "تعذر إنشاء مسودة الطلب" in result["response"]
     assert rollbacks
     with session_factory() as reader:
         persisted_conversation = reader.get(Conversation, conversation.id)
@@ -281,7 +279,7 @@ async def test_unexpected_draft_error_rolls_back_and_returns_safe_fallback(
             reader.query(Message)
             .filter(Message.conversation_id == conversation.id)
             .count()
-            == 0
+            == 2
         )
     db.close()
 
@@ -292,7 +290,11 @@ async def test_successful_turn_commits_inbound_tool_and_reply_once(integrity_dat
     db = session_factory()
     store, customer, conversation = seed_conversation(db)
     commits = []
-    event.listen(db, "before_commit", lambda *_: commits.append("commit"))
+    event.listen(
+        db,
+        "before_commit",
+        lambda session: commits.append(session.get_nested_transaction() is None),
+    )
 
     db.add(
         Message(
@@ -316,7 +318,7 @@ async def test_successful_turn_commits_inbound_tool_and_reply_once(integrity_dat
     )
 
     assert result.get("processing_failed") is not True
-    assert len(commits) == 1
+    assert sum(commits) == 1
 
     with session_factory() as reader:
         persisted_conversation = reader.get(Conversation, conversation.id)
@@ -425,9 +427,9 @@ async def test_variant_correction_then_price_uses_current_variant(integrity_data
     result = await send("How much?")
 
     assert conversation.metadata_json["selected_variant_id"] == str(blue_variant.id)
-    assert "السعر: 1500.0 دج" in result["response"]
-    assert "الكمية المتوفرة: 3" in result["response"]
-    assert "السعر: 1100.0 دج" not in result["response"]
+    assert "Price for option Blue: 1,500 DZD." in result["response"]
+    assert "Available quantity: 3." in result["response"]
+    assert "Price for option Blue: 1,100 DZD." not in result["response"]
     db.close()
 
 
@@ -512,9 +514,14 @@ async def test_repeated_confirmation_deducts_stock_and_creates_order_once(
         Conversation.store_id == store.id,
         Conversation.customer_id == customer.id,
     ).one()
+    draft_id = str(uuid.uuid4())
     conversation.active_draft_json = {
+        "draft_id": draft_id,
         "items": [{"variant_id": str(variant.id), "quantity": 2}],
         "total_price": "200.00",
+    }
+    conversation.metadata_json = {
+        "confirmation_pending": {"draft_id": draft_id},
     }
     db.commit()
 

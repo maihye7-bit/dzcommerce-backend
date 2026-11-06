@@ -396,6 +396,7 @@ def mark_conversation_order_confirmed(db_session, conversation, product):
 
 
 def prepare_pending_confirmation(conversation, product, variant):
+    draft_id = str(uuid.uuid4())
     conversation.metadata_json = {
         "commerce_stage": "DRAFT_PENDING",
         "selected_product_id": str(product.id),
@@ -403,8 +404,10 @@ def prepare_pending_confirmation(conversation, product, variant):
         "selected_variant_id": str(variant.id),
         "selected_attributes": {"color": "black"},
         "last_question_type": "ORDER_CONFIRMATION",
+        "confirmation_pending": {"draft_id": draft_id},
     }
     conversation.active_draft_json = {
+        "draft_id": draft_id,
         "items": [
             {
                 "variant_id": str(variant.id),
@@ -417,7 +420,10 @@ def prepare_pending_confirmation(conversation, product, variant):
             }
         ],
         "total_price": 100,
-        "shipping_info": {},
+        "shipping_info": {
+            "phone": "0550123456",
+            "wilaya": "الجزائر",
+        },
     }
 
 
@@ -1482,6 +1488,7 @@ async def test_single_variant_purchase_creates_draft_without_customer_index(db_s
     assert conversation.metadata_json["last_question_type"] == (
         "CUSTOMER_DELIVERY_INFO"
     )
+    assert "confirmation_pending" not in conversation.metadata_json
     assert conversation.metadata_json["variant_index_map_product_id"] == str(product.id)
 
 
@@ -1889,6 +1896,9 @@ async def test_agent_loop_draft_then_confirmation_uses_existing_tools(db_session
     assert conversation.metadata_json["last_question_type"] == (
         "ORDER_CONFIRMATION"
     )
+    assert conversation.metadata_json["confirmation_pending"] == {
+        "draft_id": conversation.active_draft_json["draft_id"]
+    }
 
     confirm_result = await run_turn(
         engine,
@@ -1917,12 +1927,15 @@ async def test_agent_usage_does_not_rollback_order_confirmation_on_sqlite(db_eng
     db_session = sessionmaker(bind=db_engine, expire_on_commit=False)()
     try:
         _, _, conversation, product, variant = make_fixture(db_session)
+        draft_id = str(uuid.uuid4())
         conversation.metadata_json = {
             "commerce_stage": "DRAFT_PENDING",
             "last_question_type": "ORDER_CONFIRMATION",
             "selected_product_id": str(product.id),
+            "confirmation_pending": {"draft_id": draft_id},
         }
         conversation.active_draft_json = {
+            "draft_id": draft_id,
             "items": [
                 {
                     "variant_id": str(variant.id),
@@ -2776,8 +2789,77 @@ async def test_agent_loop_does_not_confirm_without_the_pending_confirmation(
     assert conversation.active_draft_json["items"]
     assert (
         "not confirmed" in result["response"].casefold()
-        or "غير مؤكد" in result["response"]
+        or "no order was placed" in result["response"].casefold()
+        or "لا تنتظر التأكيد" in result["response"]
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_agent_tool_preserves_draft_and_returns_recoverable_reply(
+    db_session,
+):
+    _, _, conversation, product, variant = make_fixture(db_session, with_draft=True)
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    original_draft = {
+        "draft_id": str(uuid.uuid4()),
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100,
+                "line_total": 100,
+            }
+        ],
+        "total_price": 100,
+        "shipping_info": {"phone": "0550123456", "wilaya": "الجزائر"},
+    }
+    conversation.active_draft_json = original_draft
+    db_session.commit()
+
+    class FailingUpdateTool(BaseTool):
+        name = "update_order_draft"
+        description = "Raises after a simulated partial update."
+        input_schema = {}
+
+        async def execute(self, store_id, arguments, context=None):
+            context["db"].query(Conversation).filter(
+                Conversation.id == context["conversation_id"]
+            ).one().active_draft_json = {"items": []}
+            raise RuntimeError("simulated update failure")
+
+    registry = make_registry()
+    registry._tools["update_order_draft"] = FailingUpdateTool()
+    provider = ScriptedToolProvider(
+        [
+            tool_call(
+                "update_order_draft",
+                {"action": "set", "item_index": 1, "quantity": 2},
+            ),
+            RuntimeError("provider unavailable after tool failure"),
+        ]
+    )
+    engine = ConversationEngine(provider, registry)
+    engine.agent_tool_loop_enabled = True
+
+    result = await run_turn(
+        engine,
+        db_session,
+        conversation,
+        "Change the quantity to two",
+    )
+
+    db_session.refresh(conversation)
+    assert conversation.active_draft_json == original_draft
+    assert result.get("processing_failed") is not True
+    assert "unchanged" in result["response"]
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -3209,6 +3291,10 @@ async def test_messenger_first_purchase_saves_draft_without_confirming(db_sessio
     assert "هذا الإجراء غير متاح حاليًا" not in result["response"]
     assert "تم حفظ مسودة الطلب" in result["response"]
     assert draft is not None
+    assert isinstance(draft["draft_id"], str)
+    assert conversation.metadata_json["conversation_memory"]["active_draft_id"] == (
+        draft["draft_id"]
+    )
     assert len(draft["items"]) == 1
     assert draft["items"][0] == {
         "variant_id": str(variant.id),

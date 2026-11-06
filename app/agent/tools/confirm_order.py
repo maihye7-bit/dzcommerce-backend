@@ -92,6 +92,21 @@ class ConfirmOrderTool(BaseTool):
                 },
             )
 
+        pending_confirmation = (conv.metadata_json or {}).get(
+            "confirmation_pending"
+        )
+        draft_id = draft_data.get("draft_id")
+        if (
+            not isinstance(draft_id, str)
+            or not isinstance(pending_confirmation, dict)
+            or pending_confirmation.get("draft_id") != draft_id
+        ):
+            return ToolResult(
+                success=False,
+                error="This draft is not awaiting customer confirmation.",
+                error_code="CONFIRMATION_NOT_PENDING",
+            )
+
         items = draft_data["items"]
         if not isinstance(items, list):
             raise ValidationError("Invalid order draft structure.")
@@ -186,6 +201,9 @@ class ConfirmOrderTool(BaseTool):
             ))
 
         conv.active_draft_json = None
+        metadata = dict(conv.metadata_json or {})
+        metadata.pop("confirmation_pending", None)
+        conv.metadata_json = metadata
         db.flush()
 
         return ToolResult(
