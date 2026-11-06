@@ -180,14 +180,17 @@ def detect_language(message: str) -> str:
 def _is_greeting(message: str) -> bool:
     """Check if the message is a general greeting."""
     normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
-    greetings_ar = {"السلام", "عليكم", "السلام عليكم", "مرحبا", "أهلا", "أهلا وسهلا", "وعليكم السلام"}
-    greetings_fr = {"bonjour", "salut", "coucou"}
+    greetings_ar = {"السلام", "سلام", "عليكم", "السلام عليكم", "سلام عليكم", "مرحبا", "أهلا", "أهلا وسهلا", "وعليكم السلام"}
+    greetings_fr = {"bonjour", "salut", "coucou", "salut"}
     greetings_en = {"hello", "hi", "hey", "hi there"}
+    greetings_dz = {"salam", "salam alikoum", "salam alikom", "wach kayen", "bch7al"}
     if normalized in greetings_ar or normalized.startswith("السلام"):
         return True
     if normalized in greetings_fr:
         return True
     if normalized in greetings_en:
+        return True
+    if normalized in greetings_dz:
         return True
     return False
 
@@ -543,6 +546,16 @@ def _infer_intent_from_context(
     clarification_needed = False
 
     normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
+
+    # ------------------------------------------------------------------
+    # Check for greetings FIRST - unconditional, before any context checks
+    # Greetings should always be GENERAL_CHAT regardless of commerce stage
+    # ------------------------------------------------------------------
+    if _is_greeting(message):
+        intent = INTENT_GENERAL_CHAT
+        commerce_tools_needed = False
+        clarification_needed = False
+        return intent, entities, commerce_tools_needed, clarification_needed
 
     # ------------------------------------------------------------------
     # Context: product selected → follow-ups or details

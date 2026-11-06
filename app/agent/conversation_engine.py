@@ -5800,8 +5800,8 @@ Rules:
         ) <= 2:
             return "unknown", 0.35
         if re.match(
-            r"^(?:السلام عليكم|سلام(?: عليكم)?|مرحبا|أهلا|اهلا|صباح الخير|"
-            r"مساء الخير|salam|salem|bonjour|hello|hi)(?:\b|[،,.!؟?\s]|$)",
+            r"^(?:السلام(?: عليكم)?|سلام(?: عليكم)?|وعليكم السلام|مرحبا|أهلا|اهلا|أهلا وسهلا|صباح الخير|"
+            r"مساء الخير|salam|salam alikoum|salam alikom|salem|wach kayen|bch7al|bonjour|salut|coucou|hello|hi|hey)(?:\b|[،,.!؟?\s]|$)",
             normalized,
         ):
             return "greeting", 0.9

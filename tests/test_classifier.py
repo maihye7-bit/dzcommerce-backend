@@ -47,12 +47,19 @@ from app.agent.classifier import (
 @pytest.mark.parametrize(
     "message,expected_intent",
     [
+        ("السلام", INTENT_GENERAL_CHAT),
         ("السلام عليكم", INTENT_GENERAL_CHAT),
+        ("سلام", INTENT_GENERAL_CHAT),
+        ("سلام عليكم", INTENT_GENERAL_CHAT),
         ("مرحبا", INTENT_GENERAL_CHAT),
+        ("أهلا", INTENT_GENERAL_CHAT),
         ("أهلا وسهلا", INTENT_GENERAL_CHAT),
         ("وعليكم السلام", INTENT_GENERAL_CHAT),
+        ("salam", INTENT_GENERAL_CHAT),  # Darija greeting
+        ("salam alikoum", INTENT_GENERAL_CHAT),  # Darija greeting
         ("salam, wach kayen?", INTENT_GENERAL_CHAT),  # Darija greeting
         ("bch7al?", INTENT_GENERAL_CHAT),  # Algerian Arabic greeting
+        ("wach kayen", INTENT_GENERAL_CHAT),  # Darija greeting
     ],
 )
 def test_general_greetings_arabic_and_darija(message: str, expected_intent: str) -> None:
@@ -60,6 +67,8 @@ def test_general_greetings_arabic_and_darija(message: str, expected_intent: str)
     result = ConversationClassifier.classify(message)
     assert result.intent == expected_intent, f"Message: '{message}', expected {expected_intent}, got {result.intent}"
     assert 0.8 <= result.confidence <= 1.0, f"Confidence should be high for greetings, got {result.confidence}"
+    assert result.commerce_tools_needed is False, f"Greeting '{message}' should not need commerce tools"
+    assert result.clarification_needed is False, f"Greeting '{message}' should not need clarification"
 
 
 @pytest.mark.parametrize(
@@ -76,6 +85,43 @@ def test_general_greetings_french_and_english(message: str, expected_intent: str
     """Test that general greetings in French and English are classified correctly."""
     result = ConversationClassifier.classify(message)
     assert result.intent == expected_intent, f"Message: '{message}', expected {expected_intent}, got {result.intent}"
+    assert result.commerce_tools_needed is False, f"Greeting '{message}' should not need commerce tools"
+    assert result.clarification_needed is False, f"Greeting '{message}' should not need clarification"
+
+
+# ---------------------------------------------------------------------------
+# Test greetings in different commerce stages (should always be GENERAL_CHAT)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message,commerce_stage,selected_product_id,selected_product_name",
+    [
+        ("السلام عليكم", "EMPTY", None, None),
+        ("السلام", "EMPTY", None, None),
+        ("مرحبا", "PRODUCT_SELECTED", "prod-123", "Samsung Galaxy"),
+        ("أهلا", "VARIANT_SELECTED", "prod-123", "Samsung Galaxy"),
+        ("salam", "DRAFT_PENDING", "prod-123", "Samsung Galaxy"),
+        ("salut", "PRODUCT_SELECTED", "prod-123", "iPhone"),
+        ("bonjour", "VARIANT_SELECTED", "prod-123", "iPhone"),
+    ],
+)
+def test_greetings_in_all_commerce_stages(
+    message: str,
+    commerce_stage: str,
+    selected_product_id: str | None,
+    selected_product_name: str | None,
+) -> None:
+    """Test that greetings are always GENERAL_CHAT regardless of commerce stage."""
+    result = ConversationClassifier.classify(
+        message,
+        commerce_stage=commerce_stage,
+        selected_product_id=selected_product_id,
+        selected_product_name=selected_product_name,
+    )
+    assert result.intent == INTENT_GENERAL_CHAT, f"Message: '{message}' in stage {commerce_stage} should be GENERAL_CHAT, got {result.intent}"
+    assert result.commerce_tools_needed is False, f"Greeting '{message}' should not need commerce tools even in {commerce_stage}"
+    assert result.clarification_needed is False, f"Greeting '{message}' should not need clarification"
 
 
 # ---------------------------------------------------------------------------

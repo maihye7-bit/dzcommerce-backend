@@ -827,29 +827,25 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     )
                 processing_failed = True
 
-            if ai_reply and processing_failed and conv_id_for_log:
-                _persist_webhook_reply(
-                    db,
-                    conv_id_for_log,
-                    ai_reply,
-                    channel=channel,
-                    external_account_id=external_account_id,
-                    recipient_external_id=sender_id,
-                )
-
-            # The durable outbox, not the webhook event, owns response delivery.
-            if ai_reply and conv_id_for_log and not processing_failed:
-                processed_count += 1
-            if conv_id_for_log:
+            # The durable outbox owns response delivery - always attempt to dispatch
+            if ai_reply and conv_id_for_log:
+                if not processing_failed:
+                    processed_count += 1
                 logger.debug("SEND_ATTEMPT delivery_id=%s", delivery_trace_id)
                 response_sent_count = await dispatch_due_deliveries(db, limit=20)
                 if response_sent_count:
                     logger.debug("SEND_OK delivered_count=%d", response_sent_count)
-                elif ai_reply:
-                    logger.error(
-                        "SEND_FAIL delivery_id=%s reply remains pending_or_failed",
+                else:
+                    logger.warning(
+                        "SEND_PENDING delivery_id=%s reply remains pending (will retry on next webhook)",
                         delivery_trace_id,
                     )
+            elif ai_reply and not conv_id_for_log:
+                # No conversation ID - cannot dispatch, but log for debugging
+                logger.error(
+                    "SEND_FAIL delivery_id=%s no conversation ID available",
+                    delivery_trace_id,
+                )
 
             logger.info(
                 (
