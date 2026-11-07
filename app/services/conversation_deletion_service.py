@@ -1,7 +1,9 @@
 """Delete one conversation and only records directly owned by it."""
 
+import logging
 import uuid
 
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.models.ai_usage_event import AIUsageEvent
@@ -11,6 +13,8 @@ from app.models.order import Order, OrderItem
 from app.models.outbound_delivery import OutboundDelivery
 from app.models.sales_opportunity import SalesOpportunity
 
+logger = logging.getLogger(__name__)
+
 
 def delete_conversation_records(
     db: Session,
@@ -19,6 +23,7 @@ def delete_conversation_records(
     delete_orders: bool,
 ) -> None:
     """Apply the deletion policy; the caller owns commit and rollback."""
+    inspector = inspect(db.get_bind())
     order_filter = (
         Order.store_id == conversation.store_id,
         Order.conversation_id == conversation.id,
@@ -33,12 +38,18 @@ def delete_conversation_records(
             db.query(OrderItem).filter(OrderItem.order_id.in_(order_ids)).delete(
                 synchronize_session=False
             )
-            db.query(SalesOpportunity).filter(
-                SalesOpportunity.related_order_id.in_(order_ids)
-            ).update(
-                {SalesOpportunity.related_order_id: None},
-                synchronize_session=False,
-            )
+            if inspector.has_table(SalesOpportunity.__tablename__):
+                db.query(SalesOpportunity).filter(
+                    SalesOpportunity.related_order_id.in_(order_ids)
+                ).update(
+                    {SalesOpportunity.related_order_id: None},
+                    synchronize_session=False,
+                )
+            else:
+                logger.warning(
+                    "conversation_delete_optional_table_missing table=%s",
+                    SalesOpportunity.__tablename__,
+                )
             db.query(Order).filter(*order_filter).delete(synchronize_session=False)
     else:
         db.query(Order).filter(*order_filter).update(
@@ -71,9 +82,15 @@ def delete_conversation_records(
             OutboundDelivery.conversation_id == conversation.id
         ).delete(synchronize_session=False)
 
-    db.query(HumanHandoff).filter(
-        HumanHandoff.conversation_id == conversation.id
-    ).delete(synchronize_session=False)
+    if inspector.has_table(HumanHandoff.__tablename__):
+        db.query(HumanHandoff).filter(
+            HumanHandoff.conversation_id == conversation.id
+        ).delete(synchronize_session=False)
+    else:
+        logger.warning(
+            "conversation_delete_optional_table_missing table=%s",
+            HumanHandoff.__tablename__,
+        )
     db.query(Message).filter(
         Message.conversation_id == conversation.id
     ).delete(synchronize_session=False)

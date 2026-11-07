@@ -409,3 +409,33 @@ def test_conversation_deletion_rolls_back_all_changes_on_failure(
     assert db_session.get(Order, order_id) is not None
     assert db_session.get(OrderItem, item_id) is not None
     assert db_session.get(AIUsageEvent, usage_id).conversation_id == conversation_id
+
+
+def test_conversation_deletion_tolerates_unmigrated_optional_tables(
+    client, db_session, caplog
+):
+    data = _commerce_fixture(db_session)
+    order, item = _order(
+        db_session,
+        data["store"],
+        data["customer"],
+        data["conversation"],
+        OrderStatus.DRAFT,
+    )
+    conversation_id = data["conversation"].id
+    order_id = order.id
+    item_id = item.id
+    HumanHandoff.__table__.drop(db_session.connection())
+    SalesOpportunity.__table__.drop(db_session.connection())
+
+    response = client.delete(
+        f"/api/conversations/{conversation_id}?delete_orders=true",
+        headers=auth_headers(data["token"]),
+    )
+
+    assert response.status_code == 204
+    assert db_session.get(Conversation, conversation_id) is None
+    assert db_session.get(Order, order_id) is None
+    assert db_session.get(OrderItem, item_id) is None
+    assert "table=human_handoffs" in caplog.text
+    assert "table=sales_opportunities" in caplog.text
