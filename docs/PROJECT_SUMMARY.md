@@ -118,8 +118,14 @@ sequenceDiagram
 
 - `app/main.py` creates `FastAPI(title="DzCommerce Agent API", version="0.12.0")`, installs permissive CORS, includes API routers, and registers `SearchProductsTool` into the imported global `tool_registry` if absent.
 - `app/api/agent.py` builds a new `ToolRegistry` per chat request and registers a larger tool set. Its provider is selected by `AGENT_PROVIDER`, defaulting to `mock`; `qwen` selects `QwenLLMProvider`.
-- `app/api/webhooks.py` creates a module-level engine with `QwenLLMProvider` and the global `tool_registry`.
+- `app/api/webhooks.py` creates a module-level engine with the `AGENT_PROVIDER` text provider, the global `tool_registry`, and an optional OpenAI-compatible vision provider.
 - `app/database.py` creates the SQLAlchemy engine from `settings.DATABASE_URL`; `get_db()` yields and closes a `SessionLocal` session.
+
+### Conversation continuity and Messenger image understanding
+
+- Conversation working memory is stored in `Conversation.metadata_json`; product and variant selections remain database-backed references, and the active draft remains in `active_draft_json`. Newly created active drafts have a stable `draft_id`; existing JSON drafts are not rewritten just to add one.
+- Messenger image attachments are analyzed only after they have been validated and stored locally. Configure `VISION_API_KEY`, `VISION_BASE_URL`, and `VISION_MODEL` to use an OpenAI-compatible vision-capable model. Without all three values, image handling remains graceful and asks the customer to describe the image.
+- Vision output is persisted as an unverified visual observation. Product identity, price, inventory, order state, and customer consent must still come from the catalog, database, or explicit customer input.
 
 ## 5. Core Components
 
@@ -127,7 +133,7 @@ sequenceDiagram
 
 Routes:
 
-- `POST /webhooks/meta` — parses Meta-style `entry[].messaging[]` events, requires sender ID and text, locates the first active store, finds/creates a `Customer` by `phone` and `store_id`, and finds/creates an active `Conversation`.
+- `POST /webhooks/meta` — parses Meta-style `entry[].messaging[]` events, requires a sender ID and accepts text or supported image attachments, locates the active store bound to the Meta account, and finds/creates a `Customer` and active `Conversation`.
 - `GET /webhooks/meta` and `GET /webhooks/whatsapp` — verify a subscription using `hub.mode`, `hub.verify_token`, and `hub.challenge`. The default token is `dzcommerce_test_2026`; `FACEBOOK_VERIFY_TOKEN` may override it.
 
 Idempotency:

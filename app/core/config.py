@@ -28,6 +28,13 @@ FREE_LLM_MODEL = os.getenv("FREE_LLM_MODEL", "auto")
 FREE_LLM_BASE_URL = os.getenv("FREE_LLM_BASE_URL", "")
 FREE_LLM_TIMEOUT = int(os.getenv("FREE_LLM_TIMEOUT", "60"))
 
+# Optional OpenAI-compatible vision endpoint. Kept separate from the text
+# provider because the selected text model is not guaranteed to accept images.
+VISION_API_KEY = os.getenv("VISION_API_KEY", "")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL", "")
+VISION_MODEL = os.getenv("VISION_MODEL", "")
+VISION_TIMEOUT = int(os.getenv("VISION_TIMEOUT", "30"))
+
 # Context Management
 QWEN_RECENT_MESSAGES_LIMIT = int(os.getenv("QWEN_RECENT_MESSAGES_LIMIT", "10"))
 QWEN_MAX_CONTEXT_TOKENS = int(os.getenv("QWEN_MAX_CONTEXT_TOKENS", "32000"))

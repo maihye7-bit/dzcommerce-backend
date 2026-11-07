@@ -321,6 +321,131 @@ async def test_send_product_image_cannot_cross_store_boundary(db_session):
     assert result.error_code == "NOT_FOUND"
 
 
+@pytest.mark.asyncio
+async def test_vision_analysis_reads_only_stored_local_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "PRODUCT_IMAGE_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setattr(settings, "RAILWAY_VOLUME_MOUNT_PATH", None)
+    monkeypatch.setattr(settings, "RAILWAY_ENVIRONMENT", None)
+    storage_key = "inbound/test.png"
+    image_bytes = _png_bytes()
+    product_image_storage.save_image(storage_key, image_bytes)
+
+    class MockVisionProvider:
+        def __init__(self):
+            self.received = []
+
+        async def describe_image(self, image, mime_type):
+            self.received.append((image, mime_type))
+            return "A blue ceramic mug."
+
+    provider = MockVisionProvider()
+    engine = ConversationEngine(None, tool_registry, vision_provider=provider)
+
+    observations = await engine._analyze_inbound_images(
+        [
+            {
+                "status": "stored",
+                "storage_key": storage_key,
+                "mime_type": "image/png",
+            },
+            {
+                "status": "stored",
+                "storage_key": "..\\outside.png",
+                "mime_type": "image/png",
+            },
+        ]
+    )
+
+    assert observations == ["A blue ceramic mug."]
+    assert provider.received == [(image_bytes, "image/png")]
+
+
+def test_conversation_memory_persists_canonical_commerce_state(db_session):
+    store = Store(name="Memory store", slug=f"memory-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.flush()
+    customer = Customer(
+        store_id=store.id,
+        name="Memory customer",
+        phone="0550123456",
+    )
+    db_session.add(customer)
+    db_session.flush()
+    conversation = Conversation(
+        store_id=store.id,
+        customer_id=customer.id,
+        channel="facebook",
+        status=ConversationStatus.ACTIVE,
+        metadata_json={
+            "commerce_stage": "DRAFT_PENDING",
+            "selected_product_id": str(uuid.uuid4()),
+            "selected_product_name": "حذاء",
+            "selected_variant_id": str(uuid.uuid4()),
+            "selected_attributes": {"color": "black", "size": "42"},
+            "last_question_type": "CUSTOMER_DELIVERY_INFO",
+            "recent_image_understanding": ["حذاء أزرق ظاهر في الصورة."],
+        },
+        active_draft_json={
+            "draft_id": str(uuid.uuid4()),
+            "items": [{"product_name": "حذاء", "quantity": 1}],
+            "shipping_info": {"wilaya": "الجزائر"},
+        },
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    current_state = ConversationEngine._normalize_current_state(
+        conversation,
+        store.id,
+    )
+    ConversationEngine._refresh_conversation_memory(
+        db_session,
+        conversation,
+        current_state,
+        "order_create",
+    )
+    db_session.commit()
+    db_session.expire_all()
+
+    reloaded = db_session.query(Conversation).filter_by(id=conversation.id).one()
+    memory = reloaded.metadata_json["conversation_memory"]
+    assert memory["current_goal"] == "order_create"
+    assert memory["current_topic"] == "حذاء"
+    assert memory["selected_product_id"] == reloaded.metadata_json[
+        "selected_product_id"
+    ]
+    assert memory["selected_variant_attributes"] == {
+        "color": "black",
+        "size": "42",
+    }
+    assert memory["pending_question"] == "CUSTOMER_DELIVERY_INFO"
+    assert memory["pending_action"] == "collect_delivery_details"
+    assert memory["active_draft_id"] == reloaded.active_draft_json["draft_id"]
+    assert memory["customer_info"]["phone"] == "0550123456"
+    assert memory["recent_image_understanding"] == [
+        "حذاء أزرق ظاهر في الصورة."
+    ]
+    assert ConversationEngine._memory_for_agent(memory)["current_goal"] == (
+        "order_create"
+    )
+
+    ConversationEngine._refresh_conversation_memory(
+        db_session,
+        reloaded,
+        ConversationEngine._normalize_current_state(reloaded, store.id),
+        "store_info",
+    )
+    assert reloaded.metadata_json["conversation_memory"]["current_topic"] == (
+        "store_info"
+    )
+    assert reloaded.metadata_json["conversation_memory"]["pending_action"] == (
+        "collect_delivery_details"
+    )
+    assert reloaded.active_draft_json["items"] == [
+        {"product_name": "حذاء", "quantity": 1}
+    ]
+
+
 def test_product_photo_request_requires_an_explicit_image_request():
     assert is_product_image_request("ممكن صور المنتج")
     assert is_product_image_request("أرسل لي صورة العباية")

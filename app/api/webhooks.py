@@ -42,6 +42,7 @@ from app.agent.conversation_engine import ConversationEngine
 from app.agent.providers.mock_provider import MockLLMProvider
 from app.agent.providers.qwen_provider import QwenLLMProvider
 from app.agent.providers.freellm_provider import FreeLLMProvider
+from app.agent.providers.vision import OpenAICompatibleVisionProvider
 from app.agent.tools import tool_registry
 
 router = APIRouter(prefix="/webhooks", tags=["social-webhooks"])
@@ -87,7 +88,11 @@ async def _send_instagram_comment_reply(
 
 # Initialize Components Once at Module Load Time (FIXED: Added #)
 _llm_provider = _build_llm_provider()
-_engine = ConversationEngine(llm_provider=_llm_provider, tool_registry=tool_registry)
+_engine = ConversationEngine(
+    llm_provider=_llm_provider,
+    tool_registry=tool_registry,
+    vision_provider=OpenAICompatibleVisionProvider.from_settings(),
+)
 
 def _extract_message_attachments(message_data: dict) -> list[dict]:
     attachments = message_data.get("attachments")
@@ -733,7 +738,13 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                         "attachments": attachment_metadata
                     }
 
-                if raw_attachments and not text.strip():
+                stored_images = [
+                    attachment
+                    for attachment in attachment_metadata
+                    if attachment.get("type") == "image"
+                    and attachment.get("status") == "stored"
+                ]
+                if raw_attachments and not text.strip() and not stored_images:
                     ai_reply = _attachment_notice(
                         attachment_metadata,
                         _message_language(text),
@@ -757,7 +768,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                             attachment_metadata,
                             _message_language(text),
                         )
-                        if raw_attachments
+                        if raw_attachments and not stored_images
                         else None
                     )
                     result = await _engine.process_message(
@@ -766,10 +777,11 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                         customer_id=customer.id,
                         conversation_id=conv.id,
                         channel=channel,
-                        user_message=text,
+                        user_message=text or "وصلتني صورة.",
                         external_account_id=external_account_id,
                         external_user_id=sender_id,
                         outbound_suffix=attachment_suffix,
+                        image_attachments=stored_images,
                     )
                     ai_reply = result.get("response", "")
                     turn_diagnostics = result.get("turn_diagnostics") or {}
@@ -777,15 +789,16 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
 
                     if raw_attachments:
                         if processing_failed:
-                            ai_reply = (
-                                f"{ai_reply}\n\n{attachment_suffix}".strip()
-                            )
+                            if attachment_suffix:
+                                ai_reply = (
+                                    f"{ai_reply}\n\n{attachment_suffix}".strip()
+                                )
                             _delete_stored_attachments(attachment_metadata)
                         elif attachment_suffix and not ai_reply.endswith(
                             attachment_suffix
                         ):
                             ai_reply = f"{ai_reply}\n\n{attachment_suffix}".strip()
-                    if ai_reply and not processing_failed:
+                    if ai_reply:
                         _persist_webhook_reply(
                             db,
                             conv.id,

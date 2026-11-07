@@ -11,18 +11,19 @@ Flow:
 """
 import asyncio
 import json
+import logging
 import os
 import re
 import unicodedata
 import uuid
 from decimal import Decimal, InvalidOperation
-import logging
 from typing import Any, TypedDict
 from sqlalchemy import inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.agent.providers.base import LLMMessage
+from app.agent.providers.vision import ImageUnderstandingProvider
 from app.agent.tools.base import ToolResult
 from app.agent.tools.registry import ToolRegistry, ToolSessionUnusableError
 from app.agent.tools.search_products import normalize_product_search_text
@@ -44,7 +45,7 @@ from app.models.store import Store
 from app.models.inventory import InventoryItem
 from app.models.product import Product, ProductVariant
 from app.services.algerian_wilayas import resolve_delivery_wilaya
-from app.services import usage_service
+from app.services import product_image_storage, usage_service
 
 MAX_TOOL_ROUNDS = 3
 AGENT_TOOL_NAMES = (
@@ -120,9 +121,15 @@ class ConversationState(TypedDict, total=False):
 
 
 class ConversationEngine:
-    def __init__(self, llm_provider, tool_registry: ToolRegistry):
+    def __init__(
+        self,
+        llm_provider,
+        tool_registry: ToolRegistry,
+        vision_provider: ImageUnderstandingProvider | None = None,
+    ):
         self.llm = llm_provider
         self.registry = tool_registry
+        self.vision_provider = vision_provider
         if self.registry.get("store_info") is None:
             self.registry.register(StoreInfoTool())
         tool_loop_setting = os.getenv("DZCOMMERCE_AGENT_TOOL_LOOP_ENABLED")
@@ -912,6 +919,7 @@ class ConversationEngine:
         current_state: dict[str, Any],
         dialogue_context: list[dict[str, str]],
         language: str,
+        image_observations: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Run up to three resolver-authorized tool calls before a final reply."""
         schemas = self._agent_tool_schemas()
@@ -969,6 +977,7 @@ class ConversationEngine:
             "conversation_memory": self._memory_for_agent(
                 current_state.get("conversation_memory")
             ),
+            "image_observations": (image_observations or [])[-3:],
             "verified_facts": facts,
             "agent_working_memory": self._sanitize_agent_working_memory(
                 (conversation.metadata_json or {}).get("agent_working_memory")
@@ -1002,6 +1011,9 @@ class ConversationEngine:
                     "- A short answer usually responds to the pending question or action "
                     "in conversation_memory; do not treat it as a new request unless "
                     "the customer clearly changes topic.\n"
+                    "- image_observations are unverified visual clues, never catalog "
+                    "identity or authoritative product attributes. Verify products, "
+                    "options, prices, and stock from tools or the database.\n"
                     "- agent_working_memory is an unverified summary of what the "
                     "customer said or what remains to be resolved. It is not a source "
                     "of product, price, stock, order, or consent facts. Never use it "
@@ -1800,6 +1812,9 @@ class ConversationEngine:
                 }.items()
                 if isinstance(value, str) and value.strip()
             },
+            "recent_image_understanding": (
+                metadata.get("recent_image_understanding") or []
+            )[-3:],
         }
         metadata["conversation_memory"] = memory
         conversation.metadata_json = metadata
@@ -2594,6 +2609,39 @@ class ConversationEngine:
 
         return "clarify", {**nlu, "intent": "unknown", "language": language}
 
+    async def _analyze_inbound_images(
+        self,
+        attachments: list[dict[str, Any]],
+    ) -> list[str]:
+        if self.vision_provider is None:
+            return []
+
+        observations: list[str] = []
+        for attachment in attachments[:3]:
+            storage_key = attachment.get("storage_key")
+            mime_type = attachment.get("mime_type")
+            if (
+                attachment.get("status") != "stored"
+                or not isinstance(storage_key, str)
+                or mime_type not in {"image/jpeg", "image/png", "image/webp"}
+            ):
+                continue
+            try:
+                image_path = product_image_storage.read_image(storage_key)
+                description = await self.vision_provider.describe_image(
+                    image_path.read_bytes(),
+                    mime_type,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "inbound_image_analysis_failed error_type=%s",
+                    type(exc).__name__,
+                )
+                continue
+            if isinstance(description, str) and description.strip():
+                observations.append(description.strip()[:800])
+        return observations
+
     @staticmethod
     def _memory_for_agent(value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -2607,10 +2655,25 @@ class ConversationEngine:
                 "selected_variant_attributes",
                 "pending_question",
                 "pending_action",
+                "recent_image_understanding",
                 "confirmation_pending",
             )
             if key in value
         }
+
+    @staticmethod
+    def _vision_unavailable_text(language: str) -> str:
+        if language == "fr":
+            return (
+                "J'ai reçu la photo, mais je ne peux pas l'analyser visuellement "
+                "pour le moment. Décrivez-moi ce que vous cherchez."
+            )
+        if language == "en":
+            return (
+                "I received the image, but visual analysis is not available right "
+                "now. Please describe what you need."
+            )
+        return "وصلتني الصورة، لكن تحليلها البصري غير متاح حالياً. صف لي ما تحتاجه."
 
     async def process_message(
         self,
@@ -2623,8 +2686,18 @@ class ConversationEngine:
         external_account_id: str | None = None,
         external_user_id: str | None = None,
         outbound_suffix: str | None = None,
+        image_attachments: list[dict[str, Any]] | None = None,
     ) -> dict:
         try:
+            image_observations = await self._analyze_inbound_images(
+                image_attachments or []
+            )
+            if image_attachments and not image_observations and not outbound_suffix:
+                outbound_suffix = self._vision_unavailable_text(
+                    self._heuristic_nlu(user_message or "", {}).get(
+                        "language", "ar"
+                    )
+                )
             return await self._process_message(
                 db=db,
                 store_id=store_id,
@@ -2635,6 +2708,7 @@ class ConversationEngine:
                 external_account_id=external_account_id,
                 external_user_id=external_user_id,
                 outbound_suffix=outbound_suffix,
+                image_observations=image_observations,
             )
         except Exception as exc:
             logger.exception(
@@ -2661,6 +2735,7 @@ class ConversationEngine:
         external_account_id: str | None = None,
         external_user_id: str | None = None,
         outbound_suffix: str | None = None,
+        image_observations: list[str] | None = None,
     ) -> dict:
         turn_id = uuid.uuid4().hex
         conv_id = conversation_id or uuid.uuid4()
@@ -2687,6 +2762,23 @@ class ConversationEngine:
         # STEP 1: LOAD CURRENT STATE FROM DB
         # ---------------------------------------------------------
         metadata = conversation.metadata_json or {}
+        image_observations = (image_observations or [])[-3:]
+        if image_observations:
+            metadata = dict(metadata)
+            previous_observations = metadata.get("recent_image_understanding")
+            previous_observations = (
+                [
+                    observation.strip()[:800]
+                    for observation in previous_observations
+                    if isinstance(observation, str) and observation.strip()
+                ]
+                if isinstance(previous_observations, list)
+                else []
+            )
+            metadata["recent_image_understanding"] = (
+                previous_observations + image_observations
+            )[-3:]
+            conversation.metadata_json = metadata
         has_confirmed_order = False
         if (
             metadata.get("commerce_stage") == "ORDER_CONFIRMED"
@@ -3020,6 +3112,7 @@ class ConversationEngine:
                 current_state=current_state,
                 dialogue_context=dialogue_context,
                 language=fallback_nlu.get("language", "ar"),
+                image_observations=image_observations,
             )
             agent_loop_accepted = bool(
                 agent_loop_result and agent_loop_result.get("accepted")
