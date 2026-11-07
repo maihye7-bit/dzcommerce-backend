@@ -445,6 +445,26 @@ def test_empty_conversation_greeting_uses_deterministic_greeting_intent() -> Non
     assert engine._heuristic_nlu("السلام عليكم")["intent"] == "greeting"
 
 
+@pytest.mark.parametrize(
+    "message",
+    ["سلام", "salam", "salam alikoum", "Hey"],
+)
+def test_greeting_heuristic_preempts_selected_product_context(message: str) -> None:
+    engine = ConversationEngine(llm_provider=None, tool_registry=ToolRegistry())
+
+    nlu = engine._heuristic_nlu(
+        message,
+        {
+            "commerce_stage": "PRODUCT_SELECTED",
+            "selected_product_id": "selected-product",
+            "selected_product_name": "Selected product",
+        },
+    )
+
+    assert nlu["intent"] == "greeting"
+    assert nlu["confidence"] >= 0.9
+
+
 def test_general_catalog_question_has_a_distinct_intent() -> None:
     engine = ConversationEngine(llm_provider=None, tool_registry=ToolRegistry())
 

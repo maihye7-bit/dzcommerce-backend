@@ -179,11 +179,49 @@ def detect_language(message: str) -> str:
 
 def _is_greeting(message: str) -> bool:
     """Check if the message is a general greeting."""
-    normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
-    greetings_ar = {"السلام", "عليكم", "السلام عليكم", "مرحبا", "أهلا", "أهلا وسهلا", "وعليكم السلام"}
+    normalized = re.sub(
+        r"[\s,،؟?!.;:]+",
+        " ",
+        (message or "").casefold(),
+    ).strip()
+    greetings_ar = {
+        "السلام",
+        "سلام",
+        "عليكم",
+        "السلام عليكم",
+        "سلام عليكم",
+        "مرحبا",
+        "أهلا",
+        "أهلا وسهلا",
+        "وعليكم السلام",
+        "السلام عليكم كيف حالك",
+        "السلام عليكم كيف حالكم",
+    }
+    greetings_dz = {
+        "salam",
+        "salem",
+        "salam alikoum",
+        "salam alikom",
+        "salem alikoum",
+        "salem alikom",
+        "salam 3likom",
+        "salam 3alaykom",
+        "salam wach kayen",
+        "salem wach kayen",
+    }
     greetings_fr = {"bonjour", "salut", "coucou"}
-    greetings_en = {"hello", "hi", "hey", "hi there"}
-    if normalized in greetings_ar or normalized.startswith("السلام"):
+    greetings_en = {
+        "hello",
+        "hi",
+        "hey",
+        "hi there",
+        "hello how are you",
+        "hey how are you",
+        "hi how are you",
+    }
+    if normalized in greetings_ar:
+        return True
+    if normalized in greetings_dz:
         return True
     if normalized in greetings_fr:
         return True
@@ -299,9 +337,9 @@ def _is_price_inquiry(message: str) -> bool:
     normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
     # More specific price question patterns - looking for question-like structures
     price_patterns = [
-        r"(بشحال|كم\s+سع|how\s+much|combien|prix|price|cost|سعر)\s*[؟?]",
-        r"(بشحال|كم\s+سع|how\s+much|combien|prix|price|cost|سعر)\s*$",
-        r"(بشحال|كم\s+سع|how\s+much|combien|prix|price|cost|سعر)\b",
+        r"(بشحال|بقداه|شحال|bch7al|besh7al|ch7al|chhal|كم\s+سع|how\s+much|combien|prix|price|cost|سعر)\s*[؟?]",
+        r"(بشحال|بقداه|شحال|bch7al|besh7al|ch7al|chhal|كم\s+سع|how\s+much|combien|prix|price|cost|سعر)\s*$",
+        r"(?<!\w)(?:بشحال|بقداه|شحال|bch7al|besh7al|ch7al|chhal|كم\s+سع|how\s+much|combien|prix|price|cost|سعر)\b",
     ]
     for pattern in price_patterns:
         if re.search(pattern, normalized):
@@ -544,6 +582,9 @@ def _infer_intent_from_context(
 
     normalized = re.sub(r"\s+", " ", (message or "").casefold()).strip()
 
+    if _is_greeting(message):
+        return INTENT_GENERAL_CHAT, entities, False, False
+
     # ------------------------------------------------------------------
     # Context: product selected → follow-ups or details
     # ------------------------------------------------------------------
@@ -625,16 +666,6 @@ def _infer_intent_from_context(
     # Context: no product selected (EMPTY stage)
     # ------------------------------------------------------------------
     elif commerce_stage in {None, "EMPTY"} or commerce_stage is None:
-        # Check for greetings first
-        if _is_greeting(message):
-            intent = INTENT_GENERAL_CHAT
-            commerce_tools_needed = False
-            clarification_needed = False
-            # Set language based on detection
-            if language == "ar" or (ARABIC_SCRIPT_RE.search(message) and not ARABIC_DIRAJA_ARABIZI_RE.search(message)):
-                pass  # keep detected language
-            return intent, entities, commerce_tools_needed, clarification_needed
-
         # Check for price inquiry without product context
         # When explicitly in EMPTY stage, price inquiry is ambiguous (need to know which product)
         if commerce_stage == "EMPTY" and _is_price_inquiry(message):
@@ -810,6 +841,10 @@ class ConversationClassifier:
 
     def __init__(self) -> None:
         pass  # No state needed; all methods are static/classmethods
+
+    @staticmethod
+    def is_greeting(message: str) -> bool:
+        return _is_greeting(message)
 
     # ------------------------------------------------------------------
     # Public API

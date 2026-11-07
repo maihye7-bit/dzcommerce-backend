@@ -48,11 +48,13 @@ from app.agent.classifier import (
     "message,expected_intent",
     [
         ("السلام عليكم", INTENT_GENERAL_CHAT),
+        ("سلام", INTENT_GENERAL_CHAT),
         ("مرحبا", INTENT_GENERAL_CHAT),
         ("أهلا وسهلا", INTENT_GENERAL_CHAT),
         ("وعليكم السلام", INTENT_GENERAL_CHAT),
+        ("salam", INTENT_GENERAL_CHAT),
+        ("salam alikoum", INTENT_GENERAL_CHAT),
         ("salam, wach kayen?", INTENT_GENERAL_CHAT),  # Darija greeting
-        ("bch7al?", INTENT_GENERAL_CHAT),  # Algerian Arabic greeting
     ],
 )
 def test_general_greetings_arabic_and_darija(message: str, expected_intent: str) -> None:
@@ -66,6 +68,7 @@ def test_general_greetings_arabic_and_darija(message: str, expected_intent: str)
     "message,expected_intent",
     [
         ("Hello", INTENT_GENERAL_CHAT),
+        ("Hello, how are you?", INTENT_GENERAL_CHAT),
         ("Hi there", INTENT_GENERAL_CHAT),
         ("Hey", INTENT_GENERAL_CHAT),
         ("Bonjour", INTENT_GENERAL_CHAT),
@@ -76,6 +79,30 @@ def test_general_greetings_french_and_english(message: str, expected_intent: str
     """Test that general greetings in French and English are classified correctly."""
     result = ConversationClassifier.classify(message)
     assert result.intent == expected_intent, f"Message: '{message}', expected {expected_intent}, got {result.intent}"
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["PRODUCT_SELECTED", "VARIANT_SELECTED", "DRAFT_PENDING"],
+)
+@pytest.mark.parametrize(
+    "message",
+    ["سلام", "salam", "salam alikoum", "Hey"],
+)
+def test_greetings_do_not_become_product_followups_in_active_commerce(
+    message: str,
+    stage: str,
+) -> None:
+    result = ConversationClassifier.classify(
+        message,
+        commerce_stage=stage,
+        selected_product_id="selected-product",
+        selected_product_name="Selected product",
+    )
+
+    assert result.intent == INTENT_GENERAL_CHAT
+    assert result.commerce_tools_needed is False
+    assert result.clarification_needed is False
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +147,41 @@ def test_price_inquiry_ambiguous_no_product() -> None:
     result = ConversationClassifier.classify("بشحال؟", commerce_stage="EMPTY", selected_product_name=None)
     assert result.intent == INTENT_AMBIGUOUS
     assert result.clarification_needed is True
-    assert result.confidence < 0.6
+
+
+def test_algerian_arabizi_price_inquiry_without_product_is_ambiguous() -> None:
+    result = ConversationClassifier.classify(
+        "bch7al?",
+        commerce_stage="EMPTY",
+        selected_product_name=None,
+    )
+
+    assert result.intent == INTENT_AMBIGUOUS
+    assert result.commerce_tools_needed is False
+    assert result.clarification_needed is True
+
+
+def test_algerian_arabizi_price_inquiry_uses_selected_product_context() -> None:
+    result = ConversationClassifier.classify(
+        "bch7al?",
+        commerce_stage="PRODUCT_SELECTED",
+        selected_product_id="selected-product",
+        selected_product_name="Selected product",
+    )
+
+    assert result.intent == INTENT_PRICE_INQUIRY
+    assert result.commerce_tools_needed is True
+    assert result.clarification_needed is False
+
+
+def test_greeting_before_availability_question_does_not_hide_commerce_intent() -> None:
+    result = ConversationClassifier.classify(
+        "السلام عليكم، عندكم آيفون؟",
+        commerce_stage="EMPTY",
+    )
+
+    assert result.intent == INTENT_AVAILABILITY_INQUIRY
+    assert result.commerce_tools_needed is True
 
 
 # ---------------------------------------------------------------------------

@@ -5558,6 +5558,8 @@ Rules:
     ) -> tuple[str, float]:
         """Resolve intent from NLU confidence, utterance structure, and state."""
         normalized = (message or "").casefold().strip()
+        if ConversationClassifier.is_greeting(message):
+            return "greeting", 0.9
         stage = context.get("commerce_stage")
         selected_product_id = context.get("selected_product_id")
         selected_product_name = context.get("selected_product_name")
@@ -5799,12 +5801,6 @@ Rules:
             normalized.split()
         ) <= 2:
             return "unknown", 0.35
-        if re.match(
-            r"^(?:السلام عليكم|سلام(?: عليكم)?|مرحبا|أهلا|اهلا|صباح الخير|"
-            r"مساء الخير|salam|salem|bonjour|hello|hi)(?:\b|[،,.!؟?\s]|$)",
-            normalized,
-        ):
-            return "greeting", 0.9
         return "unknown", 0.2
 
     @staticmethod
