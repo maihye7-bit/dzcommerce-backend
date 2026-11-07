@@ -7,15 +7,16 @@ import uuid
 from datetime import datetime
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
 from app.database import get_db
 from app.models.conversation import Conversation, Message
-from app.models.store_user import StoreUser
+from app.models.store_user import StoreRole, StoreUser
 from app.models.user import User
+from app.services.conversation_deletion_service import delete_conversation_records
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -44,6 +45,55 @@ class ConversationSummary(BaseModel):
 
 
 # --- Endpoints ---
+
+
+@router.delete(
+    "/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def delete_conversation(
+    conversation_id: uuid.UUID,
+    delete_orders: bool = Query(
+        False,
+        description="Also permanently delete orders directly linked to this conversation.",
+    ),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Delete an owner-managed conversation and apply the requested order policy."""
+    access = (
+        db.query(Conversation, StoreUser)
+        .join(StoreUser, StoreUser.store_id == Conversation.store_id)
+        .filter(
+            Conversation.id == conversation_id,
+            StoreUser.user_id == current_user.id,
+        )
+        .with_for_update()
+        .first()
+    )
+    if access is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    conversation, membership = access
+    if membership.role != StoreRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Store owner permission required",
+        )
+
+    try:
+        delete_conversation_records(
+            db,
+            conversation,
+            delete_orders=delete_orders,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/", response_model=List[ConversationSummary])

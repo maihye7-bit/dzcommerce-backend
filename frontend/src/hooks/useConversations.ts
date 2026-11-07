@@ -1,7 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import api from "@/lib/api";
 import { useAuth } from "@/context/useAuth";
 import { useStoreId } from "@/hooks/useStoreId";
+import { showMutationError, showToast } from "@/lib/toast";
 import type {
   Conversation,
   ConversationPreview,
@@ -66,5 +67,29 @@ export function useConversationTranscript(conversationId: string | null) {
     },
     enabled: Boolean(token && conversationId),
     staleTime: 5 * 60 * 1000,
+  });
+}
+
+export function useDeleteConversation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      conversationId,
+      deleteOrders,
+    }: {
+      conversationId: string;
+      deleteOrders: boolean;
+    }) => {
+      await api.delete(`/api/conversations/${conversationId}`, {
+        params: { delete_orders: deleteOrders },
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      showToast("تم حذف المحادثة بنجاح.", "success");
+    },
+    onError: (error) =>
+      showMutationError(error, "تعذر حذف المحادثة. حاول مرة أخرى."),
   });
 }
