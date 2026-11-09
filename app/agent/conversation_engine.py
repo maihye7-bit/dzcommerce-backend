@@ -41,6 +41,7 @@ from app.models.conversation import (
 )
 from app.models.customer import Customer
 from app.models.order import Order, OrderStatus
+from app.models.outbound_delivery import OutboundDelivery
 from app.models.store import Store
 from app.models.inventory import InventoryItem
 from app.models.product import Product, ProductVariant
@@ -58,6 +59,8 @@ AGENT_TOOL_NAMES = (
     "confirm_order",
     "get_customer_context",
     "recommend_products",
+    "store_info",
+    "send_product_image",
 )
 SAFE_FALLBACK_RESPONSE = "عذراً، لم أتمكن من إكمال طلبك حالياً. يرجى المحاولة مرة أخرى لاحقاً."
 logger = logging.getLogger(__name__)
@@ -158,6 +161,97 @@ class ConversationEngine:
         _ft_val = max(10.0, min(60.0, _ft_val))  # clamp to [10s, 60s] safe band
         self.reply_composer = ReplyComposer(llm_provider, timeout_seconds=_ft_val) if llm_provider else None
 
+    @classmethod
+    def _trace_safe_text(cls, value: Any) -> str:
+        if not isinstance(value, str) or not value:
+            return ""
+        if cls._contains_sensitive_nlu_content(value):
+            return "[redacted customer or credential data]"
+        return value[:300]
+
+    @classmethod
+    def _model_safe_customer_message(cls, value: str) -> str:
+        message = (value or "").translate(
+            str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+        )
+        message = re.sub(
+            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|"
+            r"0[567](?:[\s.-]?\d){8})(?!\d)",
+            "[phone withheld]",
+            message,
+        )
+        message = re.sub(
+            r"\b[\w.+-]+@[\w.-]+\.[A-Z]{2,}\b",
+            "[email withheld]",
+            message,
+            flags=re.IGNORECASE,
+        )
+        message = re.sub(
+            r"(?:https?://|www\.)\S+",
+            "[link withheld]",
+            message,
+            flags=re.IGNORECASE,
+        )
+        message = re.sub(
+            r"(?i)(?:delivery address|address|adresse|العنوان|عنوان|"
+            r"رقم الهاتف|الهاتف)\s*[:=]?\s*[^,،;\n]+",
+            "[private delivery detail withheld]",
+            message,
+        )
+        if cls._contains_sensitive_nlu_content(message):
+            return "[customer message contains private contact details; withheld]"
+        return message[:1000]
+
+    @classmethod
+    def _trace_safe_arguments(cls, value: Any) -> dict[str, Any]:
+        sensitive_key = re.compile(
+            r"(?:phone|address|email|password|secret|token|credential|"
+            r"customer_id|recipient_external_id)",
+            re.IGNORECASE,
+        )
+
+        def clean(item: Any, key: str = "") -> Any:
+            if sensitive_key.search(key):
+                return "[redacted]"
+            if isinstance(item, dict):
+                return {
+                    str(child_key): clean(child_value, str(child_key))
+                    for child_key, child_value in list(item.items())[:20]
+                }
+            if isinstance(item, list):
+                return [clean(child) for child in item[:20]]
+            if isinstance(item, str):
+                return cls._trace_safe_text(item)
+            if item is None or isinstance(item, (bool, int, float)):
+                return item
+            return "[omitted]"
+
+        result = clean(value)
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _tool_result_trace_summary(result: ToolResult) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "success": result.success,
+            "error_code": result.error_code,
+        }
+        data = result.data if isinstance(result.data, dict) else {}
+        summary["data_fields"] = sorted(str(key) for key in data)[:30]
+        for key in ("queued", "item_count", "total_price", "available_quantity"):
+            value = data.get(key)
+            if isinstance(value, (bool, int, float)) and not isinstance(value, bool):
+                summary[key] = value
+            elif isinstance(value, bool):
+                summary[key] = value
+        delivery_id = data.get("delivery_id")
+        if isinstance(delivery_id, str):
+            summary["delivery_id"] = delivery_id
+        for key in ("products", "variants", "recommendations", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                summary[f"{key}_count"] = len(value)
+        return summary
+
     @staticmethod
     def _normalize_current_state(
         conversation: Conversation,
@@ -187,14 +281,16 @@ class ConversationEngine:
         )
 
         commerce_stage = metadata.get("commerce_stage")
-        if commerce_stage == "ORDER_CONFIRMED" and not has_confirmed_order:
-            commerce_stage = None
-        if has_confirmed_order and not (draft and isinstance(draft, dict) and draft.get("items")):
+        if has_confirmed_order and not (
+            isinstance(draft, dict) and draft.get("items")
+        ):
             commerce_stage = "ORDER_CONFIRMED"
+        elif isinstance(draft, dict) and draft.get("items"):
+            commerce_stage = "DRAFT_PENDING"
+        elif commerce_stage == "ORDER_CONFIRMED":
+            commerce_stage = None
         if not commerce_stage:
-            if draft and isinstance(draft, dict) and draft.get("items"):
-                commerce_stage = "DRAFT_PENDING"
-            elif selected_variant_id:
+            if selected_variant_id:
                 commerce_stage = "VARIANT_SELECTED"
             elif candidate_product_ids and not selected_product_id:
                 commerce_stage = "PRODUCT_CANDIDATES"
@@ -274,7 +370,7 @@ class ConversationEngine:
         return list(reversed(recent))
 
     def _agent_tool_schemas(self) -> list[dict[str, Any]]:
-        """Expose only the commerce tools supported by the resolver-gated loop."""
+        """Expose the allowlisted customer-facing tools available to FreeLLM."""
         registered = {
             definition["name"]: definition
             for definition in self.registry.get_tool_definitions()
@@ -332,15 +428,42 @@ class ConversationEngine:
             "create_order_draft": {
                 "type": "object",
                 "properties": {
-                    "variant_index": {
-                        "type": "integer",
-                        "description": (
-                            "Option number shown for the selected product."
-                        ),
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "variant_index": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Displayed option number; omit only when a "
+                                        "verified selected variant already exists."
+                                    ),
+                                },
+                                "quantity": {
+                                    "type": "integer",
+                                    "description": "Quantity requested by the customer.",
+                                },
+                            },
+                            "required": ["quantity"],
+                            "additionalProperties": False,
+                        },
                     },
-                    "quantity": {"type": "integer"},
+                    "shipping_info": {
+                        "type": "object",
+                        "description": (
+                            "Optional delivery details the customer provided."
+                        ),
+                        "properties": {
+                            "phone": {"type": "string"},
+                            "wilaya": {"type": "string"},
+                            "municipality": {"type": "string"},
+                            "address": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
                 },
-                "required": ["quantity"],
+                "required": ["items"],
                 "additionalProperties": False,
             },
             "update_order_draft": {
@@ -348,7 +471,17 @@ class ConversationEngine:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "remove", "set", "replace"],
+                        "enum": [
+                            "add",
+                            "remove",
+                            "set",
+                            "replace",
+                            "set_shipping",
+                        ],
+                        "description": (
+                            "Choose an item operation, or set_shipping to persist "
+                            "customer-provided delivery details."
+                        ),
                     },
                     "item_index": {
                         "type": "integer",
@@ -365,6 +498,19 @@ class ConversationEngine:
                         ),
                     },
                     "quantity": {"type": "integer"},
+                    "shipping_info": {
+                        "type": "object",
+                        "description": (
+                            "Delivery details to add or update on the active draft."
+                        ),
+                        "properties": {
+                            "phone": {"type": "string"},
+                            "wilaya": {"type": "string"},
+                            "municipality": {"type": "string"},
+                            "address": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -418,6 +564,18 @@ class ConversationEngine:
                 "required": [],
                 "additionalProperties": False,
             },
+            "store_info": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            "send_product_image": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
         }
         schemas = []
         for name in AGENT_TOOL_NAMES:
@@ -452,6 +610,61 @@ class ConversationEngine:
                 }
             )
         return schemas
+
+    @staticmethod
+    def _agent_draft_summary(
+        db: Session,
+        store_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        value: Any,
+    ) -> dict[str, Any] | None:
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            return None
+        items = []
+        for item in value["items"][:10]:
+            if not isinstance(item, dict):
+                continue
+            items.append(
+                {
+                    key: item[key]
+                    for key in (
+                        "product_name",
+                        "variant_name",
+                        "quantity",
+                        "unit_price",
+                    )
+                    if key in item
+                    and isinstance(item[key], (str, int, float))
+                    and not isinstance(item[key], bool)
+                }
+            )
+        shipping_info = value.get("shipping_info")
+        shipping_info = shipping_info if isinstance(shipping_info, dict) else {}
+        customer = (
+            db.query(Customer.phone)
+            .filter(
+                Customer.id == customer_id,
+                Customer.store_id == store_id,
+            )
+            .scalar()
+        )
+        return {
+            "items": items,
+            "total_price": value.get("total_price"),
+            "currency": value.get("currency", "DZD"),
+            "phone_provided": bool(shipping_info.get("phone") or customer),
+            "address_provided": bool(shipping_info.get("address")),
+            "wilaya": (
+                shipping_info.get("wilaya")
+                if isinstance(shipping_info.get("wilaya"), str)
+                else None
+            ),
+            "municipality": (
+                shipping_info.get("municipality")
+                if isinstance(shipping_info.get("municipality"), str)
+                else None
+            ),
+        }
 
     def _agent_verified_state_facts(
         self,
@@ -907,9 +1120,192 @@ class ConversationEngine:
         except (SQLAlchemyError, TypeError, ValueError):
             logger.warning("Failed to record agent-loop provider usage")
 
+    async def _dispatch_agent_tool_call_safely(
+        self,
+        *,
+        call: dict[str, Any],
+        user_message: str,
+        language: str,
+        db: Session,
+        store_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        conversation: Conversation,
+        channel: str,
+        state: dict[str, Any],
+        external_account_id: str | None,
+        external_user_id: str | None,
+        inbound_message_id: uuid.UUID | None = None,
+    ) -> tuple[ResolutionResult, dict[str, Any], str, ToolResult]:
+        tool_name = call.get("name")
+        arguments = call.get("arguments")
+        if (
+            not isinstance(tool_name, str)
+            or not isinstance(arguments, dict)
+            or not self._agent_tool_arguments_valid(tool_name, arguments)
+            or self.registry.get(tool_name) is None
+        ):
+            return self._agent_tool_failure(
+                str(tool_name or "unknown"),
+                language,
+                "The tool request is invalid or unavailable.",
+                "VALIDATION_ERROR",
+            )
+        if tool_name == "confirm_order" and not (
+            self._is_required_order_confirmation(user_message)
+            and state.get("last_question_type") == "ORDER_CONFIRMATION"
+            and self._has_pending_confirmation(conversation)
+        ):
+            return self._agent_tool_failure(
+                tool_name,
+                language,
+                "An explicit approval for the current pending draft is required.",
+                "CONFIRMATION_NOT_PENDING",
+            )
+
+        transaction_before = (
+            f"active={db.is_active},in_transaction={db.in_transaction()}"
+        )
+        try:
+            savepoint = db.begin_nested()
+        except SQLAlchemyError as exc:
+            _log_agent_tool_database_failure(
+                tool_name,
+                exc,
+                transaction_before,
+                db,
+                recovery_succeeded=False,
+            )
+            raise ToolSessionUnusableError(
+                "Could not establish a savepoint for agent tool dispatch"
+            ) from exc
+
+        try:
+            execution = await self._execute_agent_tool_call(
+                tool_name=tool_name,
+                arguments=arguments,
+                user_message=user_message,
+                language=language,
+                db=db,
+                store_id=store_id,
+                customer_id=customer_id,
+                conversation=conversation,
+                channel=channel,
+                state=state,
+                external_account_id=external_account_id,
+                external_user_id=external_user_id,
+                inbound_message_id=inbound_message_id,
+            )
+            if execution is None:
+                execution = self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "The action could not be resolved from verified conversation state.",
+                    "ACTION_NOT_AUTHORIZED",
+                )
+            elif tool_name == "update_order_draft" and execution[3].success:
+                metadata = dict(conversation.metadata_json or {})
+                metadata.pop("confirmation_pending", None)
+                conversation.metadata_json = metadata
+            savepoint.commit()
+            return execution
+        except ToolSessionUnusableError:
+            if savepoint.is_active:
+                savepoint.rollback()
+            raise
+        except Exception as exc:
+            recovery_succeeded = False
+            try:
+                if savepoint.is_active:
+                    savepoint.rollback()
+                    recovery_succeeded = db.is_active
+            except SQLAlchemyError:
+                recovery_succeeded = False
+
+            if isinstance(exc, SQLAlchemyError):
+                _log_agent_tool_database_failure(
+                    tool_name,
+                    exc,
+                    transaction_before,
+                    db,
+                    recovery_succeeded=recovery_succeeded,
+                )
+                if not recovery_succeeded:
+                    raise ToolSessionUnusableError(
+                        "Could not recover the database session after agent tool dispatch"
+                    ) from exc
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "A temporary database error occurred; no result was produced.",
+                    "DATABASE_ERROR",
+                )
+            if not recovery_succeeded:
+                raise ToolSessionUnusableError(
+                    "Could not recover the database session after agent tool dispatch"
+                ) from exc
+            logger.warning(
+                "Agent tool dispatch failed (tool=%s, error_type=%s)",
+                tool_name,
+                type(exc).__name__,
+            )
+            return self._agent_tool_failure(
+                tool_name,
+                language,
+                "The action failed; conversation and draft state were left unchanged.",
+                "TOOL_ERROR",
+            )
+
+    @staticmethod
+    def _agent_tool_failure(
+        tool_name: str,
+        language: str,
+        message: str,
+        error_code: str,
+    ) -> tuple[ResolutionResult, dict[str, Any], str, ToolResult]:
+        return (
+            ResolutionResult(
+                allowed_action=AllowedAction.NATURAL_RESPONSE.value,
+            ),
+            {
+                "intent": "unknown",
+                "intent_guess": "unknown",
+                "language": language,
+                "confidence": 0.0,
+            },
+            tool_name,
+            ToolResult(success=False, error=message, error_code=error_code),
+        )
+
+    @staticmethod
+    def _is_secure_agent_reply(reply: str) -> bool:
+        if (
+            not isinstance(reply, str)
+            or not reply.strip()
+            or any(ord(char) < 32 and char not in "\n\t" for char in reply)
+            or re.search(
+                r"\b(?:product_id|variant_id|order_id|store_id|customer_id|"
+                r"conversation_id|api[_ -]?key|access[_ -]?token|secret)\b",
+                reply,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+                reply,
+                re.IGNORECASE,
+            )
+        ):
+            return False
+        stripped = reply.strip()
+        return not (
+            stripped.startswith(("{", "[", "```"))
+            and not re.search(r"[.!?؟]", stripped)
+        )
+
     async def _run_agent_tool_loop(
         self,
         *,
+        turn_id: str | None = None,
         db: Session,
         store_id: uuid.UUID,
         customer_id: uuid.UUID,
@@ -920,13 +1316,69 @@ class ConversationEngine:
         dialogue_context: list[dict[str, str]],
         language: str,
         image_observations: list[str] | None = None,
+        external_account_id: str | None = None,
+        external_user_id: str | None = None,
+        inbound_message_id: uuid.UUID | None = None,
     ) -> dict[str, Any] | None:
-        """Run up to three resolver-authorized tool calls before a final reply."""
+        """Execute FreeLLM-selected tools and preserve its final reply."""
         schemas = self._agent_tool_schemas()
         if not schemas:
             return None
+        trace_turn_id = turn_id or uuid.uuid4().hex
+        provider_name = getattr(self.llm, "provider_name", None) or "unknown"
+        model_name = getattr(self.llm, "model", None) or "unknown"
+        offered_tools = [
+            schema["function"]["name"]
+            for schema in schemas
+            if isinstance(schema, dict)
+            and isinstance(schema.get("function"), dict)
+        ]
+        logger.info(
+            "agent_turn_started turn_id=%s provider=%s model=%s tools_offered=%s "
+            "customer_message=%s",
+            trace_turn_id,
+            provider_name,
+            model_name,
+            json.dumps(offered_tools, ensure_ascii=False),
+            self._trace_safe_text(user_message),
+        )
 
         facts = self._agent_verified_state_facts(db, store_id, current_state)
+        recent_image_deliveries = [
+            {
+                "status": delivery.status,
+                "failure_kind": delivery.failure_kind,
+            }
+            for delivery in (
+                db.query(OutboundDelivery)
+                .filter(
+                    OutboundDelivery.conversation_id == conversation.id,
+                    OutboundDelivery.payload_type == "image",
+                )
+                .order_by(
+                    OutboundDelivery.created_at.desc(),
+                    OutboundDelivery.id.desc(),
+                )
+                .limit(3)
+                .all()
+            )
+        ]
+        served_wilayas = db.query(Store.served_wilayas).filter(
+            Store.id == store_id
+        ).scalar()
+        provided_phone, provided_wilaya = self._extract_delivery_details(
+            user_message,
+            served_wilayas,
+        )
+        draft_summary = self._agent_draft_summary(
+            db,
+            store_id,
+            customer_id,
+            current_state.get("active_draft_json"),
+        )
+        if draft_summary is not None:
+            facts["draft_summary"] = draft_summary
+            facts["total_price"] = draft_summary.get("total_price")
         safe_context = {
             "commerce_stage": current_state.get("commerce_stage", "EMPTY"),
             "selected_product": (
@@ -946,6 +1398,12 @@ class ConversationEngine:
                 (current_state.get("active_draft_json") or {}).get("items")
                 if isinstance(current_state.get("active_draft_json"), dict)
                 else False
+            ),
+            "active_draft_summary": self._agent_draft_summary(
+                db,
+                store_id,
+                customer_id,
+                current_state.get("active_draft_json"),
             ),
             "confirmation_pending": self._matches_pending_confirmation(
                 conversation.metadata_json or {},
@@ -978,6 +1436,11 @@ class ConversationEngine:
                 current_state.get("conversation_memory")
             ),
             "image_observations": (image_observations or [])[-3:],
+            "recent_image_deliveries": recent_image_deliveries,
+            "delivery_details_in_current_message": {
+                "phone_provided": bool(provided_phone),
+                "wilaya_provided": bool(provided_wilaya),
+            },
             "verified_facts": facts,
             "agent_working_memory": self._sanitize_agent_working_memory(
                 (conversation.metadata_json or {}).get("agent_working_memory")
@@ -1018,8 +1481,13 @@ class ConversationEngine:
                     "customer said or what remains to be resolved. It is not a source "
                     "of product, price, stock, order, or consent facts. Never use it "
                     "to override verified_facts or the active draft.\n"
+                    "- Private phone numbers and addresses are withheld from the "
+                    "message content sent to you. If the context says delivery "
+                    "details were provided, use update_order_draft set_shipping when "
+                    "appropriate; the backend securely persists matching details "
+                    "from the original message.\n"
                     "- When the goal, preference, budget, objection, or next step "
-                    "materially changes, return a complete refreshed memory with your "
+                    "materially changes, you may return a refreshed memory with your "
                     "final answer as JSON: {\"reply\":\"natural customer response\","
                     "\"working_memory\":{\"customer_goal\":\"...\","
                     "\"active_entity\":\"product name only\","
@@ -1034,7 +1502,9 @@ class ConversationEngine:
                     "Search for discovery, details for a known product, inventory for "
                     "availability, recommendations for relevant in-stock alternatives, "
                     "and customer context for order history or relevant saved "
-                    "preferences.\n"
+                    "preferences. Use store_info for verified store policies and "
+                    "send_product_image only for an explicit request for a product "
+                    "photo on Messenger.\n"
                     "- When the customer asks about a product's description, features, "
                     "sizes, colors, options, or photos, call get_product_details for "
                     "the selected product before answering. If a single product is "
@@ -1056,12 +1526,34 @@ class ConversationEngine:
                     "result is not a reservation or guarantee beyond its verified "
                     "availability observation.\n"
                     "- Never claim a tool action succeeded unless its result confirms it.\n\n"
+                    "- A successful send_product_image result confirms only that "
+                    "the image was queued, not delivered. Say it was queued or is "
+                    "being prepared; never claim it was sent or delivered. On later "
+                    "turns, report delivery as sent or failed only when that status "
+                    "appears in recent_image_deliveries; pending means unconfirmed.\n\n"
                     "COMMERCE SAFETY:\n"
                     "- Product names, prices, options, stock, promotions, and order "
                     "status must come from verified tool/database results. Admit "
                     "uncertainty when facts are missing.\n"
+                    "- For a price question about the selected or last-discussed "
+                    "product, answer from its verified price and selected variant "
+                    "price in verified_facts/conversation context. Do not send the "
+                    "whole question to search_products; use get_product_details only "
+                    "if the product is known but its current price is absent.\n"
                     "- A price question is not a purchase request. A draft is not a "
                     "confirmed order. Create or edit drafts only when requested.\n"
+                    "- When the customer asks to buy the already selected product and "
+                    "variant, create a draft with that verified variant and quantity "
+                    "one unless they clearly requested another quantity. Pass the "
+                    "draft's items as an array of {variant_index, quantity}; omit "
+                    "variant_index only when the server context has a selected "
+                    "variant. Never ask them to select the product again.\n"
+                    "- Decide naturally whether a delivery detail is needed next. "
+                    "Persist customer-provided phone, wilaya, municipality, or address "
+                    "with update_order_draft set_shipping when appropriate. Municipality "
+                    "is optional; do not force a fixed collection sequence. Before "
+                    "confirmation, ensure required delivery details are present, "
+                    "summarize the verified draft, and ask for explicit approval.\n"
                     "- Call confirm_order only when the customer explicitly approves "
                     "the current verified draft in response to its confirmation "
                     "question. Never infer consent from silence, an unrelated "
@@ -1082,7 +1574,9 @@ class ConversationEngine:
                 role="user",
                 content=json.dumps(
                     {
-                        "customer_message": user_message,
+                        "customer_message": self._model_safe_customer_message(
+                            user_message
+                        ),
                         "language": language,
                     },
                     ensure_ascii=False,
@@ -1095,8 +1589,30 @@ class ConversationEngine:
         last_tool_name: str | None = None
         last_tool_result: ToolResult | None = None
         executed_count = 0
+        executed_tools: list[str] = []
+        model_call_count = 0
 
-        for _ in range(self.max_tool_rounds):
+        async def safe_fallback() -> dict[str, Any]:
+            fallback = await self._agent_loop_safe_fallback(
+                language,
+                user_message,
+                last_decision,
+                last_nlu,
+                last_tool_name,
+                last_tool_result,
+            )
+            fallback["executed_tools"] = list(executed_tools)
+            return fallback
+
+        for _ in range(self.max_tool_rounds + 2):
+            model_call_count += 1
+            logger.info(
+                "agent_model_call_started turn_id=%s provider=%s model=%s call=%d",
+                trace_turn_id,
+                provider_name,
+                model_name,
+                model_call_count,
+            )
             try:
                 response = await asyncio.wait_for(
                     self.llm.chat(messages=messages, tools=schemas),
@@ -1104,17 +1620,15 @@ class ConversationEngine:
                 )
             except Exception as exc:
                 logger.warning(
-                    "Agent loop provider call failed (error_type=%s)",
+                    "agent_model_call_failed turn_id=%s provider=%s model=%s "
+                    "call=%d error_type=%s",
+                    trace_turn_id,
+                    provider_name,
+                    model_name,
+                    model_call_count,
                     type(exc).__name__,
                 )
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
+                return await safe_fallback()
             self._record_agent_usage(
                 response,
                 db,
@@ -1123,34 +1637,41 @@ class ConversationEngine:
                 self.llm,
             )
             if getattr(response, "finish_reason", None) == "error":
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
+                return await safe_fallback()
 
             calls = getattr(response, "tool_calls", None) or []
             content = (getattr(response, "content", None) or "").strip()
+            logger.info(
+                "agent_model_call_completed turn_id=%s call=%d "
+                "selected_tools=%s",
+                trace_turn_id,
+                model_call_count,
+                json.dumps(
+                    [
+                        str(call.get("name") or "invalid_tool")
+                        for call in calls
+                        if isinstance(call, dict)
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
             working_memory_update = None
             if not calls and content:
+                candidate_content = content.strip()
+                if candidate_content.startswith("```") and candidate_content.endswith("```"):
+                    candidate_content = re.sub(
+                        r"^```(?:json)?\s*|\s*```$",
+                        "",
+                        candidate_content,
+                        flags=re.IGNORECASE,
+                    ).strip()
                 try:
-                    possible_tool = json.loads(content)
+                    possible_tool = json.loads(candidate_content)
                 except (json.JSONDecodeError, TypeError):
                     possible_tool = None
-                    if content.startswith(("{", "[")):
-                        content = ""
                 if isinstance(possible_tool, dict):
                     if (
-                        set(possible_tool) == {"reply"}
-                        and isinstance(possible_tool.get("reply"), str)
-                    ):
-                        content = possible_tool["reply"].strip()
-                    elif (
                         set(possible_tool).issubset({"reply", "working_memory"})
-                        and "reply" in possible_tool
                         and isinstance(possible_tool.get("reply"), str)
                     ):
                         content = possible_tool["reply"].strip()
@@ -1187,19 +1708,31 @@ class ConversationEngine:
                                 current_facts,
                                 tool_facts,
                             )
-                if ReplyComposer.is_safe_agent_reply(
-                    content,
-                    (
-                        "ar"
-                        if re.search(r"[\u0600-\u06ff]", content)
-                        else language
-                    ),
-                    current_facts,
+                if (
+                    self._is_secure_agent_reply(content)
+                    if getattr(self.llm, "provider_name", None) == "freellm"
+                    else ReplyComposer.is_safe_agent_reply(
+                        content,
+                        (
+                            "ar"
+                            if re.search(r"[\u0600-\u06ff]", content)
+                            else language
+                        ),
+                        current_facts,
+                    )
                 ):
                     if working_memory_update is not None:
                         metadata = dict(conversation.metadata_json or {})
                         metadata["agent_working_memory"] = working_memory_update
                         conversation.metadata_json = metadata
+                    logger.info(
+                        "agent_model_final_reply turn_id=%s provider=%s model=%s "
+                        "reply=%s",
+                        trace_turn_id,
+                        provider_name,
+                        model_name,
+                        self._trace_safe_text(content),
+                    )
                     if last_decision is None:
                         last_decision = ResolutionResult(
                             allowed_action=AllowedAction.ASK_FOR_CLARIFICATION.value,
@@ -1218,282 +1751,178 @@ class ConversationEngine:
                         },
                         "tool_name": last_tool_name,
                         "tool_result": last_tool_result,
+                        "executed_tools": executed_tools,
                         "response": content,
                     }
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
+                return await safe_fallback()
 
-            if len(calls) != 1 or executed_count >= self.max_tool_rounds:
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
-            call = calls[0]
-            if not isinstance(call, dict):
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
-            tool_name = call.get("name")
-            arguments = call.get("arguments")
-            if not isinstance(tool_name, str) or not isinstance(arguments, dict):
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
-            signature = (
-                tool_name,
-                json.dumps(arguments, sort_keys=True, separators=(",", ":")),
-            )
-            if signature in seen_calls:
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
-            seen_calls.add(signature)
-            if self.registry.get(tool_name) is None:
-                return await self._agent_loop_safe_fallback(
-                    language,
-                    user_message,
-                    last_decision,
-                    last_nlu,
-                    last_tool_name,
-                    last_tool_result,
-                )
-
-            transaction_before = (
-                f"active={db.is_active},in_transaction={db.in_transaction()}"
-            )
-            try:
-                savepoint = db.begin_nested()
-            except SQLAlchemyError as exc:
-                _log_agent_tool_database_failure(
-                    tool_name,
-                    exc,
-                    transaction_before,
-                    db,
-                    recovery_succeeded=False,
-                )
-                raise ToolSessionUnusableError(
-                    "Could not establish a savepoint for agent tool dispatch"
-                ) from exc
-
-            try:
-                execution = await self._execute_agent_tool_call(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    user_message=user_message,
-                    language=language,
-                    db=db,
-                    store_id=store_id,
-                    customer_id=customer_id,
-                    conversation=conversation,
-                    channel=channel,
-                    state=current_state,
-                )
-                savepoint.commit()
-            except ToolSessionUnusableError:
-                if savepoint.is_active:
-                    savepoint.rollback()
-                raise
-            except Exception as exc:
-                recovery_succeeded = False
-                try:
-                    if savepoint.is_active:
-                        savepoint.rollback()
-                        recovery_succeeded = db.is_active
-                except SQLAlchemyError:
-                    recovery_succeeded = False
-
-                if isinstance(exc, SQLAlchemyError):
-                    _log_agent_tool_database_failure(
-                        tool_name,
-                        exc,
-                        transaction_before,
-                        db,
-                        recovery_succeeded=recovery_succeeded,
-                    )
-                    if not recovery_succeeded:
-                        raise ToolSessionUnusableError(
-                            "Could not recover the database session after agent tool dispatch"
-                        ) from exc
-                    execution = (
-                        ResolutionResult(
-                            allowed_action=AllowedAction.NATURAL_RESPONSE.value
-                        ),
-                        {
-                            "intent": "unknown",
-                            "intent_guess": "unknown",
-                            "language": language,
-                            "confidence": 0.0,
-                        },
-                        tool_name,
-                        ToolResult(
-                            success=False,
-                            error=(
-                                "A temporary database error occurred; no result "
-                                "was produced. This is not a NO_RESULTS result."
-                            ),
-                            error_code="DATABASE_ERROR",
-                        ),
-                    )
-                else:
-                    if not recovery_succeeded:
-                        raise ToolSessionUnusableError(
-                            "Could not recover the database session after agent tool dispatch"
-                        ) from exc
-                    logger.warning(
-                        "Agent tool dispatch failed (tool=%s, error_type=%s)",
-                        tool_name,
-                        type(exc).__name__,
-                    )
-                    execution = None
-
-            call_id = str(call.get("id") or uuid.uuid4())
+            normalized_calls = [
+                call if isinstance(call, dict) else {}
+                for call in calls
+            ]
             messages.append(
                 LLMMessage(
                     role="assistant",
                     content=getattr(response, "content", None),
                     tool_calls=[
                         {
-                            "id": call_id,
-                            "name": tool_name,
-                            "arguments": self._sanitize_agent_payload(arguments),
+                            "id": str(call.get("id") or uuid.uuid4()),
+                            "name": str(call.get("name") or "invalid_tool"),
+                            "arguments": self._sanitize_agent_payload(
+                                call.get("arguments")
+                                if isinstance(call.get("arguments"), dict)
+                                else {}
+                            ),
                         }
+                        for call in normalized_calls
                     ],
                 )
             )
-            if execution is None:
-                execution = (
-                    ResolutionResult(
-                        allowed_action=AllowedAction.NATURAL_RESPONSE.value,
-                        response_hint=(
-                            "The requested action was not authorized or its "
-                            "arguments could not be resolved."
-                        ),
-                    ),
-                    {
-                        "intent": "unknown",
-                        "intent_guess": "unknown",
-                        "language": language,
-                        "confidence": 0.0,
-                    },
+            for call in normalized_calls:
+                tool_name = str(call.get("name") or "invalid_tool")
+                arguments = call.get("arguments")
+                call_id = str(call.get("id") or uuid.uuid4())
+                logger.info(
+                    "agent_tool_selected turn_id=%s call_id=%s tool=%s "
+                    "arguments=%s",
+                    trace_turn_id,
+                    call_id,
                     tool_name,
-                    ToolResult(
-                        success=False,
-                        error=(
-                            "The requested action could not be completed. "
-                            "Conversation and draft state were left unchanged."
+                    json.dumps(
+                        self._trace_safe_arguments(
+                            arguments if isinstance(arguments, dict) else {}
                         ),
-                        error_code="ACTION_NOT_AUTHORIZED",
+                        ensure_ascii=False,
+                        sort_keys=True,
                     ),
                 )
-            decision, tool_nlu, executed_tool_name, tool_result = execution
-            last_decision = decision
-            last_nlu = tool_nlu
-            last_tool_name = executed_tool_name
-            last_tool_result = tool_result
-            executed_count += 1
-            current_state = self._normalize_current_state(conversation, store_id)
-            result_facts: dict[str, Any] = {}
-            if tool_result.success and isinstance(tool_result.data, dict):
-                result_facts = self._agent_result_facts(
-                    executed_tool_name,
-                    tool_result.data,
-                )
-                facts = self._merge_agent_facts(facts, result_facts)
-            safe_result = (
-                {
-                    "success": True,
-                    **self._sanitize_agent_payload(tool_result.data),
-                }
-                if tool_result.success
-                else {
-                    "success": False,
-                    "category": (
-                        "technical_error"
-                        if tool_result.error_code == "DATABASE_ERROR"
-                        else "no_results"
-                        if tool_result.error_code == "NO_RESULTS"
-                        else "tool_error"
+                signature = (
+                    tool_name,
+                    json.dumps(
+                        arguments if isinstance(arguments, dict) else {},
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
-                    "error_code": tool_result.error_code or "TOOL_ERROR",
-                    "message": self._tool_error_response(
-                        executed_tool_name,
-                        tool_result.error_code or "TOOL_ERROR",
-                        {},
+                )
+                if signature in seen_calls:
+                    execution = self._agent_tool_failure(
+                        tool_name,
                         language,
+                        "This identical tool request was already attempted this turn.",
+                        "DUPLICATE_TOOL_CALL",
+                    )
+                elif executed_count >= self.max_tool_rounds:
+                    execution = self._agent_tool_failure(
+                        tool_name,
+                        language,
+                        "The safe per-turn tool limit has been reached.",
+                        "TOOL_LIMIT_REACHED",
+                    )
+                else:
+                    seen_calls.add(signature)
+                    execution = await self._dispatch_agent_tool_call_safely(
+                        call=call,
+                        user_message=user_message,
+                        language=language,
+                        db=db,
+                        store_id=store_id,
+                        customer_id=customer_id,
+                        conversation=conversation,
+                        channel=channel,
+                        state=current_state,
+                        external_account_id=external_account_id,
+                        external_user_id=external_user_id,
+                        inbound_message_id=inbound_message_id,
+                    )
+                    executed_count += 1
+
+                decision, tool_nlu, executed_tool_name, tool_result = execution
+                last_decision = decision
+                last_nlu = tool_nlu
+                last_tool_name = executed_tool_name
+                last_tool_result = tool_result
+                executed_tools.append(executed_tool_name)
+                logger.info(
+                    "agent_tool_completed turn_id=%s call_id=%s tool=%s "
+                    "result=%s",
+                    trace_turn_id,
+                    call_id,
+                    executed_tool_name,
+                    json.dumps(
+                        self._tool_result_trace_summary(tool_result),
+                        ensure_ascii=False,
+                        sort_keys=True,
                     ),
-                }
-            )
-            messages.append(
-                LLMMessage(
-                    role="tool",
-                    tool_call_id=call_id,
-                    content=json.dumps(safe_result, ensure_ascii=False),
                 )
-            )
-            if not db.is_active:
-                raise ToolSessionUnusableError(
-                    "Refusing to refresh conversation using an inactive database session"
+                current_state = self._normalize_current_state(
+                    conversation, store_id
                 )
-            db.flush()
-            db.refresh(
-                conversation,
-                attribute_names=["metadata_json", "active_draft_json"],
-            )
-            has_confirmed_order = False
-            metadata = conversation.metadata_json or {}
-            if (
-                metadata.get("commerce_stage") == "ORDER_CONFIRMED"
-                and not (conversation.active_draft_json or {}).get("items")
-            ):
-                has_confirmed_order = (
-                    db.query(Order.id)
+                if tool_result.success and isinstance(tool_result.data, dict):
+                    facts = self._merge_agent_facts(
+                        facts,
+                        self._agent_result_facts(
+                            executed_tool_name, tool_result.data
+                        ),
+                    )
+                safe_result = (
+                    {
+                        "success": True,
+                        **self._sanitize_agent_payload(tool_result.data),
+                    }
+                    if tool_result.success
+                    else {
+                        "success": False,
+                        "category": (
+                            "technical_error"
+                            if tool_result.error_code == "DATABASE_ERROR"
+                            else "no_results"
+                            if tool_result.error_code == "NO_RESULTS"
+                            else "tool_error"
+                        ),
+                        "error_code": tool_result.error_code or "TOOL_ERROR",
+                        "message": self._tool_error_response(
+                            executed_tool_name,
+                            tool_result.error_code or "TOOL_ERROR",
+                            {},
+                            language,
+                        ),
+                    }
+                )
+                messages.append(
+                    LLMMessage(
+                        role="tool",
+                        tool_call_id=call_id,
+                        content=json.dumps(safe_result, ensure_ascii=False),
+                    )
+                )
+                if not db.is_active:
+                    raise ToolSessionUnusableError(
+                        "Refusing to refresh conversation using an inactive database session"
+                    )
+                db.flush()
+                db.refresh(
+                    conversation,
+                    attribute_names=["metadata_json", "active_draft_json"],
+                )
+                metadata = conversation.metadata_json or {}
+                has_confirmed_order = bool(
+                    metadata.get("commerce_stage") == "ORDER_CONFIRMED"
+                    and not (conversation.active_draft_json or {}).get("items")
+                    and db.query(Order.id)
                     .filter(
                         Order.conversation_id == conversation.id,
                         Order.store_id == store_id,
                         Order.status == OrderStatus.CONFIRMED,
                     )
                     .first()
-                    is not None
                 )
-            current_state = self._normalize_current_state(
-                conversation,
-                store_id,
-                has_confirmed_order=has_confirmed_order,
-            )
+                current_state = self._normalize_current_state(
+                    conversation,
+                    store_id,
+                    has_confirmed_order=has_confirmed_order,
+                )
 
-        return await self._agent_loop_safe_fallback(
-            language,
-            user_message,
-            last_decision,
-            last_nlu,
-            last_tool_name,
-            last_tool_result,
-        )
+        return await safe_fallback()
 
     @staticmethod
     def _agent_tool_arguments_valid(tool_name: str, arguments: dict[str, Any]) -> bool:
@@ -1506,11 +1935,17 @@ class ConversationEngine:
             ),
             "list_catalog_products": (set(), set()),
             "create_order_draft": (
-                {"variant_index", "quantity"},
-                {"quantity"},
+                {"items", "shipping_info", "variant_index", "quantity"},
+                set(),
             ),
             "update_order_draft": (
-                {"action", "item_index", "quantity", "variant_index"},
+                {
+                    "action",
+                    "item_index",
+                    "quantity",
+                    "variant_index",
+                    "shipping_info",
+                },
                 {"action"},
             ),
             "confirm_order": (set(), set()),
@@ -1519,6 +1954,8 @@ class ConversationEngine:
                 {"customer_need", "max_price", "reason", "limit"},
                 set(),
             ),
+            "store_info": (set(), set()),
+            "send_product_image": (set(), set()),
         }
         if tool_name not in schemas:
             return False
@@ -1579,14 +2016,58 @@ class ConversationEngine:
                 isinstance(arguments.get("product_name"), str)
                 and len(arguments["product_name"].strip()) <= 160
             )
-        if tool_name in {"check_inventory", "create_order_draft"}:
+        if tool_name == "check_inventory":
             if not ConversationEngine._is_positive_integer(arguments.get("quantity")):
                 return False
             return "variant_index" not in arguments or ConversationEngine._is_positive_integer(
                 arguments.get("variant_index")
             )
+        if tool_name == "create_order_draft":
+            items = arguments.get("items")
+            shipping_info = arguments.get("shipping_info")
+            if items is None:
+                return (
+                    ConversationEngine._is_positive_integer(
+                        arguments.get("quantity")
+                    )
+                    and (
+                        "variant_index" not in arguments
+                        or ConversationEngine._is_positive_integer(
+                            arguments.get("variant_index")
+                        )
+                    )
+                    and (
+                        shipping_info is None
+                        or ConversationEngine._valid_shipping_info(shipping_info)
+                    )
+                )
+            if not isinstance(items, list) or not 1 <= len(items) <= 10:
+                return False
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) - {"variant_index", "quantity"}
+                    or not ConversationEngine._is_positive_integer(
+                        item.get("quantity")
+                    )
+                    or (
+                        "variant_index" in item
+                        and not ConversationEngine._is_positive_integer(
+                            item.get("variant_index")
+                        )
+                    )
+                ):
+                    return False
+            return shipping_info is None or ConversationEngine._valid_shipping_info(
+                shipping_info
+            )
         if tool_name == "update_order_draft":
             action = arguments.get("action")
+            if action == "set_shipping":
+                shipping_info = arguments.get("shipping_info")
+                return shipping_info is None or ConversationEngine._valid_shipping_info(
+                    shipping_info
+                )
             if action not in {"add", "remove", "set", "replace"}:
                 return False
             if action == "replace":
@@ -1631,6 +2112,20 @@ class ConversationEngine:
     @staticmethod
     def _is_positive_integer(value: Any) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _valid_shipping_info(value: Any) -> bool:
+        if not isinstance(value, dict) or set(value) - {
+            "phone",
+            "wilaya",
+            "municipality",
+            "address",
+        }:
+            return False
+        return all(
+            isinstance(field, str) and 0 < len(field.strip()) <= 160
+            for field in value.values()
+        )
 
     def _persist_agent_context_updates(
         self,
@@ -1679,6 +2174,13 @@ class ConversationEngine:
                 "variant_index_map_product_id",
             }
         for key, value in decision.context_updates.items():
+            if (
+                key == "commerce_stage"
+                and isinstance(conversation.active_draft_json, dict)
+                and conversation.active_draft_json.get("items")
+                and value != "ORDER_CONFIRMED"
+            ):
+                continue
             if (
                 decision.allowed_action == AllowedAction.CONFIRM_ORDER.value
                 and not tool_result.success
@@ -1809,6 +2311,7 @@ class ConversationEngine:
                     "phone": shipping_info.get("phone")
                     or (customer.phone if customer is not None else None),
                     "wilaya": shipping_info.get("wilaya"),
+                    "municipality": shipping_info.get("municipality"),
                 }.items()
                 if isinstance(value, str) and value.strip()
             },
@@ -1960,9 +2463,26 @@ class ConversationEngine:
         conversation: Conversation,
         channel: str,
         state: dict[str, Any],
+        external_account_id: str | None = None,
+        external_user_id: str | None = None,
+        inbound_message_id: uuid.UUID | None = None,
     ) -> tuple[ResolutionResult, dict[str, Any], str, ToolResult] | None:
         if not self._agent_tool_arguments_valid(tool_name, arguments):
             return None
+        if tool_name == "create_order_draft" and "items" not in arguments:
+            arguments = {
+                "items": [
+                    {
+                        "variant_index": arguments.get("variant_index"),
+                        "quantity": arguments["quantity"],
+                    }
+                ],
+                **(
+                    {"shipping_info": arguments["shipping_info"]}
+                    if "shipping_info" in arguments
+                    else {}
+                ),
+            }
 
         if tool_name == "get_customer_context":
             result = await self.registry.aexecute(
@@ -2054,6 +2574,48 @@ class ConversationEngine:
                         ],
                     },
                 )
+            return (
+                ResolutionResult(
+                    allowed_action=AllowedAction.NATURAL_RESPONSE.value,
+                ),
+                {
+                    "intent": "unknown",
+                    "intent_guess": "unknown",
+                    "language": language,
+                    "confidence": 0.95,
+                },
+                tool_name,
+                result,
+            )
+
+        if tool_name in {"store_info", "send_product_image"}:
+            tool_arguments: dict[str, Any] = {}
+            tool_context = {
+                "db": db,
+                "store_id": store_id,
+                "customer_id": customer_id,
+                "conversation_id": conversation.id,
+                "channel": channel,
+                "user_message": user_message,
+                "external_account_id": external_account_id,
+                "external_user_id": external_user_id,
+                "inbound_message_id": inbound_message_id,
+            }
+            if tool_name == "send_product_image":
+                product = self._agent_product_for_tool(db, store_id, state, None)
+                if product is None:
+                    return self._agent_tool_failure(
+                        tool_name,
+                        language,
+                        "There is no verified selected product image to send.",
+                        "NOT_FOUND",
+                    )
+                tool_arguments["product_id"] = str(product.id)
+            result = await self.registry.aexecute(
+                tool_name=tool_name,
+                arguments=tool_arguments,
+                context=tool_context,
+            )
             return (
                 ResolutionResult(
                     allowed_action=AllowedAction.NATURAL_RESPONSE.value,
@@ -2197,7 +2759,7 @@ class ConversationEngine:
             nlu.update(
                 intent="order_create",
                 intent_guess="order_create",
-                quantity=arguments["quantity"],
+                quantity=sum(item["quantity"] for item in arguments["items"]),
             )
         elif tool_name == "update_order_draft":
             if arguments.get("action") == "replace":
@@ -2210,18 +2772,17 @@ class ConversationEngine:
                 nlu.update(intent="order_create", intent_guess="order_create")
             nlu["draft_action"] = arguments.get("action")
         elif tool_name == "confirm_order":
-            if not self._has_pending_confirmation(conversation):
+            if not (
+                self._is_required_order_confirmation(user_message)
+                and state.get("last_question_type") == "ORDER_CONFIRMATION"
+                and self._has_pending_confirmation(conversation)
+            ):
                 return None
             nlu.update(
                 intent="order_confirm",
                 intent_guess="order_confirm",
                 confirmation_phrase=True,
             )
-            nlu = self._validate_nlu_context(nlu, user_message, state)
-            if nlu.get("intent") != "order_confirm" or not nlu.get(
-                "confirmation_phrase"
-            ):
-                return None
 
         if tool_name == "create_order_draft":
             active_draft = state.get("active_draft_json")
@@ -2237,21 +2798,25 @@ class ConversationEngine:
             product = self._agent_product_for_tool(db, store_id, state, None)
             if product is None:
                 return None
-            variant = self._agent_variant_for_tool(
-                db,
-                store_id,
-                state,
-                product,
-                arguments.get("variant_index"),
-            )
-            if variant is None:
-                return None
-            quantity = arguments["quantity"]
-
             index_map = state.get("variant_index_map")
-            index = arguments.get("variant_index")
-            if index is None and isinstance(index_map, dict):
-                if str(state.get("variant_index_map_product_id")) == str(product.id):
+            if not isinstance(index_map, dict):
+                index_map = {}
+            safe_items = []
+            for item in arguments["items"]:
+                variant_index = item.get("variant_index")
+                variant = self._agent_variant_for_tool(
+                    db,
+                    store_id,
+                    state,
+                    product,
+                    variant_index,
+                )
+                if variant is None:
+                    return None
+                index = variant_index
+                if index is None and str(
+                    state.get("variant_index_map_product_id")
+                ) == str(product.id):
                     index = next(
                         (
                             int(key)
@@ -2260,31 +2825,48 @@ class ConversationEngine:
                         ),
                         None,
                     )
-            if index is None:
-                index = self._ensure_variant_index_mapping(
-                    db=db,
-                    store_id=store_id,
-                    conversation=conversation,
-                    product_id=product.id,
-                    variant_id=str(variant.id),
+                if index is None:
+                    index = self._ensure_variant_index_mapping(
+                        db=db,
+                        store_id=store_id,
+                        conversation=conversation,
+                        product_id=product.id,
+                        variant_id=str(variant.id),
+                    )
+                    index_map = dict(
+                        (conversation.metadata_json or {}).get(
+                            "variant_index_map", {}
+                        )
+                    )
+                if (
+                    index is None
+                    or not isinstance(index_map, dict)
+                    or str(index_map.get(str(index))) != str(variant.id)
+                ):
+                    return None
+                safe_items.append(
+                    {"variant_index": int(index), "quantity": item["quantity"]}
                 )
-                index_map = dict(
-                    (conversation.metadata_json or {}).get("variant_index_map", {})
-                )
-            if (
-                index is None
-                or not isinstance(index_map, dict)
-                or str(index_map.get(str(index))) != str(variant.id)
-            ):
-                return None
             nlu.update(
                 intent="order_create",
                 intent_guess="order_create",
                 product_mention=product.name,
             )
-            safe_arguments = {
-                "items": [{"variant_index": int(index), "quantity": quantity}]
-            }
+            safe_arguments = {"items": safe_items}
+            shipping_info = dict(arguments.get("shipping_info") or {})
+            served_wilayas = db.query(Store.served_wilayas).filter(
+                Store.id == store_id
+            ).scalar()
+            message_phone, message_wilaya = self._extract_delivery_details(
+                user_message,
+                served_wilayas,
+            )
+            if message_phone:
+                shipping_info.setdefault("phone", message_phone)
+            if message_wilaya:
+                shipping_info.setdefault("wilaya", message_wilaya)
+            if shipping_info:
+                safe_arguments["shipping_info"] = shipping_info
         elif tool_name == "update_order_draft":
             active_draft = state.get("active_draft_json")
             draft_items = (
@@ -2300,6 +2882,41 @@ class ConversationEngine:
                 return None
 
             update_action = arguments["action"]
+            if update_action == "set_shipping":
+                shipping_info = dict(arguments.get("shipping_info") or {})
+                served_wilayas = db.query(Store.served_wilayas).filter(
+                    Store.id == store_id
+                ).scalar()
+                message_phone, message_wilaya = self._extract_delivery_details(
+                    user_message,
+                    served_wilayas,
+                )
+                if message_phone:
+                    shipping_info.setdefault("phone", message_phone)
+                if message_wilaya:
+                    shipping_info.setdefault("wilaya", message_wilaya)
+                result = await self.registry.aexecute(
+                    tool_name=tool_name,
+                    arguments={
+                        "action": "set_shipping",
+                        "shipping_info": shipping_info,
+                    },
+                    context={
+                        "db": db,
+                        "store_id": store_id,
+                        "customer_id": customer_id,
+                        "conversation_id": conversation.id,
+                        "channel": channel,
+                    },
+                )
+                return (
+                    ResolutionResult(
+                        allowed_action=AllowedAction.UPDATE_ORDER_DRAFT_TOOL.value,
+                    ),
+                    nlu,
+                    tool_name,
+                    result,
+                )
             item_index = arguments.get("item_index")
             variant = None
             if update_action in {"remove", "set"}:
@@ -2360,7 +2977,7 @@ class ConversationEngine:
             resolved_entities.update(
                 product_id=str(product.id),
                 variant_id=str(variant.id),
-                quantity=arguments["quantity"],
+                quantity=sum(item["quantity"] for item in safe_arguments["items"]),
             )
         elif tool_name == "update_order_draft":
             resolved_entities.update(
@@ -2480,6 +3097,28 @@ class ConversationEngine:
         tool_name: str | None,
         tool_result: ToolResult | None,
     ) -> dict[str, Any]:
+        if getattr(self.llm, "provider_name", None) == "freellm":
+            if (
+                decision is not None
+                and nlu is not None
+                and tool_name is not None
+                and tool_result is not None
+                and not tool_result.success
+            ):
+                return {
+                    "accepted": True,
+                    "decision": decision,
+                    "nlu_output": nlu,
+                    "tool_name": tool_name,
+                    "tool_result": tool_result,
+                    "response": self._tool_error_response(
+                        tool_name,
+                        tool_result.error_code or "TOOL_ERROR",
+                        {},
+                        language,
+                    ),
+                }
+            return {"accepted": False}
         if decision is None or nlu is None or tool_name is None or tool_result is None:
             return {"accepted": False}
         if tool_result.success and isinstance(tool_result.data, dict):
@@ -2687,6 +3326,7 @@ class ConversationEngine:
         external_user_id: str | None = None,
         outbound_suffix: str | None = None,
         image_attachments: list[dict[str, Any]] | None = None,
+        inbound_message_id: uuid.UUID | None = None,
     ) -> dict:
         try:
             image_observations = await self._analyze_inbound_images(
@@ -2709,6 +3349,7 @@ class ConversationEngine:
                 external_user_id=external_user_id,
                 outbound_suffix=outbound_suffix,
                 image_observations=image_observations,
+                inbound_message_id=inbound_message_id,
             )
         except Exception as exc:
             logger.exception(
@@ -2736,6 +3377,7 @@ class ConversationEngine:
         external_user_id: str | None = None,
         outbound_suffix: str | None = None,
         image_observations: list[str] | None = None,
+        inbound_message_id: uuid.UUID | None = None,
     ) -> dict:
         turn_id = uuid.uuid4().hex
         conv_id = conversation_id or uuid.uuid4()
@@ -2799,6 +3441,25 @@ class ConversationEngine:
             store_id,
             has_confirmed_order=has_confirmed_order,
         )
+        if (
+            channel == "facebook"
+            and getattr(self.llm, "provider_name", None) == "freellm"
+        ):
+            return await self._process_free_agent_turn(
+                db=db,
+                store_id=store_id,
+                customer_id=customer_id,
+                conversation=conversation,
+                channel=channel,
+                user_message=user_message,
+                current_state=current_state,
+                external_account_id=external_account_id,
+                external_user_id=external_user_id,
+                outbound_suffix=outbound_suffix,
+                image_observations=image_observations or [],
+                turn_id=turn_id,
+                inbound_message_id=inbound_message_id,
+            )
         local_message_nlu = self._heuristic_nlu(user_message, current_state)
         active_draft = current_state.get("active_draft_json")
         delivery_info_pending = bool(
@@ -3103,6 +3764,7 @@ class ConversationEngine:
             if re.search(r"[\u0600-\u06ff]", user_message):
                 fallback_nlu["language"] = "ar"
             agent_loop_result = await self._run_agent_tool_loop(
+                turn_id=turn_id,
                 db=db,
                 store_id=store_id,
                 customer_id=customer_id,
@@ -3302,7 +3964,11 @@ class ConversationEngine:
                 allowed_action="RESPOND:text_only",
                 resolved_entities={},
                 context_updates={},
-                response_hint=nlu_output.get("response_hint", ""),
+                response_hint=(
+                    delivery_info_reply
+                    if delivery_info_capture_turn
+                    else nlu_output.get("response_hint", "")
+                ),
             )
         elif not agent_loop_accepted:
             resolver = CommerceResolver(db=db)
@@ -3959,6 +4625,11 @@ class ConversationEngine:
             next_question_type = "ORDER_CREATE_OFFER"
         read_only_draft_interruption = (
             current_state.get("commerce_stage") == "DRAFT_PENDING"
+            and current_state.get("last_question_type")
+            in {
+                "CUSTOMER_DELIVERY_INFO",
+                "ORDER_CONFIRMATION",
+            }
             and tool_name
             in {
                 "search_products",
@@ -4066,6 +4737,203 @@ class ConversationEngine:
                 "turn_plan": turn_plan if turn_plan["has_actions"] else None,
                 "response_candidates": len(response_candidates),
                 "responses_returned": returned_response_count,
+            },
+        }
+
+    async def _process_free_agent_turn(
+        self,
+        *,
+        db: Session,
+        store_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        conversation: Conversation,
+        channel: str,
+        user_message: str,
+        current_state: dict[str, Any],
+        external_account_id: str | None,
+        external_user_id: str | None,
+        outbound_suffix: str | None,
+        image_observations: list[str],
+        turn_id: str,
+        inbound_message_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        if (
+            self._has_pending_confirmation(conversation)
+            and not self._is_required_order_confirmation(user_message)
+        ):
+            metadata = dict(conversation.metadata_json or {})
+            metadata.pop("confirmation_pending", None)
+            conversation.metadata_json = metadata
+            current_state = self._normalize_current_state(
+                conversation, store_id
+            )
+        language = self._heuristic_nlu(user_message, current_state).get(
+            "language", "ar"
+        )
+        dialogue_context = self._recent_dialogue_context(
+            db, conversation.id, user_message
+        )
+        draft_before = current_state.get("active_draft_json")
+        had_active_draft = bool(
+            isinstance(draft_before, dict) and draft_before.get("items")
+        )
+        result = await self._run_agent_tool_loop(
+            turn_id=turn_id,
+            db=db,
+            store_id=store_id,
+            customer_id=customer_id,
+            conversation=conversation,
+            channel=channel,
+            user_message=user_message,
+            current_state=current_state,
+            dialogue_context=dialogue_context,
+            language=language,
+            image_observations=image_observations,
+            external_account_id=external_account_id,
+            external_user_id=external_user_id,
+            inbound_message_id=inbound_message_id,
+        )
+        response = (
+            result.get("response")
+            if isinstance(result, dict) and result.get("accepted")
+            else None
+        )
+        if not isinstance(response, str) or not response.strip():
+            response = SAFE_FALLBACK_RESPONSE
+        else:
+            response = response.strip()
+
+        if outbound_suffix:
+            response = f"{response}\n\n{outbound_suffix}"
+
+        tool_name = result.get("tool_name") if isinstance(result, dict) else None
+        executed_tools = (
+            result.get("executed_tools", [])
+            if isinstance(result, dict)
+            else []
+        )
+        tool_result = result.get("tool_result") if isinstance(result, dict) else None
+        if any(
+            name in {"create_order_draft", "update_order_draft"}
+            for name in executed_tools
+        ) or tool_name in {"create_order_draft", "update_order_draft"} or (
+            not had_active_draft
+            and isinstance(conversation.active_draft_json, dict)
+            and bool(conversation.active_draft_json.get("items"))
+        ):
+            draft = conversation.active_draft_json
+            draft = draft if isinstance(draft, dict) else {}
+            shipping_info = draft.get("shipping_info")
+            shipping_info = shipping_info if isinstance(shipping_info, dict) else {}
+            customer = (
+                db.query(Customer)
+                .filter(
+                    Customer.id == customer_id,
+                    Customer.store_id == store_id,
+                )
+                .one_or_none()
+            )
+            if (
+                customer is not None
+                and customer.phone
+                and not shipping_info.get("phone")
+            ):
+                shipping_info["phone"] = customer.phone
+                conversation.active_draft_json = {
+                    **draft,
+                    "shipping_info": shipping_info,
+                }
+            has_phone = bool(
+                shipping_info.get("phone")
+                or (customer.phone if customer is not None else None)
+            )
+            has_wilaya = bool(shipping_info.get("wilaya"))
+            metadata = dict(conversation.metadata_json or {})
+            if not has_phone or not has_wilaya:
+                metadata["last_question_type"] = "CUSTOMER_DELIVERY_INFO"
+                metadata.pop("confirmation_pending", None)
+            elif "أكد الطلب" in response:
+                draft_id = draft.get("draft_id")
+                if not isinstance(draft_id, str) or not draft_id:
+                    draft_id = str(uuid.uuid4())
+                    conversation.active_draft_json = {**draft, "draft_id": draft_id}
+                metadata["last_question_type"] = "ORDER_CONFIRMATION"
+                metadata["confirmation_pending"] = {"draft_id": draft_id}
+            conversation.metadata_json = metadata
+        elif (
+            "confirm_order" in executed_tools or tool_name == "confirm_order"
+        ) and isinstance(tool_result, ToolResult) and tool_result.success:
+            metadata = dict(conversation.metadata_json or {})
+            metadata.pop("confirmation_pending", None)
+            conversation.metadata_json = metadata
+
+        state_after_tools = self._normalize_current_state(conversation, store_id)
+        nlu_output = (
+            result.get("nlu_output")
+            if isinstance(result, dict) and isinstance(result.get("nlu_output"), dict)
+            else {}
+        )
+        self._refresh_conversation_memory(
+            db,
+            conversation,
+            state_after_tools,
+            nlu_output.get("intent", "unknown"),
+        )
+
+        agent_message = Message(
+            conversation_id=conversation.id,
+            role=MessageRole.AGENT,
+            content=response,
+        )
+        db.add(agent_message)
+        db.flush()
+        outbound_delivery_id = None
+        if external_account_id and external_user_id:
+            from app.services.outbound_delivery import enqueue_delivery
+
+            delivery = enqueue_delivery(
+                db,
+                conversation_id=conversation.id,
+                message_id=agent_message.id,
+                channel=channel,
+                external_account_id=external_account_id,
+                recipient_external_id=external_user_id,
+                payload_type="text",
+                payload={"text": response},
+            )
+            outbound_delivery_id = str(delivery.id)
+        db.commit()
+        provider_name = getattr(self.llm, "provider_name", None) or "unknown"
+        model_name = getattr(self.llm, "model", None) or "unknown"
+        logger.info(
+            "agent_turn_final turn_id=%s provider=%s model=%s tools_selected=%s "
+            "outbound_delivery_id=%s response=%s",
+            turn_id,
+            provider_name,
+            model_name,
+            json.dumps(
+                result.get("executed_tools", [])
+                if isinstance(result, dict)
+                else [],
+                ensure_ascii=False,
+            ),
+            outbound_delivery_id or "none",
+            self._trace_safe_text(response),
+        )
+        return {
+            "conversation_id": str(conversation.id),
+            "response": response,
+            "handoff": False,
+            "tool_calls": [],
+            "turn_diagnostics": {
+                "turn_id": turn_id,
+                "intent": nlu_output.get("intent", "unknown"),
+                "resolver_action": "free_agent_tool_loop",
+                "response_candidates": 1,
+                "responses_returned": 1,
+                "provider": provider_name,
+                "model": model_name,
+                "outbound_delivery_id": outbound_delivery_id,
             },
         }
 
@@ -4973,8 +5841,8 @@ class ConversationEngine:
                 if is_french
                 else "تعذر تأكيد الطلب الآن. بقيت المسودة محفوظة ولم يتم إنشاء طلب نهائي. يمكنك المحاولة مجدداً."
                 if not is_english
-                else "I couldn't confirm the order just now. The draft is still saved and "
-                "no final order was created. You can try again."
+                else "The order is not confirmed, and no order was placed. "
+                "The draft is still saved. You can try again."
             )
         if tool_name == "update_order_draft":
             return (

@@ -1051,6 +1051,7 @@ async def test_qwen_tool_loop_may_recover_no_match_with_resolver_gated_catalog(
     assert [tool["function"]["name"] for tool in provider.calls[1][1]] == [
         "search_products",
         "list_catalog_products",
+        "store_info",
     ]
     tool_result_message = provider.calls[2][0][-1]
     assert tool_result_message.role == "tool"

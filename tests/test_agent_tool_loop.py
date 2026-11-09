@@ -29,9 +29,10 @@ from app.agent.tools.list_catalog import ListCatalogProductsTool
 from app.agent.tools.registry import ToolRegistry, ToolSessionUnusableError
 from app.agent.tools.recommend_products import RecommendProductsTool
 from app.agent.tools.search_products import SearchProductsTool
+from app.agent.tools.send_product_image import SendProductImageTool
+from app.agent.tools.store_info import StoreInfoTool
 from app.agent.tools.update_order_draft import UpdateOrderDraftTool
 from app.agent.reply_composer import ReplyComposer
-from app.agent.classifier import ConversationClassifier, INTENT_GENERAL_CHAT, INTENT_TOPIC_CHANGE, INTENT_AMBIGUOUS
 from app.models.conversation import (
     Conversation,
     ConversationStatus,
@@ -180,6 +181,8 @@ def make_registry():
         ConfirmOrderTool(),
         GetCustomerContextTool(),
         RecommendProductsTool(),
+        StoreInfoTool(),
+        SendProductImageTool(),
     ):
         registry.register(tool)
     return registry
@@ -423,6 +426,7 @@ def prepare_pending_confirmation(conversation, product, variant):
         "shipping_info": {
             "phone": "0550123456",
             "wilaya": "الجزائر",
+            "municipality": "باب الزوار",
         },
     }
 
@@ -453,6 +457,24 @@ def test_agent_facts_expose_verified_variant_choices_without_internal_ids(db_ses
     ]
     assert str(product.id) not in json.dumps(facts)
     assert str(variant.id) not in json.dumps(facts)
+
+
+def test_active_draft_overrides_stale_product_selection_stage(db_session):
+    store, _, conversation, product, variant = make_fixture(
+        db_session, with_draft=True
+    )
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_variant_id": str(variant.id),
+        "last_question_type": "CUSTOMER_DELIVERY_INFO",
+    }
+
+    state = ConversationEngine(
+        ScriptedToolProvider([]), make_registry()
+    )._normalize_current_state(conversation, store.id)
+
+    assert state["commerce_stage"] == "DRAFT_PENDING"
 
 
 @pytest.mark.asyncio
@@ -674,11 +696,95 @@ async def test_agent_tool_loop_executes_one_resolver_authorized_call(db_session)
         "confirm_order",
         "get_customer_context",
         "recommend_products",
+        "store_info",
+        "send_product_image",
     ]
     tool_result = provider.calls[1][0][-1]
     assert tool_result.role == "tool"
     assert "Samsung Galaxy" in tool_result.content
     assert str(product.id) not in tool_result.content
+
+
+@pytest.mark.asyncio
+async def test_messenger_freellm_controls_ordinary_tool_selection_and_reply(
+    db_session, caplog
+):
+    store, customer, conversation, product, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            tool_call("search_products", {"query": "Samsung"}, "search-samsung"),
+            LLMResponse(
+                content=(
+                    "I found Samsung Galaxy. "
+                    + "Here are the verified product details. " * 25
+                )
+            ),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "mock-freellm-model"
+    engine = ConversationEngine(provider, make_registry())
+
+    with caplog.at_level("INFO", logger="app.agent.conversation_engine"):
+        result = await engine.process_message(
+            db=db_session,
+            store_id=store.id,
+            customer_id=customer.id,
+            conversation_id=conversation.id,
+            channel="facebook",
+            user_message="Find Samsung, my phone is 0550123456",
+        )
+
+    assert result["response"] == (
+        "I found Samsung Galaxy. "
+        + "Here are the verified product details. " * 25
+    ).strip()
+    assert result["turn_diagnostics"]["resolver_action"] == "free_agent_tool_loop"
+    assert len(provider.calls) == 2
+    tool_result_message = next(
+        message for message in provider.calls[1][0] if message.role == "tool"
+    )
+    assert str(product.id) not in tool_result_message.content
+    assert "agent_turn_started" in caplog.text
+    assert "provider=freellm" in caplog.text
+    assert "mock-freellm-model" in caplog.text
+    assert "agent_tool_selected" in caplog.text
+    assert "agent_tool_completed" in caplog.text
+    assert "0550123456" not in caplog.text
+    customer_message = json.loads(
+        next(
+            message
+            for message in provider.calls[0][0]
+            if message.role == "user"
+        ).content
+    )
+    assert "0550123456" not in customer_message["customer_message"]
+    context = json.loads(provider.calls[0][0][1].content.split("\n", 1)[1])
+    assert context["delivery_details_in_current_message"]["phone_provided"] is True
+
+
+def test_freellm_tool_schemas_expose_customer_tools_and_shipping_fields(db_session):
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    schemas = {
+        item["function"]["name"]: item["function"]
+        for item in engine._agent_tool_schemas()
+    }
+
+    assert "send_product_image" in schemas
+    assert "store_info" in schemas
+    assert "search_products" in schemas
+    assert "get_product_details" in schemas
+    assert "create_order_draft" in schemas
+    assert "update_order_draft" in schemas
+    assert schemas["send_product_image"]["parameters"]["properties"] == {}
+    update_parameters = schemas["update_order_draft"]["parameters"]
+    assert "shipping_info" not in update_parameters["properties"]["action"]
+    assert "municipality" in update_parameters["properties"]["shipping_info"][
+        "properties"
+    ]
+    assert FreeLLMProvider.provider_name == "freellm"
 
 
 @pytest.mark.asyncio
@@ -1923,6 +2029,70 @@ async def test_agent_loop_draft_then_confirmation_uses_existing_tools(db_session
 
 
 @pytest.mark.asyncio
+async def test_draft_update_invalidates_confirmation_before_same_turn_confirm(
+    db_session,
+):
+    _, _, conversation, product, variant = make_fixture(db_session)
+    conversation.channel = "facebook"
+    prepare_pending_confirmation(conversation, product, variant)
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    {
+                        "id": "update-draft",
+                        "name": "update_order_draft",
+                        "arguments": {
+                            "action": "set",
+                            "item_index": 1,
+                            "quantity": 2,
+                        },
+                    },
+                    {
+                        "id": "confirm-updated-draft",
+                        "name": "confirm_order",
+                        "arguments": {},
+                    },
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="The updated draft needs your review before confirmation."
+            ),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "mock-freellm-model"
+    engine = ConversationEngine(provider, make_registry())
+
+    await engine.process_message(
+        db=db_session,
+        store_id=conversation.store_id,
+        customer_id=conversation.customer_id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="أكد الطلب",
+    )
+
+    confirm_result = next(
+        message
+        for message in provider.calls[1][0]
+        if message.role == "tool"
+        and message.tool_call_id == "confirm-updated-draft"
+    )
+    assert json.loads(confirm_result.content)["success"] is False
+    assert conversation.active_draft_json["items"][0]["quantity"] == 2
+    assert "confirmation_pending" not in conversation.metadata_json
+    assert (
+        db_session.query(Order)
+        .filter(Order.conversation_id == conversation.id)
+        .count()
+        == 0
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_usage_does_not_rollback_order_confirmation_on_sqlite(db_engine):
     db_session = sessionmaker(bind=db_engine, expire_on_commit=False)()
     try:
@@ -1947,6 +2117,10 @@ async def test_agent_usage_does_not_rollback_order_confirmation_on_sqlite(db_eng
                 }
             ],
             "total_price": 100,
+            "shipping_info": {
+                "phone": "0555123456",
+                "wilaya": "وهران",
+            },
         }
         db_session.commit()
         usage = {
@@ -2703,7 +2877,7 @@ async def test_unconfigured_delivery_policy_is_honest_and_preserves_draft(db_ses
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_stops_at_three_tool_rounds_and_uses_safe_template(
+async def test_agent_loop_returns_final_reply_after_three_tool_rounds(
     db_session,
 ):
     _, _, conversation, _, _ = make_fixture(db_session)
@@ -2712,6 +2886,7 @@ async def test_agent_loop_stops_at_three_tool_rounds_and_uses_safe_template(
             tool_call("search_products", {"query": "Samsung"}),
             tool_call("list_catalog_products", {}),
             tool_call("get_product_details", {"product_name": "Samsung Galaxy"}),
+            LLMResponse(content="Samsung Galaxy costs 100 DZD in the catalog."),
         ]
     )
     engine = ConversationEngine(provider, make_registry())
@@ -2719,9 +2894,50 @@ async def test_agent_loop_stops_at_three_tool_rounds_and_uses_safe_template(
 
     result = await run_turn(engine, db_session, conversation, "Find Samsung")
 
-    assert len(provider.calls) == 3
+    assert len(provider.calls) == 4
     assert "Samsung Galaxy" in result["response"]
     assert "100" in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_model_can_respond_after_tool_limit_is_reported(db_session):
+    _, customer, conversation, _, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            tool_call("search_products", {"query": "Samsung"}, "search"),
+            tool_call("list_catalog_products", {}, "catalog"),
+            tool_call(
+                "get_product_details",
+                {"product_name": "Samsung Galaxy"},
+                "details",
+            ),
+            tool_call("store_info", {}, "limit"),
+            LLMResponse(content="I have the verified product details to help you."),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "mock-freellm-model"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=conversation.store_id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="Find Samsung",
+    )
+
+    assert len(provider.calls) == 5
+    limit_result = next(
+        message
+        for message in provider.calls[4][0]
+        if message.role == "tool" and message.tool_call_id == "limit"
+    )
+    assert json.loads(limit_result.content)["error_code"] == "TOOL_LIMIT_REACHED"
+    assert result["response"] == "I have the verified product details to help you."
 
 
 @pytest.mark.asyncio
@@ -2743,6 +2959,7 @@ async def test_agent_loop_does_not_execute_repeated_tool_call(db_session):
         [
             tool_call("search_products", {"query": "Samsung"}, "first"),
             tool_call("search_products", {"query": "Samsung"}, "repeat"),
+            LLMResponse(content="Samsung Galaxy is listed in the catalog."),
         ]
     )
     engine = ConversationEngine(provider, registry)
@@ -2751,7 +2968,7 @@ async def test_agent_loop_does_not_execute_repeated_tool_call(db_session):
     result = await run_turn(engine, db_session, conversation, "Find Samsung")
 
     assert search_tool.execution_count == 1
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 3
     assert "Samsung Galaxy" in result["response"]
 
 
@@ -2799,6 +3016,7 @@ async def test_failed_agent_tool_preserves_draft_and_returns_recoverable_reply(
     db_session,
 ):
     _, _, conversation, product, variant = make_fixture(db_session, with_draft=True)
+    conversation.channel = "facebook"
     conversation.metadata_json = {
         "commerce_stage": "DRAFT_PENDING",
         "selected_product_id": str(product.id),
@@ -2845,6 +3063,7 @@ async def test_failed_agent_tool_preserves_draft_and_returns_recoverable_reply(
             RuntimeError("provider unavailable after tool failure"),
         ]
     )
+    provider.provider_name = "freellm"
     engine = ConversationEngine(provider, registry)
     engine.agent_tool_loop_enabled = True
 
@@ -4193,3 +4412,350 @@ def test_order_create_offer_fallback_does_not_repeat_stale_question():
     assert response is not None
     assert "نواصل بالخيار" not in response
     assert "دير طلب" in response
+@pytest.mark.asyncio
+async def test_messenger_freellm_creates_draft_from_selected_product_and_variant(
+    db_session,
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    product.name = "الحذاء"
+    variant.name = "أسود"
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "selected_attributes": {"color": "black"},
+    }
+    conversation.active_draft_json = None
+    db_session.commit()
+
+    provider = ScriptedToolProvider(
+        [
+            tool_call(
+                "create_order_draft",
+                {"items": [{"quantity": 1}]},
+                "create-first-draft",
+            ),
+            LLMResponse(
+                content="تم حفظ مسودة طلب الحذاء. أرسل رقم الهاتف والولاية للمتابعة."
+            ),
+        ]
+    )
+    provider.provider_name = "freellm"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="حبيت نشري الحذاء",
+    )
+
+    db_session.refresh(conversation)
+    draft = conversation.active_draft_json
+    assert result["response"] == (
+        "تم حفظ مسودة طلب الحذاء. أرسل رقم الهاتف والولاية للمتابعة."
+    )
+    assert len(draft["items"]) == 1
+    assert draft["items"][0]["variant_id"] == str(variant.id)
+    assert draft["items"][0]["quantity"] == 1
+    assert draft["items"][0]["unit_price"] == 100.0
+    assert draft["total_price"] == 100.0
+    assert conversation.metadata_json["last_question_type"] == (
+        "CUSTOMER_DELIVERY_INFO"
+    )
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+    assert db_session.query(InventoryItem).filter(
+        InventoryItem.variant_id == variant.id
+    ).one().quantity == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_message", ["قداش سعر الحذاء؟", "شحال يسوى؟"])
+async def test_messenger_price_question_uses_selected_product_facts_without_search(
+    db_session, user_message
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    product.name = "الحذاء"
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [LLMResponse(content="سعر الحذاء هو 100 دج.")]
+    )
+    provider.provider_name = "freellm"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message=user_message,
+    )
+
+    assert result["response"] == "سعر الحذاء هو 100 دج."
+    assert len(provider.calls) == 1
+    agent_context = json.loads(
+        provider.calls[0][0][1].content.split("\n", 1)[1]
+    )
+    assert agent_context["verified_facts"]["products"] == [
+        {"name": "الحذاء", "price": 100.0}
+    ]
+    assert agent_context["verified_facts"]["variants"][0]["final_price"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_executes_multiple_tool_calls_before_final_reply(db_session):
+    _, _, conversation, _, _ = make_fixture(db_session)
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    {
+                        "id": "search",
+                        "name": "search_products",
+                        "arguments": {"query": "Samsung"},
+                    },
+                    {
+                        "id": "catalog",
+                        "name": "list_catalog_products",
+                        "arguments": {},
+                    },
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="The catalog includes Samsung Galaxy."),
+        ]
+    )
+    engine = ConversationEngine(provider, make_registry())
+    engine.agent_tool_loop_enabled = True
+
+    result = await engine._run_agent_tool_loop(
+        db=db_session,
+        store_id=conversation.store_id,
+        customer_id=conversation.customer_id,
+        conversation=conversation,
+        channel="test",
+        user_message="Show me Samsung and the catalog",
+        current_state=engine._normalize_current_state(
+            conversation, conversation.store_id
+        ),
+        dialogue_context=[],
+        language="en",
+    )
+
+    assert result["accepted"] is True
+    assert result["response"] == "The catalog includes Samsung Galaxy."
+    tool_messages = [
+        message for message in provider.calls[1][0] if message.role == "tool"
+    ]
+    assert {message.tool_call_id for message in tool_messages} == {
+        "search",
+        "catalog",
+    }
+
+
+@pytest.mark.asyncio
+async def test_shipping_details_update_active_draft_without_changing_items(db_session):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.active_draft_json = {
+        "draft_id": "draft-shipping-test",
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+                "available_stock": 5,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    db_session.commit()
+
+    result = await UpdateOrderDraftTool().execute(
+        store.id,
+        {
+            "action": "set_shipping",
+            "shipping_info": {
+                "phone": "0550123456",
+                "wilaya": "الجزائر",
+                "municipality": "باب الزوار",
+            },
+        },
+        {
+            "db": db_session,
+            "conversation_id": conversation.id,
+        },
+    )
+
+    db_session.refresh(conversation)
+    assert result.success is True
+    assert conversation.active_draft_json["draft_id"] == "draft-shipping-test"
+    assert conversation.active_draft_json["shipping_info"] == {
+        "phone": "0550123456",
+        "wilaya": "الجزائر",
+        "municipality": "باب الزوار",
+    }
+    assert conversation.active_draft_json["items"][0]["variant_id"] == str(
+        variant.id
+    )
+
+
+@pytest.mark.asyncio
+async def test_freellm_selected_shipping_tool_persists_redacted_phone_and_city(
+    db_session,
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "last_question_type": "CUSTOMER_DELIVERY_INFO",
+    }
+    conversation.active_draft_json = {
+        "draft_id": str(uuid.uuid4()),
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            tool_call(
+                "update_order_draft",
+                {
+                    "action": "set_shipping",
+                    "shipping_info": {"municipality": "باب الزوار"},
+                },
+                "save-shipping",
+            ),
+            LLMResponse(content="I saved the delivery details."),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "mock-freellm-model"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="رقم الهاتف 0550123456، بلدية باب الزوار",
+    )
+
+    db_session.refresh(conversation)
+    shipping = conversation.active_draft_json["shipping_info"]
+    assert result["response"] == "I saved the delivery details."
+    assert shipping["phone"] == "0550123456"
+    assert shipping["municipality"] == "باب الزوار"
+    assert "0550123456" not in "\n".join(
+        message.content or ""
+        for messages, _tools in provider.calls
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_free_agent_cannot_confirm_without_immediate_explicit_approval(db_session):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    prepare_pending_confirmation(conversation, product, variant)
+    db_session.commit()
+    engine = ConversationEngine(ScriptedToolProvider([]), make_registry())
+    state = engine._normalize_current_state(conversation, store.id)
+
+    execution = await engine._dispatch_agent_tool_call_safely(
+        call={
+            "id": "confirmation",
+            "name": "confirm_order",
+            "arguments": {},
+        },
+        user_message="How much is delivery?",
+        language="en",
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation=conversation,
+        channel="facebook",
+        state=state,
+        external_account_id=None,
+        external_user_id=None,
+    )
+
+    assert execution[3].success is False
+    assert execution[3].error_code == "CONFIRMATION_NOT_PENDING"
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+    assert db_session.query(InventoryItem).filter(
+        InventoryItem.variant_id == variant.id
+    ).one().quantity == 5
+
+
+@pytest.mark.asyncio
+async def test_order_confirmation_requires_saved_delivery_details(db_session):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    draft_id = str(uuid.uuid4())
+    conversation.active_draft_json = {
+        "draft_id": draft_id,
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "quantity": 1,
+            }
+        ],
+        "total_price": 100.0,
+    }
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "last_question_type": "ORDER_CONFIRMATION",
+        "confirmation_pending": {"draft_id": draft_id},
+    }
+    db_session.commit()
+
+    result = await ConfirmOrderTool().execute(
+        store.id,
+        {},
+        {
+            "db": db_session,
+            "conversation_id": conversation.id,
+            "customer_id": customer.id,
+        },
+    )
+
+    assert result.success is False
+    assert result.error_code == "SHIPPING_INFO_REQUIRED"
+    assert db_session.query(Order).filter(
+        Order.conversation_id == conversation.id
+    ).count() == 0
+    assert db_session.query(InventoryItem).filter(
+        InventoryItem.variant_id == variant.id
+    ).one().quantity == 5

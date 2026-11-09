@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
 from app.models.conversation import Conversation
+from app.models.customer import Customer
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant
 from app.services.exceptions import NotFoundError, ValidationError
@@ -107,6 +108,26 @@ class ConfirmOrderTool(BaseTool):
                 error_code="CONFIRMATION_NOT_PENDING",
             )
 
+        shipping_info = draft_data.get("shipping_info")
+        shipping_info = shipping_info if isinstance(shipping_info, dict) else {}
+        customer = (
+            db.query(Customer)
+            .filter(
+                Customer.id == customer_id,
+                Customer.store_id == store_id,
+            )
+            .one_or_none()
+        )
+        if not (
+            shipping_info.get("phone")
+            or (customer.phone if customer is not None else None)
+        ) or not shipping_info.get("wilaya"):
+            return ToolResult(
+                success=False,
+                error="A phone number and wilaya are required before confirmation.",
+                error_code="SHIPPING_INFO_REQUIRED",
+            )
+
         items = draft_data["items"]
         if not isinstance(items, list):
             raise ValidationError("Invalid order draft structure.")
@@ -173,9 +194,9 @@ class ConfirmOrderTool(BaseTool):
                 "unit_price": unit_price,
             })
 
-        raw_shipping = draft_data.get("shipping_info")
-        if not isinstance(raw_shipping, dict):
-            raw_shipping = {}
+        raw_shipping = shipping_info
+        if customer is not None and not raw_shipping.get("phone"):
+            raw_shipping = {**raw_shipping, "phone": customer.phone}
 
         new_order = Order(
             store_id=store_id,

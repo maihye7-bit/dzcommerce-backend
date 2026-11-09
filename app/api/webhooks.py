@@ -782,6 +782,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                         external_user_id=sender_id,
                         outbound_suffix=attachment_suffix,
                         image_attachments=stored_images,
+                        inbound_message_id=inbound_message.id,
                     )
                     ai_reply = result.get("response", "")
                     turn_diagnostics = result.get("turn_diagnostics") or {}
@@ -858,21 +859,50 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 response_sent_count = await dispatch_due_deliveries(db, limit=20)
                 if response_sent_count:
                     logger.debug("SEND_OK delivered_count=%d", response_sent_count)
-                elif ai_reply:
-                    logger.error(
-                        "SEND_FAIL delivery_id=%s reply remains pending_or_failed",
-                        delivery_trace_id,
+
+            outbound_delivery_id = turn_diagnostics.get("outbound_delivery_id")
+            outbound_status = "unavailable"
+            if isinstance(outbound_delivery_id, str):
+                try:
+                    outbound_status = (
+                        db.query(OutboundDelivery.status)
+                        .filter(
+                            OutboundDelivery.id == uuid.UUID(outbound_delivery_id)
+                        )
+                        .scalar()
+                        or "missing"
                     )
+                except ValueError:
+                    outbound_status = "invalid_id"
+            if outbound_delivery_id and outbound_status == "failed":
+                logger.error(
+                    "conversation_reply_delivery_failed turn_id=%s "
+                    "outbound_delivery_id=%s",
+                    turn_diagnostics.get("turn_id", ""),
+                    outbound_delivery_id,
+                )
+            elif outbound_delivery_id and outbound_status in {"pending", "sending"}:
+                logger.warning(
+                    "conversation_reply_delivery_unconfirmed turn_id=%s "
+                    "outbound_delivery_id=%s status=%s",
+                    turn_diagnostics.get("turn_id", ""),
+                    outbound_delivery_id,
+                    outbound_status,
+                )
 
             logger.info(
                 (
                     "conversation_delivery delivery_id=%s turn_id=%s intent=%s "
-                    "resolver_action=%s inbound_message_id_present=%s "
-                    "response_candidates=%d responses_sent=%d"
+                    "provider=%s model=%s resolver_action=%s "
+                    "inbound_message_id_present=%s response_candidates=%d "
+                    "responses_sent=%d outbound_delivery_id=%s "
+                    "outbound_status=%s"
                 ),
                 delivery_trace_id,
                 turn_diagnostics.get("turn_id", ""),
                 turn_diagnostics.get("intent", "unknown"),
+                turn_diagnostics.get("provider", "unavailable"),
+                turn_diagnostics.get("model", "unavailable"),
                 turn_diagnostics.get("resolver_action", "unavailable"),
                 bool(external_mid),
                 turn_diagnostics.get(
@@ -880,6 +910,8 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     1 if ai_reply else 0,
                 ),
                 response_sent_count,
+                outbound_delivery_id or "none",
+                outbound_status,
             )
 
     print(f"✅ Processed: {processed_count} | ♻️ Skipped Duplicates: {skipped_duplicates}")

@@ -10,6 +10,7 @@ from PIL import Image
 
 from app.channels.adapters.facebook_adapter import FacebookAdapter
 from app.agent.conversation_engine import ConversationEngine
+from app.agent.providers.base import LLMResponse
 from app.agent.tools import tool_registry
 from app.agent.tools.send_product_image import (
     SendProductImageTool,
@@ -17,7 +18,12 @@ from app.agent.tools.send_product_image import (
 )
 from app.config import settings
 from app.models.channel_identity import ChannelIdentity
-from app.models.conversation import Conversation, ConversationStatus
+from app.models.conversation import (
+    Conversation,
+    ConversationStatus,
+    Message,
+    MessageRole,
+)
 from app.models.customer import Customer
 from app.models.outbound_delivery import OutboundDelivery
 from app.models.product import Product
@@ -276,6 +282,150 @@ async def test_send_product_image_queues_the_meta_identity_without_claiming_deli
     )
     assert image_delivery.status == "pending"
     assert customer.phone == "0550123456"
+
+
+@pytest.mark.asyncio
+async def test_freellm_selected_image_tool_allows_natural_request_and_reports_queue(
+    db_session, monkeypatch
+):
+    store = Store(name="FreeLLM image store", slug=f"freellm-image-{uuid.uuid4()}")
+    db_session.add(store)
+    db_session.flush()
+    customer = Customer(store_id=store.id, name="Messenger customer")
+    db_session.add(customer)
+    db_session.flush()
+    product = Product(
+        store_id=store.id,
+        name="عباية",
+        base_price=Decimal("1000"),
+        is_active=True,
+    )
+    db_session.add(product)
+    db_session.flush()
+    conversation = Conversation(
+        store_id=store.id,
+        customer_id=customer.id,
+        channel="facebook",
+        status=ConversationStatus.ACTIVE,
+        metadata_json={
+            "commerce_stage": "PRODUCT_SELECTED",
+            "selected_product_id": str(product.id),
+            "selected_product_name": product.name,
+            "external_account_id": "messenger-page",
+        },
+    )
+    db_session.add(conversation)
+    db_session.add(
+        ChannelIdentity(
+            store_id=store.id,
+            customer_id=customer.id,
+            channel="facebook",
+            external_account_id="messenger-page",
+            external_user_id="customer-psid",
+        )
+    )
+    image = ProductImage(
+        store_id=store.id,
+        product_id=product.id,
+        storage_key="stores/test/freellm-image.png",
+        image_url=f"/api/product-images/{uuid.uuid4()}/content",
+        mime_type="image/png",
+        file_size=20,
+        is_primary=True,
+        display_order=0,
+    )
+    db_session.add(image)
+    db_session.flush()
+    inbound_message = Message(
+        conversation_id=conversation.id,
+        role=MessageRole.CUSTOMER,
+        content="I'd love to see it",
+    )
+    db_session.add(inbound_message)
+    db_session.commit()
+    monkeypatch.setattr(settings, "RAILWAY_PUBLIC_DOMAIN", "shop.example.test")
+    monkeypatch.setattr(
+        product_image_storage,
+        "read_image",
+        lambda _storage_key: SimpleNamespace(is_file=lambda: True),
+    )
+
+    class ScriptedFreeLLM:
+        provider_name = "freellm"
+        model = "mock-freellm-model"
+
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, messages, tools=None, system_prompt=None):
+            self.calls.append((messages, tools))
+            if len(self.calls) == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        {
+                            "id": "send-product-image",
+                            "name": "send_product_image",
+                            "arguments": {},
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            if len(self.calls) == 2:
+                return LLMResponse(
+                    content=(
+                        "The image is queued for delivery; delivery is not confirmed."
+                    )
+                )
+            context = json.loads(messages[1].content.split("\n", 1)[1])
+            assert context["recent_image_deliveries"][0]["status"] == "sent"
+            return LLMResponse(content="The image delivery was confirmed.")
+
+    provider = ScriptedFreeLLM()
+    engine = ConversationEngine(provider, tool_registry)
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="I'd love to see it",
+        external_account_id="messenger-page",
+        external_user_id="customer-psid",
+        inbound_message_id=inbound_message.id,
+    )
+
+    assert result["response"] == (
+        "The image is queued for delivery; delivery is not confirmed."
+    )
+    assert any(
+        tool["function"]["name"] == "send_product_image"
+        for tool in provider.calls[0][1]
+    )
+    tool_result = next(
+        message for message in provider.calls[1][0] if message.role == "tool"
+    )
+    assert '"queued": true' in tool_result.content
+    image_delivery = (
+        db_session.query(OutboundDelivery)
+        .filter(OutboundDelivery.payload_type == "image")
+        .one()
+    )
+    assert image_delivery.status == "pending"
+    assert image_delivery.message_id == inbound_message.id
+    image_delivery.status = "sent"
+    db_session.commit()
+
+    follow_up = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="Did the image arrive?",
+        external_account_id="messenger-page",
+        external_user_id="customer-psid",
+    )
+    assert follow_up["response"] == "The image delivery was confirmed."
 
 
 @pytest.mark.asyncio

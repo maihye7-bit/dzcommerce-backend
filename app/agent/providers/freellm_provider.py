@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class FreeLLMProvider(LLMProvider):
+    provider_name = "freellm"
+
     def __init__(self):
         if not FREE_LLM_API_KEY:
             raise ValueError("FREE_LLM_API_KEY is not set.")
@@ -183,7 +185,4 @@ class FreeLLMProvider(LLMProvider):
             getattr(last_exception, "status_code", None),
         )
 
-        return LLMResponse(
-            content="عذراً، الخدمة مشغولة حالياً. يرجى المحاولة مرة أخرى بعد قليل.",
-            finish_reason="error",
-        )
+        return LLMResponse(content="", finish_reason="error")

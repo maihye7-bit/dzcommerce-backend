@@ -49,7 +49,13 @@ class CreateOrderDraftTool(BaseTool):
                 },
                 "shipping_info": {
                     "type": "object",
-                    "additionalProperties": True,
+                    "properties": {
+                        "phone": {"type": "string"},
+                        "wilaya": {"type": "string"},
+                        "municipality": {"type": "string"},
+                        "address": {"type": "string"},
+                    },
+                    "additionalProperties": False,
                 },
             },
             "required": ["items"],
@@ -99,10 +105,24 @@ class CreateOrderDraftTool(BaseTool):
                             for i in draft_data["items"]
                         ],
                     },
+                    "delivery_details": {
+                        "phone_provided": bool(
+                            (draft_data.get("shipping_info") or {}).get("phone")
+                        ),
+                        "wilaya": (draft_data.get("shipping_info") or {}).get(
+                            "wilaya"
+                        ),
+                        "municipality": (
+                            draft_data.get("shipping_info") or {}
+                        ).get("municipality"),
+                        "address_provided": bool(
+                            (draft_data.get("shipping_info") or {}).get("address")
+                        ),
+                    },
                         "instruction": (
                             "Do not confirm the final order. The conversation engine "
-                            "collects missing phone and wilaya details, then asks the "
-                            "customer to write the exact phrase 'أكد الطلب'."
+                            "will continue the conversation and require explicit "
+                            "customer approval before placing the order."
                         ),
                     },
             )

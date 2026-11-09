@@ -24,8 +24,9 @@ class UpdateOrderDraftTool(BaseTool):
         return (
             "Updates the current order draft. Can add new items, remove items, "
             "change quantities, or replace a selected item's variant when the "
-            "customer explicitly requests the change. Always validates against "
-            "latest DB prices and stock."
+            "customer explicitly requests the change. Can also update shipping "
+            "details without changing items. Always validates against latest DB "
+            "prices and stock."
         )
 
     @property
@@ -35,7 +36,13 @@ class UpdateOrderDraftTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "remove", "set", "replace"],
+                    "enum": [
+                        "add",
+                        "remove",
+                        "set",
+                        "replace",
+                        "set_shipping",
+                    ],
                     "description": "Operation to perform."
                 },
                 "variant_id": {
@@ -54,9 +61,19 @@ class UpdateOrderDraftTool(BaseTool):
                 "quantity": {
                     "type": "integer",
                     "description": "New quantity (for add/set)."
-                }
+                },
+                "shipping_info": {
+                    "type": "object",
+                    "properties": {
+                        "phone": {"type": "string"},
+                        "wilaya": {"type": "string"},
+                        "municipality": {"type": "string"},
+                        "address": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
             },
-            "required": ["action", "variant_id"],
+            "required": ["action"],
         }
 
     async def execute(
@@ -74,6 +91,78 @@ class UpdateOrderDraftTool(BaseTool):
                 return ToolResult(success=False, error="Missing conversation context.")
 
             action = args["action"]
+            if action == "set_shipping":
+                shipping_info = args.get("shipping_info")
+                if (
+                    not isinstance(shipping_info, dict)
+                    or not shipping_info
+                    or set(shipping_info)
+                    - {"phone", "wilaya", "municipality", "address"}
+                    or any(
+                        not isinstance(value, str)
+                        or not value.strip()
+                        or len(value.strip()) > 160
+                        for value in shipping_info.values()
+                    )
+                ):
+                    return ToolResult(
+                        success=False,
+                        error="Valid shipping details are required.",
+                        error_code="VALIDATION_ERROR",
+                    )
+                current_draft = get_current_draft(db, conversation_id)
+                if not current_draft:
+                    return ToolResult(
+                        success=False,
+                        error="No active draft found to update.",
+                    )
+                existing_shipping = current_draft.get("shipping_info")
+                merged_shipping = (
+                    dict(existing_shipping)
+                    if isinstance(existing_shipping, dict)
+                    else {}
+                )
+                merged_shipping.update(
+                    {
+                        key: value.strip()
+                        for key, value in shipping_info.items()
+                    }
+                )
+                updated_draft = update_draft_items(
+                    db=db,
+                    conversation_id=conversation_id,
+                    store_id=store_id,
+                    items=[
+                        {
+                            "variant_id": item["variant_id"],
+                            "quantity": item["quantity"],
+                        }
+                        for item in current_draft.get("items", [])
+                        if isinstance(item, dict)
+                    ],
+                    shipping_info=merged_shipping,
+                )
+                return ToolResult(
+                    success=True,
+                    data={
+                        "message": "Draft shipping details updated.",
+                        "total_price": updated_draft["total_price"],
+                        "item_count": len(updated_draft["items"]),
+                        "delivery_details": {
+                            "phone_provided": bool(
+                                updated_draft["shipping_info"].get("phone")
+                            ),
+                            "wilaya": updated_draft["shipping_info"].get("wilaya"),
+                            "municipality": updated_draft["shipping_info"].get(
+                                "municipality"
+                            ),
+                            "address_provided": bool(
+                                updated_draft["shipping_info"].get("address")
+                            ),
+                        },
+                    },
+                )
+
             variant_id_str = args["variant_id"]
             quantity = args.get("quantity", 1)
 

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.tools.base import BaseTool, ToolResult
 from app.models.channel_identity import ChannelIdentity
-from app.models.conversation import Conversation
+from app.models.conversation import Conversation, Message, MessageRole
 from app.models.customer import Customer
 from app.models.product import Product
 from app.models.product_image import ProductImage
@@ -84,13 +84,10 @@ class SendProductImageTool(BaseTool):
         context: dict[str, Any] | None = None,
     ) -> ToolResult:
         context = context or {}
-        if (
-            context.get("channel") != "facebook"
-            or not is_product_image_request(context.get("user_message", ""))
-        ):
+        if context.get("channel") != "facebook":
             return ToolResult(
                 success=False,
-                error="An explicit Messenger product-image request is required.",
+                error="Product images can only be sent through Messenger.",
                 error_code="NOT_AUTHORIZED",
             )
 
@@ -108,6 +105,32 @@ class SendProductImageTool(BaseTool):
             )
 
         db: Session = context["db"]
+        inbound_message = None
+        raw_message_id = context.get("inbound_message_id")
+        if raw_message_id is not None:
+            try:
+                message_id = uuid.UUID(str(raw_message_id))
+            except (ValueError, TypeError, AttributeError):
+                return ToolResult(
+                    success=False,
+                    error="The Messenger request context is unavailable.",
+                    error_code="NOT_FOUND",
+                )
+            inbound_message = (
+                db.query(Message)
+                .filter(
+                    Message.id == message_id,
+                    Message.conversation_id == conversation_id,
+                    Message.role == MessageRole.CUSTOMER,
+                )
+                .one_or_none()
+            )
+            if inbound_message is None:
+                return ToolResult(
+                    success=False,
+                    error="The Messenger request context is unavailable.",
+                    error_code="NOT_FOUND",
+                )
         conversation = (
             db.query(Conversation)
             .filter(
@@ -224,6 +247,7 @@ class SendProductImageTool(BaseTool):
         delivery = enqueue_delivery(
             db,
             conversation_id=conversation.id,
+            message_id=inbound_message.id if inbound_message is not None else None,
             channel="facebook",
             external_account_id=external_account_id,
             recipient_external_id=identity.external_user_id,
