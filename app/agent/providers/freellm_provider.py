@@ -105,10 +105,22 @@ class FreeLLMProvider(LLMProvider):
                 latency_ms = int((time.time() - start_time) * 1000)
                 choice = response.choices[0]
                 msg = choice.message
+                reported_model = getattr(response, "model", None)
+                request_id = getattr(response, "id", None)
 
                 usage_data = response.usage
                 input_tokens = usage_data.prompt_tokens if usage_data else 0
                 output_tokens = usage_data.completion_tokens if usage_data else 0
+                response_metadata = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "latency_ms": latency_ms,
+                    "reported_model": (
+                        reported_model if isinstance(reported_model, str) else None
+                    ),
+                    "requested_model": self.model,
+                    "request_id": request_id if isinstance(request_id, str) else None,
+                }
 
                 # Handle Tool Calls
                 if msg.tool_calls:
@@ -128,24 +140,14 @@ class FreeLLMProvider(LLMProvider):
                         content=msg.content,
                         tool_calls=tool_calls,
                         finish_reason="tool_calls",
-                        usage={
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "latency_ms": latency_ms,
-                            "model": self.model,
-                        },
+                        usage=response_metadata,
                     )
 
                 # Normal text response
                 return LLMResponse(
                     content=msg.content or "",
                     finish_reason=choice.finish_reason,
-                    usage={
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "latency_ms": latency_ms,
-                        "model": self.model,
-                    },
+                    usage=response_metadata,
                 )
 
             except (RateLimitError, APITimeoutError, APIError) as e:
@@ -156,6 +158,7 @@ class FreeLLMProvider(LLMProvider):
                 should_retry = (
                     isinstance(e, RateLimitError) or
                     isinstance(e, APITimeoutError) or
+                    error_code in {408, 425, 429} or
                     (isinstance(error_code, int) and error_code >= 500)
                 )
 
@@ -179,10 +182,24 @@ class FreeLLMProvider(LLMProvider):
 
         # If we reach here, all attempts failed
         logger.error(
-            "FreeLLM request failed after %s attempts (error_type=%s, status_code=%s)",
+            "FreeLLM request failed after %s attempts (error_type=%s, "
+            "status_code=%s, request_id=%s)",
             self.max_retries + 1,
             type(last_exception).__name__ if last_exception else "unknown",
             getattr(last_exception, "status_code", None),
+            getattr(last_exception, "request_id", None) or "unavailable",
         )
 
-        return LLMResponse(content="", finish_reason="error")
+        return LLMResponse(
+            content="",
+            finish_reason="error",
+            usage={
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "requested_model": self.model,
+                "request_id": getattr(last_exception, "request_id", None),
+                "error_type": (
+                    type(last_exception).__name__ if last_exception else "unknown"
+                ),
+                "status_code": getattr(last_exception, "status_code", None),
+            },
+        )

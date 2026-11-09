@@ -32,7 +32,7 @@ from app.agent.commerce_resolver import CommerceResolver, ResolutionResult, Allo
 from app.agent.reply_composer import ReplyComposer
 from app.agent.classifier import ConversationClassifier, classify_message
 from app.agent.tools.send_product_image import is_product_image_request
-from app.core.config import QWEN_TIMEOUT
+from app.core.config import FREE_LLM_TIMEOUT, QWEN_TIMEOUT
 from app.models.conversation import (
     Conversation,
     ConversationStatus,
@@ -149,7 +149,11 @@ class ConversationEngine:
             )
             configured_rounds = MAX_TOOL_ROUNDS
         self.max_tool_rounds = max(1, min(configured_rounds, MAX_TOOL_ROUNDS))
-        self.agent_tool_loop_timeout_seconds = max(1, int(QWEN_TIMEOUT))
+        provider_name = getattr(llm_provider, "provider_name", None)
+        configured_timeout = (
+            FREE_LLM_TIMEOUT if provider_name == "freellm" else QWEN_TIMEOUT
+        )
+        self.agent_tool_loop_timeout_seconds = max(1, int(configured_timeout))
         self.reply_composer_enabled = os.getenv(
             "DZCOMMERCE_REPLY_COMPOSER_ENABLED", "true"
         ).strip().lower() not in {"0", "false", "no", "off"}
@@ -725,6 +729,9 @@ class ConversationEngine:
                 facts["variants"].append(
                     {
                         "name": variant.name,
+                        "attributes": self._safe_nlu_attributes(
+                            variant.attributes_json
+                        ),
                         "index": None,
                         "final_price": float(product.base_price)
                         + float(variant.price_adjustment or 0),
@@ -887,13 +894,31 @@ class ConversationEngine:
     def _merge_agent_facts(
         current: dict[str, Any],
         incoming: dict[str, Any],
+        *,
+        replace_product_facts: bool = False,
     ) -> dict[str, Any]:
         merged = dict(current)
+        if replace_product_facts:
+            for key in (
+                "products",
+                "variants",
+                "available_variants",
+                "product_images",
+            ):
+                merged[key] = []
         for key, value in incoming.items():
             if isinstance(value, list):
-                existing = list(merged.get(key) or [])
-                existing.extend(value)
-                merged[key] = existing
+                if replace_product_facts and key in {
+                    "products",
+                    "variants",
+                    "available_variants",
+                    "product_images",
+                }:
+                    merged[key] = list(value)
+                else:
+                    existing = list(merged.get(key) or [])
+                    existing.extend(value)
+                    merged[key] = existing
             elif isinstance(value, dict):
                 merged[key] = {**(merged.get(key) or {}), **value}
             else:
@@ -1088,7 +1113,7 @@ class ConversationEngine:
         provider: Any,
     ) -> None:
         usage = getattr(response, "usage", None) or {}
-        if not usage:
+        if not usage or usage.get("error_type"):
             return
         bind = db.get_bind()
         if bind.dialect.name == "sqlite":
@@ -1110,7 +1135,15 @@ class ConversationEngine:
                     db=db,
                     store_id=store_id,
                     provider=provider_name,
-                    model=usage.get("model") or getattr(provider, "model", "unknown"),
+                    model=(
+                        usage.get("reported_model")
+                        or usage.get("model")
+                        or (
+                            "unreported"
+                            if getattr(provider, "model", None) == "auto"
+                            else getattr(provider, "model", "unknown")
+                        )
+                    ),
                     input_tokens=int(usage.get("input_tokens", 0)),
                     output_tokens=int(usage.get("output_tokens", 0)),
                     latency_ms=int(usage.get("latency_ms", 0)),
@@ -1282,6 +1315,16 @@ class ConversationEngine:
             not isinstance(reply, str)
             or not reply.strip()
             or any(ord(char) < 32 and char not in "\n\t" for char in reply)
+            or "\ufffd" in reply
+            or any(0xD800 <= ord(char) <= 0xDFFF for char in reply)
+            or len(
+                re.findall(
+                    r"(?:[ØÙ][\u0080-\u00ff\u2000-\u206f]|"
+                    r"[ÃÂ][\u0080-\u00ff])",
+                    reply,
+                )
+            )
+            >= 2
             or re.search(
                 r"\b(?:product_id|variant_id|order_id|store_id|customer_id|"
                 r"conversation_id|api[_ -]?key|access[_ -]?token|secret)\b",
@@ -1535,6 +1578,12 @@ class ConversationEngine:
                     "- Product names, prices, options, stock, promotions, and order "
                     "status must come from verified tool/database results. Admit "
                     "uncertainty when facts are missing.\n"
+                    "- In product details, `name` is the catalog variant label and "
+                    "`attributes` are the stored structured properties. Do not treat "
+                    "a generic label such as Standard as a size or color when the "
+                    "structured attributes show a different value. The latest "
+                    "successful product-tool result is authoritative for that "
+                    "product; earlier tool results remain history, not overrides.\n"
                     "- For a price question about the selected or last-discussed "
                     "product, answer from its verified price and selected variant "
                     "price in verified_facts/conversation context. Do not send the "
@@ -1591,6 +1640,9 @@ class ConversationEngine:
         executed_count = 0
         executed_tools: list[str] = []
         model_call_count = 0
+        model_calls: list[dict[str, Any]] = []
+        provider_failure_retries = 0
+        reply_repair_attempts = 0
 
         async def safe_fallback() -> dict[str, Any]:
             fallback = await self._agent_loop_safe_fallback(
@@ -1602,12 +1654,14 @@ class ConversationEngine:
                 last_tool_result,
             )
             fallback["executed_tools"] = list(executed_tools)
+            fallback["model_calls"] = list(model_calls)
             return fallback
 
-        for _ in range(self.max_tool_rounds + 2):
+        for _ in range(self.max_tool_rounds + 4):
             model_call_count += 1
             logger.info(
-                "agent_model_call_started turn_id=%s provider=%s model=%s call=%d",
+                "agent_model_call_started turn_id=%s provider=%s "
+                "requested_model=%s call=%d",
                 trace_turn_id,
                 provider_name,
                 model_name,
@@ -1619,15 +1673,37 @@ class ConversationEngine:
                     timeout=self.agent_tool_loop_timeout_seconds,
                 )
             except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                retryable = (
+                    provider_name == "freellm"
+                    and (
+                        isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                        or status_code in {408, 425, 429}
+                        or (isinstance(status_code, int) and status_code >= 500)
+                        or "connection" in type(exc).__name__.casefold()
+                    )
+                )
+                model_calls.append(
+                    {
+                        "reported_model": None,
+                        "request_id": getattr(exc, "request_id", None),
+                        "error_type": type(exc).__name__,
+                    }
+                )
                 logger.warning(
                     "agent_model_call_failed turn_id=%s provider=%s model=%s "
-                    "call=%d error_type=%s",
+                    "call=%d error_type=%s retryable=%s timeout_seconds=%s",
                     trace_turn_id,
                     provider_name,
                     model_name,
                     model_call_count,
                     type(exc).__name__,
+                    retryable,
+                    self.agent_tool_loop_timeout_seconds,
                 )
+                if retryable and provider_failure_retries < 1:
+                    provider_failure_retries += 1
+                    continue
                 return await safe_fallback()
             self._record_agent_usage(
                 response,
@@ -1636,16 +1712,75 @@ class ConversationEngine:
                 conversation.id,
                 self.llm,
             )
+            response_usage = getattr(response, "usage", None)
+            response_usage = (
+                response_usage if isinstance(response_usage, dict) else {}
+            )
+            reported_model = response_usage.get("reported_model")
+            request_id = response_usage.get("request_id")
+            model_calls.append(
+                {
+                    "reported_model": (
+                        reported_model
+                        if isinstance(reported_model, str)
+                        else None
+                    ),
+                    "request_id": request_id if isinstance(request_id, str) else None,
+                    "error_type": response_usage.get("error_type"),
+                }
+            )
             if getattr(response, "finish_reason", None) == "error":
+                error_type = response_usage.get("error_type")
+                status_code = response_usage.get("status_code")
+                retryable = (
+                    provider_name == "freellm"
+                    and (
+                        error_type
+                        in {
+                            "APITimeoutError",
+                            "APIConnectionError",
+                            "RateLimitError",
+                            "TimeoutError",
+                        }
+                        or status_code in {408, 425, 429}
+                        or (
+                            isinstance(status_code, int)
+                            and status_code >= 500
+                        )
+                    )
+                )
+                logger.warning(
+                    "agent_model_response_error turn_id=%s provider=%s "
+                    "requested_model=%s call=%d error_type=%s status_code=%s "
+                    "request_id=%s retryable=%s",
+                    trace_turn_id,
+                    provider_name,
+                    model_name,
+                    model_call_count,
+                    error_type or "unknown",
+                    status_code or "unknown",
+                    request_id or "unavailable",
+                    retryable,
+                )
+                if retryable and provider_failure_retries < 1:
+                    provider_failure_retries += 1
+                    continue
                 return await safe_fallback()
 
             calls = getattr(response, "tool_calls", None) or []
             content = (getattr(response, "content", None) or "").strip()
-            logger.info(
+            call_trace = (
+                logger.info
+                if logger.isEnabledFor(logging.INFO)
+                else logger.warning
+            )
+            call_trace(
                 "agent_model_call_completed turn_id=%s call=%d "
-                "selected_tools=%s",
+                "reported_model=%s request_id=%s selected_tools=%s",
                 trace_turn_id,
                 model_call_count,
+                reported_model or "unavailable",
+                request_id or "unavailable",
                 json.dumps(
                     [
                         str(call.get("name") or "invalid_tool")
@@ -1697,17 +1832,18 @@ class ConversationEngine:
 
             if not calls:
                 current_facts = facts
-                for message in messages:
-                    if message.role == "tool" and message.content:
-                        try:
-                            tool_facts = json.loads(message.content)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                        if isinstance(tool_facts, dict):
-                            current_facts = self._merge_agent_facts(
-                                current_facts,
-                                tool_facts,
-                            )
+                if provider_name != "freellm":
+                    for message in messages:
+                        if message.role == "tool" and message.content:
+                            try:
+                                tool_facts = json.loads(message.content)
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                            if isinstance(tool_facts, dict):
+                                current_facts = self._merge_agent_facts(
+                                    current_facts,
+                                    tool_facts,
+                                )
                 if (
                     self._is_secure_agent_reply(content)
                     if getattr(self.llm, "provider_name", None) == "freellm"
@@ -1730,7 +1866,7 @@ class ConversationEngine:
                         "reply=%s",
                         trace_turn_id,
                         provider_name,
-                        model_name,
+                        reported_model or "unavailable",
                         self._trace_safe_text(content),
                     )
                     if last_decision is None:
@@ -1752,8 +1888,25 @@ class ConversationEngine:
                         "tool_name": last_tool_name,
                         "tool_result": last_tool_result,
                         "executed_tools": executed_tools,
+                        "model_calls": list(model_calls),
                         "response": content,
                     }
+                if provider_name == "freellm" and reply_repair_attempts < 1:
+                    reply_repair_attempts += 1
+                    messages.append(
+                        LLMMessage(
+                            role="user",
+                            content=(
+                                "Your previous response could not be delivered "
+                                "because it was empty, malformed, or had invalid "
+                                "text encoding. Produce a complete natural-language "
+                                "reply in the customer's language, using the existing "
+                                "verified facts and tool results. You may call a tool "
+                                "if needed; do not invent facts."
+                            ),
+                        )
+                    )
+                    continue
                 return await safe_fallback()
 
             normalized_calls = [
@@ -1863,6 +2016,13 @@ class ConversationEngine:
                         self._agent_result_facts(
                             executed_tool_name, tool_result.data
                         ),
+                        replace_product_facts=executed_tool_name
+                        in {
+                            "search_products",
+                            "get_product_details",
+                            "list_catalog_products",
+                            "recommend_products",
+                        },
                     )
                 safe_result = (
                     {
@@ -4813,6 +4973,12 @@ class ConversationEngine:
             else []
         )
         tool_result = result.get("tool_result") if isinstance(result, dict) else None
+        model_calls = (
+            result.get("model_calls", [])
+            if isinstance(result, dict)
+            and isinstance(result.get("model_calls"), list)
+            else []
+        )
         if any(
             name in {"create_order_draft", "update_order_draft"}
             for name in executed_tools
@@ -4904,13 +5070,34 @@ class ConversationEngine:
             outbound_delivery_id = str(delivery.id)
         db.commit()
         provider_name = getattr(self.llm, "provider_name", None) or "unknown"
-        model_name = getattr(self.llm, "model", None) or "unknown"
+        requested_model = getattr(self.llm, "model", None) or "unknown"
+        actual_models = list(
+            dict.fromkeys(
+                call["reported_model"]
+                for call in model_calls
+                if isinstance(call, dict)
+                and isinstance(call.get("reported_model"), str)
+                and call["reported_model"]
+            )
+        )
+        request_ids = [
+            call["request_id"]
+            for call in model_calls
+            if isinstance(call, dict)
+            and isinstance(call.get("request_id"), str)
+            and call["request_id"]
+        ]
+        reported_model = actual_models[-1] if actual_models else "unavailable"
         logger.info(
-            "agent_turn_final turn_id=%s provider=%s model=%s tools_selected=%s "
-            "outbound_delivery_id=%s response=%s",
+            "agent_turn_final turn_id=%s provider=%s requested_model=%s "
+            "reported_models=%s request_ids=%s model_call_count=%d "
+            "tools_selected=%s outbound_delivery_id=%s response=%s",
             turn_id,
             provider_name,
-            model_name,
+            requested_model,
+            json.dumps(actual_models, ensure_ascii=False),
+            json.dumps(request_ids, ensure_ascii=False),
+            len(model_calls),
             json.dumps(
                 result.get("executed_tools", [])
                 if isinstance(result, dict)
@@ -4932,7 +5119,11 @@ class ConversationEngine:
                 "response_candidates": 1,
                 "responses_returned": 1,
                 "provider": provider_name,
-                "model": model_name,
+                "model": reported_model,
+                "requested_model": requested_model,
+                "models_reported": actual_models,
+                "request_ids": request_ids,
+                "model_call_count": len(model_calls),
                 "outbound_delivery_id": outbound_delivery_id,
             },
         }

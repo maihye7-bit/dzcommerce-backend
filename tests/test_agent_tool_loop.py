@@ -17,7 +17,7 @@ from app.agent.classifier import (
 )
 from app.agent.commerce_resolver import CommerceResolver, ResolutionResult
 from app.agent.conversation_engine import ConversationEngine
-from app.agent.providers.base import LLMResponse
+from app.agent.providers.base import LLMMessage, LLMResponse
 from app.agent.providers.freellm_provider import FreeLLMProvider
 from app.agent.tools.base import BaseTool, ToolResult
 from app.agent.tools.check_inventory import CheckInventoryTool
@@ -61,7 +61,7 @@ class ScriptedToolProvider:
         return response
 
 
-def openai_chat_response(*, content=None, tool_call=None):
+def openai_chat_response(*, content=None, tool_call=None, model=None, request_id=None):
     message = SimpleNamespace(content=content, tool_calls=[])
     finish_reason = "stop"
     if tool_call is not None:
@@ -78,6 +78,8 @@ def openai_chat_response(*, content=None, tool_call=None):
     return SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        model=model,
+        id=request_id,
     )
 
 
@@ -785,6 +787,336 @@ def test_freellm_tool_schemas_expose_customer_tools_and_shipping_fields(db_sessi
         "properties"
     ]
     assert FreeLLMProvider.provider_name == "freellm"
+
+
+@pytest.mark.asyncio
+async def test_freellm_provider_exposes_reported_model_and_request_id():
+    provider = make_mock_freellm_provider(
+        [
+            openai_chat_response(
+                content="Hello.",
+                model="provider-selected-model",
+                request_id="completion-request-id",
+            )
+        ]
+    )
+
+    response = await provider.chat(
+        [LLMMessage(role="user", content="Hello")],
+    )
+
+    assert response.usage["reported_model"] == "provider-selected-model"
+    assert response.usage["requested_model"] == "auto"
+    assert response.usage["request_id"] == "completion-request-id"
+
+
+def test_freellm_agent_loop_uses_freellm_timeout_setting(monkeypatch):
+    monkeypatch.setattr("app.agent.conversation_engine.QWEN_TIMEOUT", 7)
+    monkeypatch.setattr("app.agent.conversation_engine.FREE_LLM_TIMEOUT", 41)
+    provider = SimpleNamespace(provider_name="freellm", model="auto")
+
+    engine = ConversationEngine(provider, make_registry())
+
+    assert engine.agent_tool_loop_timeout_seconds == 41
+
+
+@pytest.mark.asyncio
+async def test_freellm_preserves_auto_model_switch_and_verified_product_attributes(
+    db_session,
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "commerce_stage": "VARIANT_SELECTED",
+    }
+    product.name = "عباية"
+    variant.name = "Standard"
+    variant.attributes_json = {"size": "XL", "color": "black"}
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    {
+                        "id": "size-search",
+                        "name": "search_products",
+                        "arguments": {"query": "عباية"},
+                    }
+                ],
+                finish_reason="tool_calls",
+                usage={
+                    "reported_model": "auto-model-a",
+                    "request_id": "request-a",
+                },
+            ),
+            LLMResponse(
+                tool_calls=[
+                    {
+                        "id": "size-details",
+                        "name": "get_product_details",
+                        "arguments": {},
+                    }
+                ],
+                finish_reason="tool_calls",
+                usage={
+                    "reported_model": "auto-model-b",
+                    "request_id": "request-b",
+                },
+            ),
+            LLMResponse(
+                content="العباية متوفرة بمقاس XL.",
+                usage={
+                    "reported_model": "auto-model-b",
+                    "request_id": "request-c",
+                },
+            ),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "auto"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="عندكم مقاسات؟",
+    )
+
+    assert result["response"] == "العباية متوفرة بمقاس XL."
+    assert result["turn_diagnostics"]["requested_model"] == "auto"
+    assert result["turn_diagnostics"]["models_reported"] == [
+        "auto-model-a",
+        "auto-model-b",
+    ]
+    assert result["turn_diagnostics"]["model"] == "auto-model-b"
+    assert result["turn_diagnostics"]["request_ids"] == [
+        "request-a",
+        "request-b",
+        "request-c",
+    ]
+    assert conversation.metadata_json["selected_product_id"] == str(product.id)
+    assert conversation.metadata_json["selected_variant_id"] == str(variant.id)
+
+    tool_results = [
+        message
+        for message in provider.calls[2][0]
+        if message.role == "tool"
+    ]
+    assert [message.tool_call_id for message in tool_results] == [
+        "size-search",
+        "size-details",
+    ]
+    details_result = json.loads(tool_results[1].content)
+    assert details_result["product"]["name"] == "عباية"
+    assert details_result["variants"][0]["name"] == "Standard"
+    assert details_result["variants"][0]["attributes"] == {
+        "size": "XL",
+        "color": "black",
+    }
+    assert "size" in provider.calls[0][1][1]["function"]["description"].lower()
+
+
+@pytest.mark.asyncio
+async def test_freellm_retries_a_transient_provider_error_before_fallback(db_session):
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(
+                finish_reason="error",
+                usage={
+                    "error_type": "APITimeoutError",
+                    "status_code": None,
+                    "requested_model": "auto",
+                },
+            ),
+            LLMResponse(
+                content="نقدر نعاونك، خذي راحتك.",
+                usage={
+                    "reported_model": "auto-model-b",
+                    "request_id": "retry-request",
+                },
+            ),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "auto"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="اكن انا حزين",
+    )
+
+    assert result["response"] == "نقدر نعاونك، خذي راحتك."
+    assert len(provider.calls) == 2
+    assert result["turn_diagnostics"]["model"] == "auto-model-b"
+    assert result["turn_diagnostics"]["request_ids"] == ["retry-request"]
+
+
+@pytest.mark.asyncio
+async def test_freellm_can_continue_after_a_recoverable_tool_failure(db_session):
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            tool_call(
+                "search_products",
+                {"query": "catalog-item-that-does-not-exist"},
+                "missing-product-search",
+            ),
+            LLMResponse(
+                content="لم أجد هذا المنتج. هل تقدر توصفه لي بطريقة أخرى؟"
+            ),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "auto"
+
+    result = await ConversationEngine(
+        provider, make_registry()
+    ).process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="ابحث عن هذا المنتج",
+    )
+
+    assert result["response"] == (
+        "لم أجد هذا المنتج. هل تقدر توصفه لي بطريقة أخرى؟"
+    )
+    assert len(provider.calls) == 2
+    tool_result = provider.calls[1][0][-1]
+    assert tool_result.role == "tool"
+    assert tool_result.tool_call_id == "missing-product-search"
+    assert json.loads(tool_result.content)["error_code"] == "NO_RESULTS"
+
+
+@pytest.mark.asyncio
+async def test_freellm_social_message_is_not_routed_into_commerce_tools(db_session):
+    store, customer, conversation, product, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "commerce_stage": "PRODUCT_SELECTED",
+    }
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [LLMResponse(content="أنا هنا إذا حبيت تهدر، خذ وقتك.")]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "auto"
+
+    result = await ConversationEngine(
+        provider, make_registry()
+    ).process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="اكن انا حزين",
+    )
+
+    assert result["response"] == "أنا هنا إذا حبيت تهدر، خذ وقتك."
+    assert provider.calls[0][0][-1].role == "user"
+    assert "اكن انا حزين" in provider.calls[0][0][-1].content
+    assert provider.calls[0][1]
+    assert conversation.active_draft_json is None
+
+
+@pytest.mark.asyncio
+async def test_freellm_repairs_mojibake_before_persisting_or_sending(db_session):
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    db_session.commit()
+    malformed = "Ø§Ù„Ù…Ø³Ø§Ø¹Ø¯ ØºÙŠØ± Ù…Ù�Ù‡ÙˆÙ…"
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(content=malformed),
+            LLMResponse(content="نقدر نعاونك، وضح لي واش تحتاج."),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "auto"
+
+    result = await ConversationEngine(
+        provider, make_registry()
+    ).process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="مانيش عارف وش نختار",
+    )
+
+    assert result["response"] == "نقدر نعاونك، وضح لي واش تحتاج."
+    assert len(provider.calls) == 2
+    assert malformed not in result["response"]
+    agent_messages = (
+        db_session.query(Message)
+        .filter(
+            Message.conversation_id == conversation.id,
+            Message.role == MessageRole.AGENT,
+        )
+        .all()
+    )
+    assert [message.content for message in agent_messages] == [result["response"]]
+
+
+@pytest.mark.asyncio
+async def test_freellm_retries_an_empty_reply_before_persisting(db_session):
+    store, customer, conversation, _, _ = make_fixture(db_session)
+    conversation.channel = "facebook"
+    db_session.commit()
+    provider = ScriptedToolProvider(
+        [
+            LLMResponse(content=""),
+            LLMResponse(content="نقدر نعاونك، قل لي واش راك تبحث عليه."),
+        ]
+    )
+    provider.provider_name = "freellm"
+    provider.model = "auto"
+
+    result = await ConversationEngine(
+        provider, make_registry()
+    ).process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="مانيش عارف وش نختار",
+    )
+
+    assert result["response"] == "نقدر نعاونك، قل لي واش راك تبحث عليه."
+    assert len(provider.calls) == 2
+    persisted_reply = (
+        db_session.query(Message)
+        .filter(
+            Message.conversation_id == conversation.id,
+            Message.role == MessageRole.AGENT,
+        )
+        .one()
+        .content
+    )
+    assert persisted_reply == result["response"]
 
 
 @pytest.mark.asyncio
