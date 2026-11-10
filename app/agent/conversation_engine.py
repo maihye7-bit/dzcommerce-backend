@@ -10,6 +10,7 @@ Flow:
 5. Update Context & Respond.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1153,6 +1154,17 @@ class ConversationEngine:
         except (SQLAlchemyError, TypeError, ValueError):
             logger.warning("Failed to record agent-loop provider usage")
 
+    @staticmethod
+    def _compute_draft_fingerprint(draft: dict | None) -> str:
+        """Compute SHA256 fingerprint of orderable draft content."""
+        if not isinstance(draft, dict):
+            return ""
+        content = json.dumps({
+            "items": draft.get("items", []),
+            "shipping_info": draft.get("shipping_info", {})
+        }, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
     async def _dispatch_agent_tool_call_safely(
         self,
         *,
@@ -1168,6 +1180,8 @@ class ConversationEngine:
         external_account_id: str | None,
         external_user_id: str | None,
         inbound_message_id: uuid.UUID | None = None,
+        normalized_calls: list[dict] | None = None,
+        turn_has_draft_mod_ref: list[bool] | None = None,
     ) -> tuple[ResolutionResult, dict[str, Any], str, ToolResult]:
         tool_name = call.get("name")
         arguments = call.get("arguments")
@@ -1183,17 +1197,57 @@ class ConversationEngine:
                 "The tool request is invalid or unavailable.",
                 "VALIDATION_ERROR",
             )
-        if tool_name == "confirm_order" and not (
-            self._is_required_order_confirmation(user_message)
-            and state.get("last_question_type") == "ORDER_CONFIRMATION"
-            and self._has_pending_confirmation(conversation)
-        ):
-            return self._agent_tool_failure(
-                tool_name,
-                language,
-                "An explicit approval for the current pending draft is required.",
-                "CONFIRMATION_NOT_PENDING",
-            )
+
+        pending = conversation.metadata_json.get("confirmation_pending") if conversation.metadata_json else None
+
+        # Enhanced confirm_order gate
+        if tool_name == "confirm_order":
+            # 1. Block if ANY draft-mod tool exists in THIS TURN's calls
+            mod_tools = {"create_order_draft", "update_order_draft", "replace_draft_item_variant"}
+            if normalized_calls and any(c.get("name") in mod_tools for c in normalized_calls):
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "Cannot confirm order in the same turn as a draft modification. The modification must be processed first, then a fresh confirmation requested.",
+                    "CONFIRMATION_BLOCKED_SAME_TURN"
+                )
+
+            # 2. Check pending confirmation exists with valid status
+            if not (pending and pending.get("status") in {"awaiting", "awaiting_final"}):
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "An explicit approval for the current pending draft is required.",
+                    "CONFIRMATION_NOT_PENDING"
+                )
+
+            # 3. Verify fingerprint matches current draft
+            current_fp = self._compute_draft_fingerprint(conversation.active_draft_json)
+            if pending.get("fingerprint") != current_fp:
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "Order draft has changed since confirmation was requested.",
+                    "CONFIRMATION_STALE"
+                )
+
+            # 4. Require explicit confirmation in current message
+            if not self._is_required_order_confirmation(user_message):
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "An explicit approval for the current pending draft is required.",
+                    "CONFIRMATION_NOT_EXPLICIT"
+                )
+
+            # 5. last_question_type must be ORDER_CONFIRMATION
+            if state.get("last_question_type") != "ORDER_CONFIRMATION":
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "An explicit approval for the current pending draft is required.",
+                    "CONFIRMATION_NOT_PENDING"
+                )
 
         transaction_before = (
             f"active={db.is_active},in_transaction={db.in_transaction()}"
@@ -1235,10 +1289,20 @@ class ConversationEngine:
                     "The action could not be resolved from verified conversation state.",
                     "ACTION_NOT_AUTHORIZED",
                 )
-            elif tool_name == "update_order_draft" and execution[3].success:
-                metadata = dict(conversation.metadata_json or {})
-                metadata.pop("confirmation_pending", None)
-                conversation.metadata_json = metadata
+            elif tool_name in {"create_order_draft", "update_order_draft", "replace_draft_item_variant"} and execution[3].success:
+                # Draft modification succeeded: update fingerprint and set status to paused
+                pending = conversation.metadata_json.get("confirmation_pending") if conversation.metadata_json else None
+                if pending and pending.get("status") in {"awaiting", "awaiting_final"}:
+                    new_fp = self._compute_draft_fingerprint(conversation.active_draft_json)
+                    metadata = dict(conversation.metadata_json or {})
+                    metadata["confirmation_pending"] = {
+                        "draft_id": pending["draft_id"],
+                        "status": "paused",
+                        "fingerprint": new_fp
+                    }
+                    conversation.metadata_json = metadata
+                    if turn_has_draft_mod_ref is not None:
+                        turn_has_draft_mod_ref[0] = True
             savepoint.commit()
             return execution
         except ToolSessionUnusableError:
@@ -1362,6 +1426,7 @@ class ConversationEngine:
         external_account_id: str | None = None,
         external_user_id: str | None = None,
         inbound_message_id: uuid.UUID | None = None,
+        turn_has_draft_mod_ref: list[bool] | None = None,
     ) -> dict[str, Any] | None:
         """Execute FreeLLM-selected tools and preserve its final reply."""
         schemas = self._agent_tool_schemas()
@@ -1643,6 +1708,7 @@ class ConversationEngine:
         model_calls: list[dict[str, Any]] = []
         provider_failure_retries = 0
         reply_repair_attempts = 0
+        turn_has_draft_mod = False
 
         async def safe_fallback() -> dict[str, Any]:
             fallback = await self._agent_loop_safe_fallback(
@@ -1890,6 +1956,7 @@ class ConversationEngine:
                         "executed_tools": executed_tools,
                         "model_calls": list(model_calls),
                         "response": content,
+                        "turn_has_draft_mod": turn_has_draft_mod,
                     }
                 if provider_name == "freellm" and reply_repair_attempts < 1:
                     reply_repair_attempts += 1
@@ -1986,6 +2053,8 @@ class ConversationEngine:
                         external_account_id=external_account_id,
                         external_user_id=external_user_id,
                         inbound_message_id=inbound_message_id,
+                        normalized_calls=normalized_calls,
+                        turn_has_draft_mod_ref=[turn_has_draft_mod],
                     )
                     executed_count += 1
 
@@ -4917,16 +4986,6 @@ class ConversationEngine:
         turn_id: str,
         inbound_message_id: uuid.UUID | None = None,
     ) -> dict[str, Any]:
-        if (
-            self._has_pending_confirmation(conversation)
-            and not self._is_required_order_confirmation(user_message)
-        ):
-            metadata = dict(conversation.metadata_json or {})
-            metadata.pop("confirmation_pending", None)
-            conversation.metadata_json = metadata
-            current_state = self._normalize_current_state(
-                conversation, store_id
-            )
         language = self._heuristic_nlu(user_message, current_state).get(
             "language", "ar"
         )
@@ -4937,6 +4996,7 @@ class ConversationEngine:
         had_active_draft = bool(
             isinstance(draft_before, dict) and draft_before.get("items")
         )
+        turn_has_draft_mod_ref = [False]
         result = await self._run_agent_tool_loop(
             turn_id=turn_id,
             db=db,
@@ -4952,6 +5012,7 @@ class ConversationEngine:
             external_account_id=external_account_id,
             external_user_id=external_user_id,
             inbound_message_id=inbound_message_id,
+            turn_has_draft_mod_ref=turn_has_draft_mod_ref,
         )
         response = (
             result.get("response")
@@ -5024,7 +5085,11 @@ class ConversationEngine:
                     draft_id = str(uuid.uuid4())
                     conversation.active_draft_json = {**draft, "draft_id": draft_id}
                 metadata["last_question_type"] = "ORDER_CONFIRMATION"
-                metadata["confirmation_pending"] = {"draft_id": draft_id}
+                metadata["confirmation_pending"] = {
+                    "draft_id": draft_id,
+                    "status": "awaiting",
+                    "fingerprint": self._compute_draft_fingerprint(conversation.active_draft_json)
+                }
             conversation.metadata_json = metadata
         elif (
             "confirm_order" in executed_tools or tool_name == "confirm_order"

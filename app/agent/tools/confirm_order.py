@@ -1,6 +1,7 @@
 """
 Confirm Order Tool: Finalizes the draft into a persistent Order.
 """
+import hashlib
 import json
 import uuid
 from decimal import Decimal
@@ -107,6 +108,22 @@ class ConfirmOrderTool(BaseTool):
                 error="This draft is not awaiting customer confirmation.",
                 error_code="CONFIRMATION_NOT_PENDING",
             )
+
+        # Validate fingerprint matches current draft
+        pending_fp = pending_confirmation.get("fingerprint")
+        if pending_fp:
+            import hashlib, json
+            draft_content = json.dumps({
+                "items": draft_data.get("items", []),
+                "shipping_info": draft_data.get("shipping_info", {})
+            }, sort_keys=True, ensure_ascii=False)
+            current_fp = hashlib.sha256(draft_content.encode()).hexdigest()[:16]
+            if pending_fp != current_fp:
+                return ToolResult(
+                    success=False,
+                    error="Order draft has changed since confirmation was requested.",
+                    error_code="CONFIRMATION_STALE"
+                )
 
         shipping_info = draft_data.get("shipping_info")
         shipping_info = shipping_info if isinstance(shipping_info, dict) else {}
