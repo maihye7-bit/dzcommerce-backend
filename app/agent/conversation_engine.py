@@ -1212,22 +1212,71 @@ class ConversationEngine:
                     "CONFIRMATION_BLOCKED_SAME_TURN"
                 )
 
-            # 2. Check pending confirmation exists with valid status
-            if not (pending and pending.get("status") in {"awaiting", "awaiting_final"}):
+            # 2. Check pending confirmation exists and is a dict
+            if not isinstance(pending, dict):
                 return self._agent_tool_failure(
                     tool_name,
                     language,
-                    "An explicit approval for the current pending draft is required.",
+                    "No pending confirmation found. Please request a new confirmation.",
+                    "CONFIRMATION_NOT_PENDING"
+                )
+
+            # Handle legacy status: if missing, treat as "awaiting" for backward compatibility
+            status = pending.get("status")
+            if status is None:
+                status = "awaiting"
+            if status not in {"awaiting", "awaiting_final"}:
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "Confirmation is not in a valid state for approval.",
                     "CONFIRMATION_NOT_PENDING"
                 )
 
             # 3. Verify fingerprint matches current draft
+            # For legacy records without fingerprint, require fresh confirmation
+            pending_fp = pending.get("fingerprint")
             current_fp = self._compute_draft_fingerprint(conversation.active_draft_json)
-            if pending.get("fingerprint") != current_fp:
+            if pending_fp is None:
+                # Legacy record without fingerprint - clear old confirmation and require fresh one
+                metadata = dict(conversation.metadata_json or {})
+                metadata.pop("confirmation_pending", None)
+                metadata["last_question_type"] = "ORDER_CONFIRMATION"
+                conversation.metadata_json = metadata
+                db.flush()
                 return self._agent_tool_failure(
                     tool_name,
                     language,
-                    "Order draft has changed since confirmation was requested.",
+                    "Confirmation requires re-verification. Please request a new confirmation with current draft.",
+                    "CONFIRMATION_STALE"
+                )
+            if pending_fp != current_fp:
+                # Fingerprint mismatch - clear old confirmation and require fresh one
+                metadata = dict(conversation.metadata_json or {})
+                metadata.pop("confirmation_pending", None)
+                metadata["last_question_type"] = "ORDER_CONFIRMATION"
+                conversation.metadata_json = metadata
+                db.flush()
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "Order draft has changed since confirmation was requested. Please request a new confirmation.",
+                    "CONFIRMATION_STALE"
+                )
+
+            # 3b. Verify draft_id matches current draft
+            pending_draft_id = pending.get("draft_id")
+            current_draft_id = (conversation.active_draft_json or {}).get("draft_id")
+            if not isinstance(pending_draft_id, str) or not isinstance(current_draft_id, str) or pending_draft_id != current_draft_id:
+                metadata = dict(conversation.metadata_json or {})
+                metadata.pop("confirmation_pending", None)
+                metadata["last_question_type"] = "ORDER_CONFIRMATION"
+                conversation.metadata_json = metadata
+                db.flush()
+                return self._agent_tool_failure(
+                    tool_name,
+                    language,
+                    "Confirmation draft ID does not match current draft. Please request a new confirmation.",
                     "CONFIRMATION_STALE"
                 )
 
