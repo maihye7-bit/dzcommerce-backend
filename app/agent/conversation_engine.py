@@ -1612,6 +1612,20 @@ class ConversationEngine:
                     "advisor for an Algerian online store. Understand Arabic, Algerian "
                     "Darija/Arabizi, French, English, and mixed messages; answer in "
                     "the customer's language and tone.\n\n"
+                    "LANGUAGE & DIALECT RULES (MANDATORY):\n"
+                    "You are a commercial assistant speaking to Algerian customers.\n"
+                    "Your default language is natural, everyday Algerian Darija, and you may use simple Algerian Arabic when clearer.\n"
+                    "Maintain the Algerian dialect consistently throughout the entire conversation:\n"
+                    "- Do not use Eastern (Mashriqi) dialect.\n"
+                    "- Do not use Moroccan dialect.\n"
+                    "- Do not switch between dialects within the same conversation.\n"
+                    "- Do not use Moroccan or Eastern expressions just because the customer used a similar word.\n"
+                    "- Do not use literal translations from English or Chinese.\n"
+                    "- Use natural, respectful Algerian expressions without exaggeration or affectation.\n"
+                    "- Maintain the same style whether greeting, answering product questions, collecting delivery info, discussing orders, or handling side questions.\n"
+                    "- If the customer writes in formal Arabic (Fusha), you may reply in simple, clear Arabic while keeping the Algerian flavor.\n"
+                    "- Product names and technical information remain unchanged.\n\n"
+                    "The priority is to sound like a natural Algerian assistant speaking naturally, not like a translated text or robotic template.\n\n"
                     "CUSTOMER-FIRST JUDGMENT:\n"
                     "- Understand the customer's practical goal, stated preferences, "
                     "budget, uncertainty, and objections from the whole supplied "
@@ -1712,7 +1726,7 @@ class ConversationEngine:
                     "variant_index only when the server context has a selected "
                     "variant. Never ask them to select the product again.\n"
                     "- Decide naturally whether a delivery detail is needed next. "
-                    "Persist customer-provided phone, wilaya, municipality, or address "
+                    "Persist customer-provided phone, wilaya, commune, or address "
                     "with update_order_draft set_shipping when appropriate. Municipality "
                     "is optional; do not force a fixed collection sequence. Before "
                     "confirmation, ensure required delivery details are present, "
@@ -2396,8 +2410,9 @@ class ConversationEngine:
         if not isinstance(value, dict) or set(value) - {
             "phone",
             "wilaya",
-            "municipality",
-            "address",
+            "commune",
+            "first_name",
+            "last_name",
         }:
             return False
         return all(
@@ -3782,11 +3797,17 @@ class ConversationEngine:
                     customer.phone if customer is not None else None
                 )
                 wilaya = shipping_info.get("wilaya")
+                commune = shipping_info.get("commune")
+                first_name = shipping_info.get("first_name")
+                last_name = shipping_info.get("last_name")
                 delivery_info_reply, delivery_info_question_type = (
                     self._draft_next_step_response(
                         updated_draft,
                         phone=phone,
                         wilaya=wilaya,
+                        commune=commune,
+                        first_name=first_name,
+                        last_name=last_name,
                         language=local_message_nlu.get("language", "ar"),
                     )
                 )
@@ -4093,6 +4114,9 @@ class ConversationEngine:
                     customer.phone if customer is not None else None
                 )
                 wilaya = shipping_info.get("wilaya")
+                commune = shipping_info.get("commune")
+                first_name = shipping_info.get("first_name")
+                last_name = shipping_info.get("last_name")
                 if phone and not shipping_info.get("phone"):
                     shipping_info["phone"] = phone
                     draft["shipping_info"] = shipping_info
@@ -4104,6 +4128,9 @@ class ConversationEngine:
                     draft,
                     phone=phone,
                     wilaya=wilaya,
+                    commune=commune,
+                    first_name=first_name,
+                    last_name=last_name,
                     language=nlu_output.get("language", "ar"),
                 )
                 agent_draft_created = True
@@ -5791,11 +5818,20 @@ class ConversationEngine:
         *,
         phone: str | None,
         wilaya: str | None,
+        commune: str | None,
+        first_name: str | None,
+        last_name: str | None,
         language: str,
     ) -> tuple[str, str]:
         missing = [
             field
-            for field, value in (("phone", phone), ("wilaya", wilaya))
+            for field, value in (
+                ("phone", phone),
+                ("wilaya", wilaya),
+                ("commune", commune),
+                ("first_name", first_name),
+                ("last_name", last_name),
+            )
             if not value
         ]
         items = draft.get("items")
@@ -5817,7 +5853,13 @@ class ConversationEngine:
         if language == "fr":
             if missing:
                 fields = " et ".join(
-                    "votre numéro de téléphone" if field == "phone" else "votre wilaya"
+                    {
+                        "phone": "votre numéro de téléphone",
+                        "wilaya": "votre wilaya",
+                        "commune": "votre commune",
+                        "first_name": "votre prénom",
+                        "last_name": "votre nom",
+                    }[field]
                     for field in missing
                 )
                 return (
@@ -5833,7 +5875,13 @@ class ConversationEngine:
         if language == "en":
             if missing:
                 fields = " and ".join(
-                    "your phone number" if field == "phone" else "your wilaya"
+                    {
+                        "phone": "your phone number",
+                        "wilaya": "your wilaya",
+                        "commune": "your commune",
+                        "first_name": "your first name",
+                        "last_name": "your last name",
+                    }[field]
                     for field in missing
                 )
                 return (
@@ -6458,6 +6506,17 @@ Schema:
   "language": "ar|fr|en",
   "confidence": 0.0
 }
+LANGUAGE & DIALECT RULES (MANDATORY):
+You are an NLU engine for an Algerian e-commerce bot.
+Your default language is natural, everyday Algerian Darija, and you may use simple Algerian Arabic when clearer.
+Maintain the Algerian dialect consistently:
+- Do not use Eastern (Mashriqi) dialect.
+- Do not use Moroccan dialect.
+- Do not switch between dialects.
+- Do not use Moroccan or Eastern expressions just because the customer used a similar word.
+- Do not use literal translations from English or Chinese.
+- Use natural, respectful Algerian expressions.
+- If the customer writes in formal Arabic (Fusha), you may reply in simple, clear Arabic while keeping the Algerian flavor.
 Rules:
 - Extract any relevant attributes without limiting them to clothing: color, size, storage, RAM, weight, material, dimensions, volume, smell, flavor, quantity, model, and other product-specific properties.
 - Use attribute names naturally in the customer's language and preserve the values as spoken. Do not translate or normalize attribute keys or values.
@@ -8299,6 +8358,9 @@ Rules:
                 customer.phone if customer is not None else None
             )
             wilaya = shipping_info.get("wilaya")
+            commune = shipping_info.get("commune")
+            first_name = shipping_info.get("first_name")
+            last_name = shipping_info.get("last_name")
             if phone and not shipping_info.get("phone"):
                 shipping_info["phone"] = phone
                 draft["shipping_info"] = shipping_info
@@ -8307,6 +8369,9 @@ Rules:
                 draft,
                 phone=phone,
                 wilaya=wilaya,
+                commune=commune,
+                first_name=first_name,
+                last_name=last_name,
                 language=language,
             )
             return response, True, question_type

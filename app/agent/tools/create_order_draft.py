@@ -52,8 +52,9 @@ class CreateOrderDraftTool(BaseTool):
                     "properties": {
                         "phone": {"type": "string"},
                         "wilaya": {"type": "string"},
-                        "municipality": {"type": "string"},
-                        "address": {"type": "string"},
+                        "commune": {"type": "string"},
+                        "first_name": {"type": "string"},
+                        "last_name": {"type": "string"},
                     },
                     "additionalProperties": False,
                 },
@@ -112,11 +113,14 @@ class CreateOrderDraftTool(BaseTool):
                         "wilaya": (draft_data.get("shipping_info") or {}).get(
                             "wilaya"
                         ),
-                        "municipality": (
+                        "commune": (
                             draft_data.get("shipping_info") or {}
-                        ).get("municipality"),
-                        "address_provided": bool(
-                            (draft_data.get("shipping_info") or {}).get("address")
+                        ).get("commune"),
+                        "first_name_provided": bool(
+                            (draft_data.get("shipping_info") or {}).get("first_name")
+                        ),
+                        "last_name_provided": bool(
+                            (draft_data.get("shipping_info") or {}).get("last_name")
                         ),
                     },
                         "instruction": (
