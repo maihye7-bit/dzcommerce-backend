@@ -65,12 +65,10 @@ def verify_meta_signature(
     if not signature_header:
         return False
 
-    # Use provided secret or fetch from environment
-    try:
-        secret = app_secret or _get_app_secret()
-    except RuntimeError:
-        # If secret is missing, verification fails gracefully rather than crashing
-        return False
+    # Use provided secret or fetch from environment.
+    # Do NOT swallow RuntimeError here — let the caller distinguish between
+    # "header missing" (False) and "secret not configured" (RuntimeError).
+    secret = app_secret or _get_app_secret()
 
     # Header format: sha256=<hex_digest>
     if not signature_header.startswith("sha256="):

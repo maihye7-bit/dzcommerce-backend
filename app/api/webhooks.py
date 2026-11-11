@@ -368,20 +368,34 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
     body_bytes = await request.body()
     
     # 1. Verify Signature
+    sig_header = request.headers.get("X-Hub-Signature-256")
+
+    if not sig_header:
+        logger.warning(
+            "WEBHOOK_NO_SIGNATURE path=%s",
+            request.url.path,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook signature",
+        )
+
     try:
         signature_valid = verify_meta_signature(
             body_bytes,
-            request.headers.get("X-Hub-Signature-256"),
+            sig_header,
         )
     except RuntimeError:
+        logger.error("WEBHOOK_SIGNATURE_CONFIG_MISSING")
         raise HTTPException(
             status_code=503,
-            detail="Meta webhook signature verification is not configured",
+            detail="Webhook verification unavailable",
         )
-    
+
     if not signature_valid:
+        logger.warning("WEBHOOK_SIGNATURE_INVALID")
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
-    
+
     logger.debug("SIGNATURE_OK path=%s", request.url.path)
 
     # 2. Parse Payload
@@ -914,7 +928,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 outbound_status,
             )
 
-    print(f"✅ Processed: {processed_count} | ♻️ Skipped Duplicates: {skipped_duplicates}")
+    print(f"Processed: {processed_count} | Skipped Duplicates: {skipped_duplicates}")
     print("=" * 60 + "\n")
     
     return {"status": "processed", "count": processed_count, "skipped": skipped_duplicates}

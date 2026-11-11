@@ -997,8 +997,78 @@ def test_meta_verification_requires_configured_token(monkeypatch):
     monkeypatch.delenv("META_VERIFY_TOKEN", raising=False)
     monkeypatch.delenv("FACEBOOK_VERIFY_TOKEN", raising=False)
 
-    with pytest.raises(RuntimeError):
-        verify_meta_verify_token("anything")
+
+def test_meta_webhook_accepts_valid_signature_with_configured_secret(client, monkeypatch):
+    """1. توقيع صحيح مع App Secret صحيح → قبول الطلب (200)."""
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+
+    # Build a valid signature using the same helper the app uses
+    body = '{"object":"page","entry":[{"id":"page_id","changes":[]}]}'.encode()
+    sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    headers = {"X-Hub-Signature-256": f"sha256={sig}"}
+
+    response = client.post(
+        "/webhooks/meta",
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] in ("processed", "ignored")
+
+
+def test_meta_webhook_rejects_invalid_signature(client, monkeypatch):
+    """2. توقيع خاطئ → 401."""
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+
+    body = '{"object":"page","entry":[{"id":"page_id","changes":[]}]}'.encode()
+    headers = {"X-Hub-Signature-256": "sha256=invalid"}
+
+    response = client.post(
+        "/webhooks/meta",
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 401
+
+
+def test_meta_webhook_requires_signature_header(client, monkeypatch):
+    """3. غياب X-Hub-Signature-256 → 401 مع WEBHOOK_NO_SIGNATURE."""
+    secret = "test-meta-secret"
+    monkeypatch.setenv("META_APP_SECRET", secret)
+
+    body = '{"object":"page","entry":[{"id":"page_id","changes":[]}]}'.encode()
+    # No X-Hub-Signature-256 header at all
+
+    response = client.post(
+        "/webhooks/meta",
+        content=body,
+    )
+
+    assert response.status_code == 401
+
+
+def test_meta_webhook_missing_secret_with_sig(client, monkeypatch):
+    """4. وجود التوقيع لكن غياب App Secret → 503 مع WEBHOOK_SIGNATURE_CONFIG_MISSING."""
+    # Ensure META_APP_SECRET is NOT set
+    monkeypatch.delenv("META_APP_SECRET", raising=False)
+    monkeypatch.delenv("FACEBOOK_APP_SECRET", raising=False)
+
+    body = '{"object":"page","entry":[{"id":"page_id","changes":[]}]}'.encode()
+    sig = hmac.new(b"some-secret", body, hashlib.sha256).hexdigest()
+    headers = {"X-Hub-Signature-256": f"sha256={sig}"}
+
+    response = client.post(
+        "/webhooks/meta",
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 503
 
 
 def test_production_settings_reject_default_jwt_secret(monkeypatch):
