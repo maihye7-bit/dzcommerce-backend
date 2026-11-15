@@ -4462,8 +4462,8 @@ class ConversationEngine:
                             },
                             products=composer_products,
                         )
-                        if composed_response is not None:
-                            final_response_content = composed_response
+                        # Kept: FreeLLM reply stands; product info handled downstream
+                # by localized final text generation, not reply composer overwrite
             else:
                 error_code = tool_result.error_code or "TOOL_ERROR"
                 logger.warning(
