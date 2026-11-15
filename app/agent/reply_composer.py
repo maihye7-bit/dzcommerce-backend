@@ -1,4 +1,4 @@
-﻿"""Conservative, tool-free language composition for verified product search results."""
+"""Conservative, tool-free language composition for verified product search results."""
 
 import asyncio
 import json
@@ -582,17 +582,34 @@ class ReplyComposer:
             )
             return None
 
-        if getattr(response, "tool_calls", None) or getattr(
-            response, "finish_reason", None
-        ) == "error":
+        if getattr(response, "finish_reason", None) == "error":
+            logger.warning("Greeting composition provider error; use deterministic reply")
             return None
 
-        # Use robust JSON extraction
+        # Handle tool_calls gracefully - if content exists, use it
+        if getattr(response, "tool_calls", None):
+            if getattr(response, "content", None):
+                logger.info("Greeting composition: tool_calls present but content exists, using content")
+            else:
+                logger.warning("Greeting composition returned tool_calls without content; use deterministic reply")
+                return None
+
+        # Use robust JSON extraction with fallback to plain text
         parsed = self._extract_json_from_response(response.content or "")
         if not parsed:
+            # Fallback: try to use raw content if it looks like a valid greeting
+            raw_content = (response.content or "").strip()
+            if raw_content and self._is_safe_greeting(raw_content, language):
+                logger.info("Greeting composition: using raw content as fallback")
+                return raw_content.strip()
             logger.warning("Greeting composition failed to extract JSON; use deterministic reply")
             return None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("reply"), str):
+            # Try raw content as fallback
+            raw_content = (response.content or "").strip()
+            if raw_content and self._is_safe_greeting(raw_content, language):
+                logger.info("Greeting composition: using raw content as fallback (invalid JSON shape)")
+                return raw_content.strip()
             logger.warning("Greeting response invalid shape; use deterministic reply")
             return None
 
@@ -657,23 +674,35 @@ class ReplyComposer:
             )
             return None
 
-        if getattr(response, "tool_calls", None):
-            logger.warning("ReplyComposer returned tool calls; use deterministic reply")
-            return None
         if getattr(response, "finish_reason", None) == "error":
             logger.warning("ReplyComposer provider reported an error; use deterministic reply")
             return None
 
-        # Use robust JSON extraction
+        # Handle tool_calls gracefully - if content exists, use it
+        if getattr(response, "tool_calls", None):
+            if getattr(response, "content", None):
+                logger.info("ReplyComposer: tool_calls present but content exists, using content")
+            else:
+                logger.warning("ReplyComposer returned tool_calls without content; use deterministic reply")
+                return None
+
+        # Use robust JSON extraction with fallback to plain text
         parsed = self._extract_json_from_response(response.content or "")
         if not parsed:
+            # Fallback: try to use raw content if it looks safe
+            raw_content = (response.content or "").strip()
+            if raw_content and self._is_safe_reply(raw_content, language, products):
+                logger.info("ReplyComposer: using raw content as fallback (JSON extraction failed)")
+                return raw_content.strip()
             logger.warning("ReplyComposer returned invalid JSON; use deterministic reply")
             return None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("reply"), str):
-            logger.warning(
-                "ReplyComposer returned an invalid response shape; "
-                "use deterministic reply"
-            )
+            # Try raw content as fallback
+            raw_content = (response.content or "").strip()
+            if raw_content and self._is_safe_reply(raw_content, language, products):
+                logger.info("ReplyComposer: using raw content as fallback (invalid JSON shape)")
+                return raw_content.strip()
+            logger.warning("ReplyComposer returned an invalid response shape; use deterministic reply")
             return None
 
         reply = parsed["reply"].strip()

@@ -2488,6 +2488,9 @@ class ConversationEngine:
                 and value == "DRAFT_PENDING"
             ):
                 continue
+            # Clear confirmation_pending when draft is modified (any successful draft modification)
+            if tool_name in {"create_order_draft", "update_order_draft", "replace_draft_item_variant"} and tool_result.success:
+                metadata.pop("confirmation_pending", None)
             if key not in resolver_managed_keys:
                 metadata[key] = value
         conversation.metadata_json = metadata
@@ -5796,9 +5799,9 @@ class ConversationEngine:
         message: str,
         served_wilayas: str | None,
     ) -> tuple[str | None, str | None]:
+        # Try primary regex (Algerian phone numbers with country code or local format)
         phone_match = re.search(
-            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|"
-            r"0[567](?:[\s.-]?\d){8})(?!\d)",
+            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
             message or "",
         )
         phone = None
@@ -5807,6 +5810,15 @@ class ConversationEngine:
             digits = re.sub(r"\D", "", phone_match.group())
             phone = f"0{digits[3:]}" if digits.startswith("213") else digits
             remainder = remainder[:phone_match.start()] + " " + remainder[phone_match.end():]
+        else:
+            # Fallback: try to find any 10-digit Algerian mobile number
+            fallback_match = re.search(r"(?<!\d)(0[567]\d{8})(?!\d)", message or "")
+            if fallback_match:
+                phone = fallback_match.group(1)
+                remainder = message[:fallback_match.start()] + " " + message[fallback_match.end():]
+            else:
+                phone = None
+                remainder = message or ""
 
         resolved_wilaya = resolve_delivery_wilaya(remainder, served_wilayas)
         return phone, resolved_wilaya.name_ar if resolved_wilaya else None
@@ -5823,14 +5835,13 @@ class ConversationEngine:
         last_name: str | None,
         language: str,
     ) -> tuple[str, str]:
+        # Only phone and wilaya are required for ORDER_CONFIRMATION
+        # commune, first_name, last_name are optional additions
         missing = [
             field
             for field, value in (
                 ("phone", phone),
                 ("wilaya", wilaya),
-                ("commune", commune),
-                ("first_name", first_name),
-                ("last_name", last_name),
             )
             if not value
         ]

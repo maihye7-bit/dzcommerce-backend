@@ -112,7 +112,6 @@ class ConfirmOrderTool(BaseTool):
         # Validate fingerprint matches current draft
         pending_fp = pending_confirmation.get("fingerprint")
         if pending_fp:
-            import hashlib, json
             draft_content = json.dumps({
                 "items": draft_data.get("items", []),
                 "shipping_info": draft_data.get("shipping_info", {})
