@@ -676,10 +676,12 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                     )
                     db.add(conv)
                     db.flush()
+                    # Commit the conversation creation so it exists even if agent fails
+                    db.commit()
                 conv_metadata = dict(conv.metadata_json or {})
                 conv_metadata["external_account_id"] = external_account_id
                 conv.metadata_json = conv_metadata
-                
+
                 conv_id_for_log = conv.id
 
                 inserted = _persist_inbound_message(
