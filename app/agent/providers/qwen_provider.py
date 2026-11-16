@@ -59,6 +59,7 @@ class QwenLLMProvider(LLMProvider):
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
         system_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> LLMResponse:
         start_time = time.time()
         openai_messages = self._build_openai_messages(messages)

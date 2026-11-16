@@ -34,4 +34,5 @@ class LLMProvider(ABC):
         messages: list[LLMMessage],
         tools: list[ToolDefinition] | None = None,
         system_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> LLMResponse: ...

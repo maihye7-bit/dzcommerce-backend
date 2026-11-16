@@ -35,7 +35,7 @@ class FixedProvider:
         self.delay = delay
         self.calls = []
 
-    async def chat(self, messages, tools=None, system_prompt=None):
+    async def chat(self, messages, tools=None, system_prompt=None, session_id=None):
         self.calls.append((messages, tools))
         if self.error:
             raise self.error

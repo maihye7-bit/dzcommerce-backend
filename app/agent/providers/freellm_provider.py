@@ -66,6 +66,7 @@ class FreeLLMProvider(LLMProvider):
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
         system_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> LLMResponse:
         start_time = time.time()
         openai_messages = self._build_openai_messages(messages)
@@ -92,21 +93,38 @@ class FreeLLMProvider(LLMProvider):
 
         last_exception = None
 
+        # Prepare extra headers for FreeLLMAPI sticky sessions
+        extra_headers = {}
+        if session_id:
+            extra_headers["X-Session-Id"] = session_id
+
         # Retry Loop
         for attempt in range(self.max_retries + 1):
             try:
-                response = await self.client.chat.completions.create(
+                # Use with_raw_response to capture headers like X-Routed-Via
+                raw_response = await self.client.chat.completions.with_raw_response.create(
                     model=self.model,
                     messages=openai_messages,
                     tools=openai_tools,
                     tool_choice="auto" if openai_tools else None,
+                    extra_headers=extra_headers or None,
                 )
 
+                response = raw_response.parse()
                 latency_ms = int((time.time() - start_time) * 1000)
                 choice = response.choices[0]
                 msg = choice.message
                 reported_model = getattr(response, "model", None)
                 request_id = getattr(response, "id", None)
+
+                # Capture X-Routed-Via for observability
+                routed_via = raw_response.headers.get("X-Routed-Via")
+                if routed_via:
+                    logger.info(
+                        "FreeLLM routed via model: %s (session_id=%s)",
+                        routed_via,
+                        session_id[:8] if session_id else "none",
+                    )
 
                 usage_data = response.usage
                 input_tokens = usage_data.prompt_tokens if usage_data else 0
@@ -120,6 +138,7 @@ class FreeLLMProvider(LLMProvider):
                     ),
                     "requested_model": self.model,
                     "request_id": request_id if isinstance(request_id, str) else None,
+                    "routed_via": routed_via,
                 }
 
                 # Handle Tool Calls

@@ -1907,7 +1907,11 @@ class ConversationEngine:
             )
             try:
                 response = await asyncio.wait_for(
-                    self.llm.chat(messages=messages, tools=schemas),
+                    self.llm.chat(
+                        messages=messages,
+                        tools=schemas,
+                        session_id=str(conversation.id),
+                    ),
                     timeout=self.agent_tool_loop_timeout_seconds,
                 )
             except Exception as exc:
@@ -4580,6 +4584,7 @@ class ConversationEngine:
                                 "recent_dialogue": dialogue_context,
                             },
                             products=composer_products,
+                            session_id=str(conversation.id),
                         )
                         # Kept: FreeLLM reply stands; product info handled downstream
                 # by localized final text generation, not reply composer overwrite
@@ -4621,6 +4626,7 @@ class ConversationEngine:
                         user_message=user_message,
                         error_text=tool_result.error,
                         language=nlu_output.get("language", "ar"),
+                        session_id=str(conversation.id),
                     )
                 else:
                     if (
@@ -4767,6 +4773,7 @@ class ConversationEngine:
                                                 "recent_dialogue": dialogue_context,
                                             },
                                             products=composer_products,
+                                            session_id=str(conversation.id),
                                         )
                                     )
                                     if composed_response is not None:
@@ -4812,6 +4819,7 @@ class ConversationEngine:
                 composed_greeting = await self.reply_composer.compose_greeting(
                     customer_message=user_message,
                     language=nlu_output.get("language", "ar"),
+                    session_id=str(conversation.id),
                 )
                 final_response_content = (
                     composed_greeting
@@ -6393,6 +6401,7 @@ class ConversationEngine:
         user_message: str,
         error_text: str,
         language: str,
+        session_id: str | None = None,
     ) -> str:
         """Ask the model to explain an expected draft validation error."""
         fallback = error_text
@@ -6422,7 +6431,11 @@ class ConversationEngine:
             ),
         ]
         try:
-            response = await self.llm.chat(messages=messages, tools=None)
+            response = await self.llm.chat(
+                messages=messages,
+                tools=None,
+                session_id=session_id,
+            )
         except Exception:
             logger.exception("Failed to phrase expected draft validation error")
             return fallback
@@ -6495,7 +6508,11 @@ class ConversationEngine:
 
         for _ in range(self.max_tool_rounds):
             try:
-                response = await self.llm.chat(messages=messages, tools=schema)
+                response = await self.llm.chat(
+                    messages=messages,
+                    tools=schema,
+                    session_id=str(conversation.id),
+                )
             except Exception:
                 logger.warning(
                     "Catalog recovery model call failed; use deterministic search error",
@@ -6781,7 +6798,11 @@ Rules:
         messages.append(LLMMessage(role="user", content=message))
 
         try:
-            response = await self.llm.chat(messages=messages, tools=None)
+            response = await self.llm.chat(
+                messages=messages,
+                tools=None,
+                session_id=str(conversation_id) if conversation_id else None,
+            )
             usage = response.usage or {}
             if usage and db is not None and store_id is not None:
                 provider_name = getattr(self.llm, "provider_name", None)

@@ -53,7 +53,7 @@ class ScriptedToolProvider:
         self.responses = list(responses)
         self.calls = []
 
-    async def chat(self, messages, tools=None, system_prompt=None):
+    async def chat(self, messages, tools=None, system_prompt=None, session_id=None):
         self.calls.append((messages, tools))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -61,7 +61,7 @@ class ScriptedToolProvider:
         return response
 
 
-def openai_chat_response(*, content=None, tool_call=None, model=None, request_id=None):
+def openai_chat_response(*, content=None, tool_call=None, model=None, request_id=None, routed_via=None):
     message = SimpleNamespace(content=content, tool_calls=[])
     finish_reason = "stop"
     if tool_call is not None:
@@ -87,10 +87,41 @@ def make_mock_freellm_provider(responses):
     provider = FreeLLMProvider.__new__(FreeLLMProvider)
     provider.model = "auto"
     provider.max_retries = 0
+    # Use a list to track responses for the mock
+    response_list = list(responses)
+
+    async def mock_with_raw_response_create(**kwargs):
+        if response_list:
+            response = response_list.pop(0)
+        else:
+            response = openai_chat_response(content="Mock response")
+        # Create a mock raw response with headers
+        raw_response = SimpleNamespace(
+            parse=lambda: response,
+            headers={"X-Routed-Via": "test-model"},
+        )
+        return raw_response
+
+    async def mock_create(**kwargs):
+        if response_list:
+            return response_list.pop(0)
+        else:
+            return openai_chat_response(content="Mock response")
+
+    # The FreeLLMProvider now uses with_raw_response.create internally
+    # but tests expect to access create directly for call counting
+    # So we track calls on both - create_mock is what tests check
+    create_mock = AsyncMock(side_effect=mock_create)
+    with_raw_response_mock = AsyncMock(side_effect=mock_with_raw_response_create)
+
+    # Attach create_mock to the path tests expect
     provider.client = SimpleNamespace(
         chat=SimpleNamespace(
             completions=SimpleNamespace(
-                create=AsyncMock(side_effect=responses),
+                create=create_mock,
+                with_raw_response=SimpleNamespace(
+                    create=with_raw_response_mock,
+                ),
             )
         )
     )
@@ -2170,7 +2201,8 @@ async def test_freellm_provider_runs_tool_call_round_trip(
     result = await run_turn(engine, db_session, conversation, "Find Samsung")
 
     assert result["response"] == "وجدت Samsung Galaxy."
-    create = provider.client.chat.completions.create
+    # The provider uses with_raw_response.create internally
+    create = provider.client.chat.completions.with_raw_response.create
     assert create.await_count == 2
     first_request = create.await_args_list[0].kwargs
     assert first_request["tools"]
@@ -2238,7 +2270,7 @@ async def test_freellm_tool_call_cannot_confirm_without_explicit_consent(
     )
     tool_result = next(
         message
-        for message in provider.client.chat.completions.create.await_args_list[
+        for message in provider.client.chat.completions.with_raw_response.create.await_args_list[
             1
         ].kwargs["messages"]
         if message.get("role") == "tool"
@@ -3437,7 +3469,7 @@ async def test_agent_provider_timeout_uses_deterministic_fallback(db_session):
     _, _, conversation, _, _ = make_fixture(db_session)
 
     class SlowProvider(ScriptedToolProvider):
-        async def chat(self, messages, tools=None, system_prompt=None):
+        async def chat(self, messages, tools=None, system_prompt=None, session_id=None):
             self.calls.append((messages, tools))
             await asyncio.sleep(0.02)
             return LLMResponse(content="This reply is too late.")

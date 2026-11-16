@@ -543,6 +543,7 @@ class ReplyComposer:
         *,
         customer_message: str,
         language: str,
+        session_id: str | None = None,
     ) -> str | None:
         if language not in {"ar", "fr", "en"}:
             return None
@@ -572,7 +573,7 @@ class ReplyComposer:
 
         try:
             response = await asyncio.wait_for(
-                self.provider.chat(messages=messages, tools=None),
+                self.provider.chat(messages=messages, tools=None, session_id=session_id),
                 timeout=self.timeout_seconds,
             )
         except Exception:
@@ -627,6 +628,7 @@ class ReplyComposer:
         language: str,
         conversation_context: dict[str, Any],
         products: list[dict[str, str | None]],
+        session_id: str | None = None,
     ) -> str | None:
         if not products or language not in {"ar", "fr", "en"}:
             return None
@@ -664,7 +666,7 @@ class ReplyComposer:
 
         try:
             response = await asyncio.wait_for(
-                self.provider.chat(messages=messages, tools=None),
+                self.provider.chat(messages=messages, tools=None, session_id=session_id),
                 timeout=self.timeout_seconds,
             )
         except Exception:
