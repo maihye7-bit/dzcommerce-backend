@@ -3469,7 +3469,7 @@ async def test_agent_provider_timeout_uses_deterministic_fallback(db_session):
     _, _, conversation, _, _ = make_fixture(db_session)
 
     class SlowProvider(ScriptedToolProvider):
-        async def chat(self, messages, tools=None, system_prompt=None, session_id=None):
+        async def chat(self, messages, tools=None, system_prompt=None, session_id=None, turn_id=None, call_index=None):
             self.calls.append((messages, tools))
             await asyncio.sleep(0.02)
             return LLMResponse(content="This reply is too late.")

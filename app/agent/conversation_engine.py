@@ -1911,6 +1911,8 @@ class ConversationEngine:
                         messages=messages,
                         tools=schemas,
                         session_id=str(conversation.id),
+                        turn_id=trace_turn_id,
+                        call_index=model_call_count,
                     ),
                     timeout=self.agent_tool_loop_timeout_seconds,
                 )
@@ -4585,6 +4587,8 @@ class ConversationEngine:
                             },
                             products=composer_products,
                             session_id=str(conversation.id),
+                            turn_id=trace_turn_id,
+                            call_index=model_call_count,
                         )
                         # Kept: FreeLLM reply stands; product info handled downstream
                 # by localized final text generation, not reply composer overwrite
@@ -4774,6 +4778,8 @@ class ConversationEngine:
                                             },
                                             products=composer_products,
                                             session_id=str(conversation.id),
+                                            turn_id=trace_turn_id,
+                                            call_index=model_call_count,
                                         )
                                     )
                                     if composed_response is not None:
@@ -4820,6 +4826,8 @@ class ConversationEngine:
                     customer_message=user_message,
                     language=nlu_output.get("language", "ar"),
                     session_id=str(conversation.id),
+                    turn_id=trace_turn_id,
+                    call_index=model_call_count,
                 )
                 final_response_content = (
                     composed_greeting
@@ -6435,6 +6443,8 @@ class ConversationEngine:
                 messages=messages,
                 tools=None,
                 session_id=session_id,
+                turn_id="corrective_error",
+                call_index=1,
             )
         except Exception:
             logger.exception("Failed to phrase expected draft validation error")
@@ -6512,6 +6522,8 @@ class ConversationEngine:
                     messages=messages,
                     tools=schema,
                     session_id=str(conversation.id),
+                    turn_id="catalog_recovery",
+                    call_index=1,
                 )
             except Exception:
                 logger.warning(
@@ -6802,6 +6814,8 @@ Rules:
                 messages=messages,
                 tools=None,
                 session_id=str(conversation_id) if conversation_id else None,
+                turn_id="nlu_extraction",
+                call_index=1,
             )
             usage = response.usage or {}
             if usage and db is not None and store_id is not None:

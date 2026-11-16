@@ -67,6 +67,8 @@ class FreeLLMProvider(LLMProvider):
         tools: list[dict] | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
+        call_index: int | None = None,
     ) -> LLMResponse:
         start_time = time.time()
         openai_messages = self._build_openai_messages(messages)
@@ -119,12 +121,29 @@ class FreeLLMProvider(LLMProvider):
 
                 # Capture X-Routed-Via for observability
                 routed_via = raw_response.headers.get("X-Routed-Via")
+                routed_via_present = routed_via is not None
                 if routed_via:
                     logger.info(
                         "FreeLLM routed via model: %s (session_id=%s)",
                         routed_via,
                         session_id[:8] if session_id else "none",
                     )
+
+                # Structured observability log per HTTP request
+                logger.info(
+                    "freellm_request_completed turn_id=%s call=%s attempt=%d "
+                    "session_id=%s routed_via=%s routed_via_present=%s request_id=%s "
+                    "latency_ms=%d reported_model=%s",
+                    turn_id or "unknown",
+                    call_index if call_index is not None else "unknown",
+                    attempt + 1,
+                    session_id or "none",
+                    routed_via or "null",
+                    routed_via_present,
+                    request_id if isinstance(request_id, str) else "none",
+                    latency_ms,
+                    reported_model if isinstance(reported_model, str) else "unknown",
+                )
 
                 usage_data = response.usage
                 input_tokens = usage_data.prompt_tokens if usage_data else 0

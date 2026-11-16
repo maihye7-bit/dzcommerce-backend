@@ -35,4 +35,6 @@ class LLMProvider(ABC):
         tools: list[ToolDefinition] | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
+        call_index: int | None = None,
     ) -> LLMResponse: ...

@@ -9,6 +9,8 @@ class MockLLMProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         system_prompt: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
+        call_index: int | None = None,
     ) -> LLMResponse:
         user_messages = [m for m in messages if m.role in ("user", "customer")]
         last_user_msg = user_messages[-1].content.lower() if user_messages else ""
