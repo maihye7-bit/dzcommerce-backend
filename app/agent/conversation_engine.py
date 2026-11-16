@@ -1511,6 +1511,51 @@ class ConversationEngine:
 
         return text
 
+    @staticmethod
+    def _has_foreign_fragments(text: str) -> bool:
+        """Detect substantial French or English fragments in an Arabic response.
+        Returns True if the response contains words/phrases that are clearly French or English,
+        not just brand names, product models, numbers, or proper nouns.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False
+
+        import re
+
+        # Remove known-safe tokens: brand names, product models, numbers, common proper nouns
+        # These patterns are allowed in Arabic responses and NOT considered language mixing
+        allowed_patterns = [
+            r'\b(?:Samsung|iPhone|Apple|Xiaomi|Huawei|Oppo|Vivo|Realme|Nokia|Motorola|Google|Pixel|OnePlus|Nothing|Sony|LG|HTC|Asus|Lenovo|HP|Dell|Acer|MSI|Razer|Logitech|JBL|Bose|Sennheiser|Anker|Baseus|UGreen|Belkin|Sandisk|Kingston|WD|Seagate|Toshiba|Hitachi|Fujitsu|Panasonic|Sharp|TCL|Hisense|Haier|Midea|Gree|Daikin|Mitsubishi|Carrier|York|Trane|Lennox|Rheem|Goodman|Amana|Bryant|Payne|Tempstar|Heil|Armstrong|AirEase|Ducane|Concord|WeatherMaker|ComfortMaker|Keeprite|DayNight|Arcoaire|InternationalComfortProducts)\b',
+            r'\b(?:Galaxy|Note|Ultra|Pro|Max|Plus|Mini|Lite|SE|FE|Z|Flip|Fold|A|S|M|F|X|Y|Z\d+)\b',
+            r'\b\d+(?:[.,]\d+)?\s*(?:GB|TB|MB|KB|GHz|MHz|MP|MPX|mm|cm|m|inch|in|V|W|A|mAh|Wh|kg|g|oz|lb)\b',
+            r'\b\d{1,3}(?:[,.\s]\d{3})*(?:[.,]\d+)?\s*(?:DZD|DA|دج|دينار)\b',
+            r'\b(?:Alger|Algeria|الجزائر|Oran|وهران|Constantine|قسنطينة|Annaba|عنابة|Blida|البليدة|Batna|باتنة|Djelfa|الجلفة|Setif|سطيف|Skikda|سكيكدة|Tizi|تيزي|Ouzou|وزو|Bejaia|بجاية|Tlemcen|تلمسان|Medea|المدية|Chlef|الشلف|Laghouat|الأغواط|Ouargla|ورقلة|Ghardaia|غرداية|El|Oued|الوادي|Biskra|بسكرة|Tebessa|تبسة|Tiaret|تيارت|Tissemsilt|تيسمسيلت|El|Bayan|البيان|Bouira|البويرة|Boumerdes|بومرداس|El|Tarf|الطارف|Mila|ميلة|Ain|Defla|عين|دفلة|Naama|النعامة|Ain|Temouchent|عين|تموشنت|Ghardaia|غرداية|Relizane|غليزان|Mascara|معسكر|Saida|سعيدة|Sidi|Bel|Abbes|سيدي|بل|عباس|Tindouf|تيندوف|Adrar|أدرار|Bechar|بشار|El|Menia|المنيعة|Ouled|Djellal|أولاد|جلال|Bordj|Badji|Mokhtar|برج|باجي|مختار|Bordj|Bou|Arreridj|برج|بو|عريريج|El|Mghair|المغير|El|Menia|المنيعة|Menaa|مناعة|Timimoun|تيميمون|Bordj|Baji|Mokhtar|برج|باجي|مختار|Djanet|جانت|In|Guezzam|إن|قزام|Touggourt|تقرت)\b',
+        ]
+        allowed = re.compile('|'.join(allowed_patterns), re.IGNORECASE)
+        # Remove allowed tokens for detection
+        filtered = allowed.sub('', text)
+
+        # Count Arabic script characters vs Latin script words
+        arabic_chars = len(re.findall(r'[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]', filtered))
+        latin_words = len(re.findall(r'\b[a-zA-Z]{3,}\b', filtered))  # words of 3+ latin letters
+        french_common = len(re.findall(r'\b(?:le|la|les|un|une|des|du|de|et|ou|mais|donc|or|ni|car|que|qui|quoi|où|quand|comment|pourquoi|combien|ce|cette|ces|mon|ton|son|ma|ta|sa|mes|tes|ses|notre|votre|leur|nos|vos|leurs|je|tu|il|elle|nous|vous|ils|elles|me|te|se|nous|vous|le|la|les|lui|leur|y|en|qui|que|quoi|dont|où|est|sont|ai|as|a|avons|avez|ont|étais|était|étions|étiez|étaient|serai|seras|sera|serons|serez|seront|aurai|auras|aura|aurons|aurez|auront|fais|fait|faisons|faites|font|vais|vas|va|allons|allez|vont|peux|peut|pouvons|pouvez|peuvent|veux|veut|voulons|voulez|veulent|dois|doit|devons|devez|doivent|sais|sait|savons|savez|savent|viens|vient|venons|venez|viennent|vois|voit|voyons|voyez|voient|dis|dit|disons|dites|disent|mets|met|mettons|mettez|mettent|pars|part|partons|partez|partent|prends|prend|prenons|prenez|prennent|connais|connaît|connaissons|connaissez|connaissent|écris|écrit|écrivons|écrivez|écrivent|lis|lit|lisons|lisez|lisent|comprends|comprend|comprenons|comprenez|comprennent|apprends|apprend|apprenons|apprenez|apprennent|travaille|travailles|travaillons|travaillez|travaillent|étudie|étudies|étudions|étudiez|étudient|cherche|cherches|cherchons|cherchez|cherchent|trouve|trouves|trouvons|trouvez|trouvent|demande|demandes|demandons|demandez|demandent|répond|réponds|répondons|répondez|répondent|parle|parles|parlons|parlez|parlent|écoute|écoutes|écoutons|écoutez|écoutent|regarde|regardes|regardons|regardez|regardent|vois|voit|voyons|voyez|voient|aime|aimes|aimons|aimez|aiment|déteste|détestes|détestons|détestez|détestent|préfère|préfères|préférons|préférez|préfèrent|choisis|choisit|choisissons|choisissez|choisissent|décide|décides|décidons|décidez|décident|pense|penses|pensons|pensez|pensent|crois|croit|croyons|croyez|croient|sais|sait|savons|savez|savent|connais|connaît|connaissons|connaissez|connaissent)\b', filtered, re.IGNORECASE))
+        english_common = len(re.findall(r'\b(?:the|and|or|but|if|then|else|for|to|in|on|at|by|from|with|about|as|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|can|could|should|may|might|must|shall|am|i|you|he|she|it|we|they|me|him|her|us|them|my|your|his|her|its|our|their|this|that|these|those|a|an|of|not|no|yes|ok|okay|sure|please|thanks|thank|you|hi|hello|hey|good|bad|great|nice|want|need|like|love|buy|purchase|order|deliver|delivery|price|cost|how|much|many|what|which|when|where|who|why|phone|mobile|address|city|wilaya|commune|name|product|item|color|size|available|stock|show|see|look|check|find|search|help|support|contact|call|message|chat|talk|speak|understand|know|think|believe|hope|wish|sorry|excuse|problem|issue|question|answer|information|detail|specification|feature|option|model|brand|new|used|original|authentic|genuine|fake|copy|warranty|guarantee|return|refund|exchange|replace|repair|fix|broken|damaged|defect|fault|quality|good|better|best|worse|worst|cheap|expensive|affordable|budget|premium|standard|basic|advanced|pro|max|plus|mini|lite|se|fe|ultra|note|galaxy|iphone|samsung|apple|xiaomi|huawei|oppo|vivo|realme|nokia|motorola|google|pixel|oneplus|nothing|sony|lg|htc|asus|lenovo|hp|dell|acer|msi|razer|logitech|jbl|bose|sennheiser|anker|baseus|ugreen|belkin|sandisk|kingston|wd|seagate|toshiba|hitachi|fujitsu|panasonic|sharp|tcl|hisense|haier|midea|gree|daikin|mitsubishi|carrier|york|trane|lennox|rheem|goodman|amana|bryant|payne|tempstar|heil|armstrong|airease|ducane|concord|weathermaker|comfortmaker|keeprite|daynight|arcoaire|internationalcomfortproducts)\b', filtered, re.IGNORECASE))
+
+        # Detect Arabizi (Darija in Latin script) - common patterns
+        arabizi_patterns = len(re.findall(r'\b(?:rani|rak|rah|rayeh|rayha|hab|nechri|nchri|nchri|bghit|bgheit|bghina|bghiti|bghiu|bghi|3and|3andek|3andkom|3andi|3andha|3andu|kifash|kifash|wesh|wash|wach|chnowa|chno|chno|wesh|wash|ya|la|wakha|wala|meh|mah|machi|makayen|makayn|makain|ma|mashi|mch|mchi|msh|mshi|kayn|kayen|kayna|kaynat|kaynin|fih|fiha|fihom|m3a|ma3a|m3ak|m3aha|m3ahom|belli|bali|baleh|balah|inch|allah|inchallah|inchalla|bismillah|bismilah|hamdullah|hamdilah|astaghfirullah|astaghfirllah|subhanallah|subhanallah|mashallah|machallah|barakallah|barakallah|allah|yatik|yatek|yatina|yatini|yatini|rabi|rabi|y3afik|y3afek|y3afina|y3afeni|y3afenkom|y3afenhom|allah|yhannik|yhannek|yhannina|yhannini|allah|ykhalih|ykhalih|ykhalina|ykhalini|allah|ystr|ystr|ybarek|ybarek|ybark|ybarek|allah|y3tik|y3tek|y3tina|y3tini|allah)\b', filtered, re.IGNORECASE))
+
+        # Detect corrupted mixed words (Arabic with Latin letters embedded)
+        corrupted_patterns = len(re.findall(r'[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿][a-zA-Z]+|[a-zA-Z]+[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]', filtered))
+
+        # Heuristic: if we have very few Arabic chars but many Latin words, it's foreign
+        if arabic_chars < 5 and (latin_words > 2 or french_common > 1 or english_common > 1 or arabizi_patterns > 0):
+            return True
+        # If we have some Arabic but significant French/English words mixed in
+        if arabic_chars > 0 and (french_common > 2 or english_common > 2 or latin_words > 5 or arabizi_patterns > 0 or corrupted_patterns > 0):
+            return True
+
+        return False
+
 
 
     async def _run_agent_tool_loop(
@@ -1683,13 +1728,14 @@ class ConversationEngine:
                     "\n"
                     "If you do not know something: say so honestly, ask, or use a tool. Never fake it.\n"
                     "\n"
-                    "LANGUAGE AND DIALECT\n"
+                    "LANGUAGE AND DIALECT (MANDATORY)\n"
                     "\n"
-                    "- Default: Natural Algerian Darija (everyday, respectful, not exaggerated)\n"
-                    "- Match the customer: If they write in French -> French. Fusha -> simple clear Arabic. Mixed -> match their mix\n"
-                    "- Consistency: Pick a dialect style and stay with it for the conversation\n"
-                    "- No Mashriqi, no Moroccan, no literal translations from English/Chinese\n"
-                    "- Product names and technical specs: keep exactly as in catalog\n"
+                    "- The customer may write in ANY of: Algerian Darija (Arabic script), Modern Standard Arabic, French, English, or Arabizi (Darija in Latin letters, including mixed forms like \"Rani hab nechri téléphone\"). You MUST understand all of them naturally.\n"
+                    "- YOUR RESPONSES MUST BE IN ARABIC ONLY (Algerian Arabic script, or clear Modern Standard Arabic when appropriate). Do NOT imitate the customer's input language.\n"
+                    "- Preferred style: natural, clear Algerian Arabic written in Arabic script.\n"
+                    "- Do NOT use Eastern (Mashriqi) or Moroccan dialect. No literal translations from English/Chinese.\n"
+                    "- Keep brand names, product models, technical identifiers, numbers, and proper nouns unchanged — this is NOT language mixing.\n"
+                    "- If your generated response contains substantial unintended French/English fragments, the system will regenerate it. Avoid simplistic word replacement or destructive sanitization.\n"
                     "\n"
                     "THE THREE CATEGORIES OF INFORMATION\n"
                     "\n"
@@ -2084,22 +2130,32 @@ class ConversationEngine:
                         "response": content,
                         "turn_has_draft_mod": turn_has_draft_mod,
                     }
-                if provider_name == "freellm" and reply_repair_attempts < 1:
-                    reply_repair_attempts += 1
-                    messages.append(
-                        LLMMessage(
-                            role="user",
-                            content=(
-                                "Your previous response could not be delivered "
-                                "because it was empty, malformed, or had invalid "
-                                "text encoding. Produce a complete natural-language "
-                                "reply in the customer's language, using the existing "
-                                "verified facts and tool results. You may call a tool "
-                                "if needed; do not invent facts."
-                            ),
+                needs_repair = False
+                repair_reason = ""
+                if not self._is_secure_agent_reply(content):
+                    needs_repair = True
+                    repair_reason = "empty, malformed, or invalid encoding"
+                elif self._has_foreign_fragments(content):
+                    needs_repair = True
+                    repair_reason = "contained unintended French/English fragments"
+
+                if provider_name == "freellm" and needs_repair and reply_repair_attempts < 1:
+                        reply_repair_attempts += 1
+                        messages.append(
+                            LLMMessage(
+                                role="user",
+                                content=(
+                                    f"Your previous response could not be delivered because it {repair_reason}. "
+                                    "Produce a complete natural-language reply in ARABIC ONLY "
+                                    "(Algerian Arabic script or clear Modern Standard Arabic). "
+                                    "Do not use French, English, or mixed language. "
+                                    "Keep brand names, product models, technical identifiers, "
+                                    "numbers, and proper nouns unchanged. Use existing verified facts "
+                                    "and tool results. You may call a tool if needed; do not invent facts."
+                                ),
+                            )
                         )
-                    )
-                    continue
+                        continue
                 return await safe_fallback()
 
             normalized_calls = [
