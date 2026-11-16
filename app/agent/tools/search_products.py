@@ -28,6 +28,9 @@ _ARABIC_LETTERS = str.maketrans(
     }
 )
 _SAMSUNG_VARIANTS = re.compile(r"(?<!\w)(?:samsung|سامسونغ|سامسونج)(?!\w)", re.IGNORECASE)
+
+# Map common phone-related terms to "هاتف" for search
+_PHONE_SYNONYMS = re.compile(r"(?<!\w)(?:تيلفون|تيليفون|موبايل|موبيل|جوالات|جوال|محمول)(?!\w)", re.IGNORECASE)
 _ARABIC_CATEGORY_FORMS = {
     "احذيه": "حذاء",
     "احذاء": "حذاء",
@@ -36,6 +39,13 @@ _ARABIC_CATEGORY_FORMS = {
     "لباس": "ملابس",
     "هواتف": "هاتف",
     "هاتف": "هاتف",
+    "تيلفون": "هاتف",
+    "تيليفون": "هاتف",
+    "موبايل": "هاتف",
+    "موبيل": "هاتف",
+    "جوالات": "هاتف",
+    "جوال": "هاتف",
+    "محمول": "هاتف",
     "حقائب": "حقيبه",
     "حقيبه": "حقيبه",
     "ساعات": "ساعه",
@@ -55,6 +65,8 @@ def normalize_product_search_text(value: str | None) -> str:
     )
     normalized = normalized.translate(_ARABIC_DIGITS).translate(_ARABIC_LETTERS)
     normalized = _SAMSUNG_VARIANTS.sub("سامسونغ", normalized)
+    # Normalize phone synonyms to "هاتف"
+    normalized = _PHONE_SYNONYMS.sub("هاتف", normalized)
     tokens = []
     for token in re.sub(r"\s+", " ", normalized.casefold()).strip().split():
         if token.startswith("ال") and len(token) > 4:
