@@ -123,14 +123,14 @@ class FreeLLMProvider(LLMProvider):
                 routed_via = raw_response.headers.get("X-Routed-Via")
                 routed_via_present = routed_via is not None
                 if routed_via:
-                    logger.info(
+                    logger.warning(
                         "FreeLLM routed via model: %s (session_id=%s)",
                         routed_via,
                         session_id[:8] if session_id else "none",
                     )
 
-                # Structured observability log per HTTP request
-                logger.info(
+                # Structured observability log per HTTP request (WARNING to appear at default log level)
+                logger.warning(
                     "freellm_request_completed turn_id=%s call=%s attempt=%d "
                     "session_id=%s routed_via=%s routed_via_present=%s request_id=%s "
                     "latency_ms=%d reported_model=%s",
