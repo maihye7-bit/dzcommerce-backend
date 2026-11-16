@@ -1453,10 +1453,65 @@ class ConversationEngine:
         ):
             return False
         stripped = reply.strip()
+        # Reject replies containing working_memory JSON (internal state leak)
+        if re.search(r'"working_memory"\s*:', reply):
+            return False
         return not (
             stripped.startswith(("{", "[", "```"))
             and not re.search(r"[.!?؟]", stripped)
         )
+
+
+
+    @staticmethod
+
+    def _strip_internal_json(text: str) -> str:
+
+        """Remove internal JSON like working_memory from model output before sending to customer."""
+
+        if not isinstance(text, str):
+
+            return text
+
+        import re
+
+        # Only strip working_memory JSON objects - be very targeted
+
+        text = re.sub(r'"working_memory"\s*:\s*\{[^}]*\}(?:\s*,?)', '', text)
+
+        # Also strip explicit reasoning blocks
+
+        text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+        # Clean up any double newlines left behind
+
+        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
+
+        return text.strip()
+
+
+
+    @staticmethod
+
+    def _sanitize_response_for_customer(text: str) -> str:
+
+        """Ensure response is safe for customer - strip internal artifacts only."""
+
+        if not isinstance(text, str):
+
+            return text
+
+        text = ConversationEngine._strip_internal_json(text)
+
+        import re
+
+        text = re.sub(r'\b(?:product_id|variant_id|order_id|store_id|customer_id|conversation_id|api[_ -]?key|access[_ -]?token|secret)\b', '[REDACTED]', text, flags=re.IGNORECASE)
+
+        text = re.sub(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b', '[REDACTED]', text, flags=re.IGNORECASE)
+
+        return text
+
+
 
     async def _run_agent_tool_loop(
         self,
@@ -5110,6 +5165,7 @@ class ConversationEngine:
             response = SAFE_FALLBACK_RESPONSE
         else:
             response = response.strip()
+            response = self._sanitize_response_for_customer(response)
 
         if outbound_suffix:
             response = f"{response}\n\n{outbound_suffix}"
