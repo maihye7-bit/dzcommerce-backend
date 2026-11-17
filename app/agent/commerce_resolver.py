@@ -104,6 +104,7 @@ class CommerceResolver:
             "candidate_product_ids": state.get("candidate_product_ids") or [],
             "last_intent": intent,
             "last_nlu": nlu_output or {},
+            "shipping_info": state.get("shipping_info"),
         }
 
         if intent == "product_image_request":
@@ -1309,7 +1310,8 @@ class CommerceResolver:
                 "variant_id": str(variant.id),
                 "quantity": qty,
                 "unit_price": float(price),
-                "total_price": float(price * qty)
+                "total_price": float(price * qty),
+                "shipping_info": base_context.get("shipping_info")
             },
             context_updates={
                 **base_context,

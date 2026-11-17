@@ -53,7 +53,7 @@ class ScriptedToolProvider:
         self.responses = list(responses)
         self.calls = []
 
-    async def chat(self, messages, tools=None, system_prompt=None, session_id=None):
+    async def chat(self, messages, tools=None, system_prompt=None, session_id=None, turn_id=None, call_index=None):
         self.calls.append((messages, tools))
         response = self.responses.pop(0)
         if isinstance(response, Exception):

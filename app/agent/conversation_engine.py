@@ -2616,6 +2616,13 @@ class ConversationEngine:
             # Clear confirmation_pending when draft is modified (any successful draft modification)
             if tool_name in {"create_order_draft", "update_order_draft", "replace_draft_item_variant"} and tool_result.success:
                 metadata.pop("confirmation_pending", None)
+            # Persist shipping info from create_order_draft even on failure so customer info survives retries
+            if (
+                tool_name == "create_order_draft"
+                and not tool_result.success
+                and decision.resolved_entities.get("shipping_info")
+            ):
+                metadata["shipping_info"] = decision.resolved_entities["shipping_info"]
             if key not in resolver_managed_keys:
                 metadata[key] = value
         conversation.metadata_json = metadata
