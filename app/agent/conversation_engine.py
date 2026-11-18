@@ -4623,8 +4623,8 @@ class ConversationEngine:
                             },
                             products=composer_products,
                             session_id=str(conversation.id),
-                            turn_id=trace_turn_id,
-                            call_index=model_call_count,
+                            turn_id=turn_id,
+                            call_index=1,
                         )
                         # Kept: FreeLLM reply stands; product info handled downstream
                 # by localized final text generation, not reply composer overwrite

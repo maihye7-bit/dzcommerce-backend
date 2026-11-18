@@ -383,6 +383,8 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
             "حبيت اطلب", "أريد اطلب", "أريد شراء",
             "n7ab nechri", "bghit nechri", "7ab nechri", "n7ab n7dem", "bghit n7dem",
             "حبيت نكوموني", "نحب نكوموني", "حب نكوموني",
+            # Completion phrases
+            "كمل الطلب", "كمل طلبي", "نكمل الطلب", "نكمل طلبي",
         ]
         for phrase in strong_phrases:
             if re.search(re.escape(phrase), normalized):
@@ -442,6 +444,11 @@ def _is_purchase_intent(message: str, state: Optional[Dict[str, Any]] = None) ->
         r"نكوموني",            # "I order" (variant)
         r"نشرى",               # "We/I buy"
         r"نشرى واحد",          # "Buy one"
+        # Completion phrases
+        r"كمل\s+الطلب",       # "كمل الطلب" - complete the order
+        r"كمل\s+طلبي",        # "كمل طلبي" - complete my order
+        r"نكمل\s+الطلب",     # "نكمل الطلب" - we complete the order
+        r"نكمل\s+طلبي",      # "نكمل طلبي" - we complete my order
     ]
     if _is_explicit_order_request(message):
         return True
