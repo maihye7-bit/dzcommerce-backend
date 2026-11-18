@@ -67,6 +67,21 @@ SAFE_FALLBACK_RESPONSE = "عذراً، لم أتمكن من إكمال طلبك 
 logger = logging.getLogger(__name__)
 
 
+def _retry_after_seconds(exc: Exception, default: float = 2.0) -> float:
+    """Read Retry-After from a 429 response, falling back to a default."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if not raw:
+        return default
+    try:
+        if isinstance(raw, (int, float)):
+            return max(0.0, float(raw))
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 def _log_agent_tool_database_failure(
     tool_name: str,
     exc: SQLAlchemyError,
@@ -1947,6 +1962,13 @@ class ConversationEngine:
                 )
                 if retryable and provider_failure_retries < 1:
                     provider_failure_retries += 1
+                    # A 429 is a per-model rate limit: honor the server's
+                    # Retry-After instead of hammering the dead model, then
+                    # yield the next request to FreeLLMAPI's own routing.
+                    if getattr(exc, "status_code", None) == 429:
+                        retry_after = _retry_after_seconds(exc)
+                        if isinstance(retry_after, (int, float)) and retry_after > 0:
+                            await asyncio.sleep(float(retry_after))
                     continue
                 return await safe_fallback()
             self._record_agent_usage(
@@ -2008,6 +2030,13 @@ class ConversationEngine:
                 )
                 if retryable and provider_failure_retries < 1:
                     provider_failure_retries += 1
+                    # A 429 is a per-model rate limit: honor the server's
+                    # Retry-After instead of hammering the dead model, then
+                    # yield the next request to FreeLLMAPI's own routing.
+                    if status_code == 429:
+                        retry_after = response_usage.get("retry_after_seconds")
+                        if isinstance(retry_after, (int, float)) and retry_after > 0:
+                            await asyncio.sleep(float(retry_after))
                     continue
                 return await safe_fallback()
 

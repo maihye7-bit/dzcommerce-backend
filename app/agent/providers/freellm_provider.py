@@ -32,6 +32,29 @@ class FreeLLMProvider(LLMProvider):
         self.model = FREE_LLM_MODEL
         # Max retries for transient errors (429, 500s)
         self.max_retries = 3
+        # A 429 means the currently routed model is rate-limited. Repeating the
+        # same request only burns quota against a dead model, so we attempt at
+        # most one rate-limit retry (honoring Retry-After) and then yield to the
+        # engine-level fallback, which issues a fresh request FreeLLMAPI can
+        # route to an available model (e.g. groq/openai/gpt-oss-120b).
+        self._rate_limit_retry_attempted = False
+
+    @staticmethod
+    def _retry_after_seconds(exc: RateLimitError, default: float = 2.0) -> float:
+        """Read Retry-After from the 429 response, falling back to a default."""
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) or {}
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+        if not raw:
+            return default
+        try:
+            # Header can be a delta-seconds integer or an HTTP-date.
+            if isinstance(raw, (int, float)):
+                return max(0.0, float(raw))
+            value = float(str(raw).strip())
+            return max(0.0, value)
+        except (TypeError, ValueError):
+            return default
 
     def _build_openai_messages(self, messages: list[LLMMessage]) -> list[dict]:
         """Convert internal LLMMessage list to OpenAI-compatible format."""
@@ -71,6 +94,7 @@ class FreeLLMProvider(LLMProvider):
         call_index: int | None = None,
     ) -> LLMResponse:
         start_time = time.time()
+        self._rate_limit_retry_attempted = False
         openai_messages = self._build_openai_messages(messages)
 
         if system_prompt and not any(m["role"] == "system" for m in openai_messages):
@@ -201,13 +225,23 @@ class FreeLLMProvider(LLMProvider):
                 )
 
                 if should_retry and attempt < self.max_retries:
-                    wait_time = (attempt + 1) * 2  # Simple linear backoff: 2s, 4s, 6s
+                    # HTTP 429 is a per-model rate limit, not a request glitch.
+                    # Retry it at most once, honoring the server's Retry-After,
+                    # then stop: further retries hammer the same dead model.
+                    if isinstance(e, RateLimitError):
+                        if self._rate_limit_retry_attempted:
+                            break
+                        self._rate_limit_retry_attempted = True
+                        wait_time = self._retry_after_seconds(e, default=2)
+                    else:
+                        wait_time = (attempt + 1) * 2  # Simple linear backoff: 2s, 4s, 6s
                     logger.warning(
                         "FreeLLM request failed; retrying "
-                        "(attempt=%s/%s, error_type=%s)",
+                        "(attempt=%s/%s, error_type=%s, wait_seconds=%.1f)",
                         attempt + 1,
                         self.max_retries,
                         type(e).__name__,
+                        wait_time,
                     )
                     await asyncio.sleep(wait_time)
                     continue
@@ -239,5 +273,10 @@ class FreeLLMProvider(LLMProvider):
                     type(last_exception).__name__ if last_exception else "unknown"
                 ),
                 "status_code": getattr(last_exception, "status_code", None),
+                "retry_after_seconds": (
+                    self._retry_after_seconds(last_exception)
+                    if isinstance(last_exception, RateLimitError)
+                    else None
+                ),
             },
         )
