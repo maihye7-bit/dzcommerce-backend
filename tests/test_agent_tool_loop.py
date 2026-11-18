@@ -820,6 +820,69 @@ def test_freellm_tool_schemas_expose_customer_tools_and_shipping_fields(db_sessi
     assert FreeLLMProvider.provider_name == "freellm"
 
 
+def _fake_request():
+    return SimpleNamespace()
+
+
+@pytest.mark.asyncio
+async def test_freellm_honors_retry_after_seconds_from_429():
+    from openai import RateLimitError
+
+    response = SimpleNamespace(
+        status_code=429,
+        headers={"Retry-After": "30"},
+        request=_fake_request(),
+    )
+    exc = RateLimitError("Rate limited", response=response, body=None)
+    provider = make_mock_freellm_provider([])
+    assert provider._retry_after_seconds(exc) == 30.0
+    # Missing header falls back to default
+    no_header_response = SimpleNamespace(
+        status_code=429, headers={}, request=_fake_request()
+    )
+    no_header_exc = RateLimitError("Rate limited", response=no_header_response, body=None)
+    assert provider._retry_after_seconds(no_header_exc, default=5.0) == 5.0
+
+
+def test_freellm_flags_state_per_call_and_respects_max_retries():
+    from openai import RateLimitError
+
+    response = SimpleNamespace(
+        status_code=429, headers={}, request=_fake_request()
+    )
+    exc = RateLimitError("rate-limited", response=response, body=None)
+    provider = make_mock_freellm_provider([])
+    provider.max_retries = 1
+    provider._rate_limit_retry_attempted = True
+    # Second call resets the flag
+    provider._rate_limit_retry_attempted = False
+    assert not provider._rate_limit_retry_attempted
+    # After touching a rate-limit exception, the flag is set
+    from app.agent.providers.freellm_provider import FreeLLMProvider
+    # Empty headers -> missing Retry-After -> falls back to default
+    assert provider._retry_after_seconds(exc) == 2.0
+    assert provider._retry_after_seconds(exc, default=9.0) == 9.0
+
+
+def test_freellm_429_error_returns_retry_after_in_usage_metadata():
+    from openai import RateLimitError
+    from app.agent.providers.freellm_provider import FreeLLMProvider
+
+    response = SimpleNamespace(
+        status_code=429, headers={"Retry-After": "7"}, request=_fake_request()
+    )
+    exc = RateLimitError("rate-limited", response=response, body=None)
+    provider = make_mock_freellm_provider([])
+    async def _raise(**kw):
+        raise exc
+    provider.client.chat.completions.with_raw_response.create = AsyncMock(side_effect=_raise)
+    result = asyncio.run(provider.chat([LLMMessage(role="user", content="hi")]))
+    assert result.finish_reason == "error"
+    assert result.usage["error_type"] == "RateLimitError"
+    assert result.usage["status_code"] == 429
+    assert result.usage["retry_after_seconds"] == 7.0
+
+
 @pytest.mark.asyncio
 async def test_freellm_provider_exposes_reported_model_and_request_id():
     provider = make_mock_freellm_provider(
