@@ -5164,6 +5164,8 @@ async def test_freellm_captures_delivery_details_before_generating_checkout_repl
     assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
     assert conversation.metadata_json["confirmation_pending"]["draft_id"] == draft_id
     assert "أكد الطلب" in first["response"]
+    assert "0674251265" in first["response"]
+    assert "قالمة" in first["response"]
 
     second = await engine.process_message(
         db=db_session,
@@ -5182,6 +5184,7 @@ async def test_freellm_captures_delivery_details_before_generating_checkout_repl
         engine._compute_draft_fingerprint(conversation.active_draft_json)
     )
     assert "أكد الطلب" in second["response"]
+    assert "حي 60 مسكن" in second["response"]
     assert provider.calls == []
 
 @pytest.mark.asyncio
