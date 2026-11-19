@@ -5334,3 +5334,29 @@ async def test_order_confirmation_requires_saved_delivery_details(db_session):
     assert db_session.query(InventoryItem).filter(
         InventoryItem.variant_id == variant.id
     ).one().quantity == 5
+
+
+def test_free_agent_reply_does_not_reask_saved_delivery_fields():
+    reply = (
+        "تمام، سجلت طلبك. من فضلك أعطني رقم الهاتف والولاية مرة أخرى. "
+        "كم قطعة تحب تطلب؟"
+    )
+    cleaned = ConversationEngine._suppress_saved_delivery_reasks(
+        reply,
+        {"phone": True, "wilaya": True},
+        has_active_draft=False,
+    )
+
+    assert "رقم الهاتف" not in cleaned
+    assert "الولاية مرة أخرى" not in cleaned
+    assert "كم قطعة" in cleaned
+
+
+def test_free_agent_reply_uses_next_missing_checkout_step_when_only_saved_field_is_requested():
+    cleaned = ConversationEngine._suppress_saved_delivery_reasks(
+        "من فضلك أعطني رقم هاتفك.",
+        {"phone": True, "wilaya": True},
+        has_active_draft=False,
+    )
+
+    assert cleaned == "وصلتني بيانات التوصيل. شحال من قطعة تحب تطلب؟"
