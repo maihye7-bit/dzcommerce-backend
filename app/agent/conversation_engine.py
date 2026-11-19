@@ -5305,18 +5305,20 @@ class ConversationEngine:
             normalized_message = (user_message or "").translate(
                 str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
             )
-            received_phone, received_wilaya = self._extract_delivery_details(
-                normalized_message, served_wilayas
+            is_delivery_statement = not re.search(
+                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
+                normalized_message,
+                flags=re.IGNORECASE,
+            )
+            received_phone, received_wilaya = (
+                self._extract_delivery_details(normalized_message, served_wilayas)
+                if is_delivery_statement
+                else (None, None)
             )
             phone_free_message = re.sub(
                 r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
                 " ",
                 normalized_message,
-            )
-            is_delivery_statement = not re.search(
-                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
-                normalized_message,
-                flags=re.IGNORECASE,
             )
             municipality_match = (
                 re.search(
