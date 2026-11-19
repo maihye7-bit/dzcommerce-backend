@@ -5314,7 +5314,7 @@ class ConversationEngine:
                 normalized_message,
             )
             is_delivery_statement = not re.search(
-                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\\b",
+                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
                 normalized_message,
                 flags=re.IGNORECASE,
             )
