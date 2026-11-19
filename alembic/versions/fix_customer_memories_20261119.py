@@ -21,6 +21,10 @@ down_revision = "db39a7d5b0a4"
 branch_labels = None
 depends_on = None
 
+# Ownership tracking table - persisted metadata about what this migration created
+_OWNERSHIP_TABLE = "migration_ownership_metadata"
+_OWNERSHIP_MARKER = "customer_memories_created_by_fix_customer_memories"
+
 
 def _table_exists(conn):
     """Check if customer_memories table exists using SQLAlchemy Inspector."""
@@ -191,18 +195,54 @@ def _validate_schema(conn) -> None:
         )
 
 
-def _migration_created_table(conn) -> bool:
-    """Check if this migration created the customer_memories table.
+def _ensure_ownership_table(conn):
+    """Create the ownership metadata table if it doesn't exist.
 
-    Uses a heuristic: if the table exists and has our specific index,
-    this migration created it. We track ownership by the unique indexes
-    we create.
+    This table persists information about what this migration created,
+    surviving separate upgrade and downgrade executions.
     """
-    indexes = _get_indexes(conn)
-    # These indexes are created only by this migration
-    has_store_customer_idx = "ix_customer_memories_store_customer" in indexes
-    has_type_idx = "ix_customer_memories_type" in indexes
-    return has_store_customer_idx or has_type_idx
+    inspector = inspect(conn)
+    if _OWNERSHIP_TABLE not in inspector.get_table_names():
+        conn.execute(sa.text(f"""
+            CREATE TABLE {_OWNERSHIP_TABLE} (
+                marker TEXT PRIMARY KEY,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+            )
+        """))
+
+
+def _migration_created_table(conn) -> bool:
+    """Check if this migration created the customer_memories table using persistent metadata.
+
+    Uses a dedicated ownership tracking table that records whether this
+    migration created the customer_memories table. This survives separate
+    upgrade and downgrade executions.
+    """
+    # First ensure ownership table exists
+    _ensure_ownership_table(conn)
+
+    # Check if we recorded that we created this table
+    result = conn.execute(sa.text(f"""
+        SELECT 1 FROM {_OWNERSHIP_TABLE} WHERE marker = :marker
+    """), {"marker": _OWNERSHIP_MARKER})
+
+    return result.scalar() is not None
+
+
+def _record_ownership(conn, created: bool):
+    """Record ownership state in the metadata table."""
+    if created:
+        # Record that we created customer_memories
+        conn.execute(sa.text(f"""
+            INSERT INTO {_OWNERSHIP_TABLE} (marker) VALUES (:marker)
+            ON CONFLICT (marker) DO NOTHING
+        """), {"marker": _OWNERSHIP_MARKER})
+    else:
+        # Record that customer_memories was pre-existing
+        conn.execute(sa.text(f"""
+            INSERT INTO {_OWNERSHIP_TABLE} (marker) VALUES (:marker)
+            ON CONFLICT (marker) DO NOTHING
+        """), {"marker": f"{_OWNERSHIP_MARKER}_preexisting"})
 
 
 def upgrade() -> None:
@@ -218,6 +258,8 @@ def upgrade() -> None:
         if _table_exists(conn):
             # Table exists - validate schema
             _validate_schema(conn)
+            # Record that table was pre-existing
+            _record_ownership(conn, created=False)
             return
 
         # Create table and indexes using op methods for Alembic compatibility
@@ -269,6 +311,14 @@ def upgrade() -> None:
             ["store_id", "memory_type"],
             unique=False,
         )
+
+        # Ensure ownership table exists and record that we created customer_memories
+        _ensure_ownership_table(conn)
+        conn.execute(sa.text(f"""
+            INSERT INTO {_OWNERSHIP_TABLE} (marker) VALUES (:marker)
+            ON CONFLICT (marker) DO NOTHING
+        """), {"marker": _OWNERSHIP_MARKER})
+
     finally:
         conn.close()
 
@@ -283,6 +333,7 @@ def downgrade() -> None:
     1. Never removes a pre-existing table
     2. Never touches ai_usage_events
     3. Safe to run multiple times (idempotent)
+    4. Uses persistent metadata to determine ownership
     """
     bind = op.get_bind()
     conn = bind.connect()
@@ -291,9 +342,9 @@ def downgrade() -> None:
         if not _table_exists(conn):
             return
 
-        # Check if this migration owns this table
-        owner = _migration_created_table(conn)
-        if owner:
+        # Check if this migration owns this table using persistent metadata
+        if _migration_created_table(conn):
+            # We created it - remove it
             op.drop_index(
                 op.f("ix_customer_memories_store_customer"),
                 table_name="customer_memories"
@@ -303,7 +354,13 @@ def downgrade() -> None:
                 table_name="customer_memories"
             )
             op.drop_table("customer_memories")
+
+            # Record that we removed it
+            conn.execute(sa.text(f"""
+                DELETE FROM {_OWNERSHIP_TABLE} WHERE marker = :marker
+            """), {"marker": _OWNERSHIP_MARKER})
         # If not owned by this migration, we leave the table intact
+
     finally:
         conn.close()
 
