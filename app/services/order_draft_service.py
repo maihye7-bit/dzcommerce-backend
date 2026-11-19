@@ -404,8 +404,9 @@ def save_draft_safe(
 
             # CASE A: Same Variant + Same Quantity -> Idempotent, merge shipping
             if req_vid == ex_vid and req_qty == ex_qty:
-                existing_shipping: dict[str, Any] = dict(
-                    existing_draft.get("shipping_info") or {}
+                # Normalize existing shipping to canonical form (handles legacy commune field)
+                existing_shipping = _normalize_canonical_shipping(
+                    existing_draft.get("shipping_info")
                 )
                 new_shipping = _normalize_canonical_shipping(shipping_info)
                 existing_shipping.update(new_shipping)

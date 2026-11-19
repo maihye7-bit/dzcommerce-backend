@@ -121,12 +121,11 @@ class UpdateOrderDraftTool(BaseTool):
                     return ToolResult(
                         success=False, error="No active draft found to update.",
                     )
-                existing_shipping = current_draft.get("shipping_info")
-                merged_shipping = (
-                    dict(existing_shipping)
-                    if isinstance(existing_shipping, dict)
-                    else {}
+                # Normalize existing shipping to canonical form (handles legacy commune field)
+                existing_shipping = _normalize_canonical_shipping(
+                    current_draft.get("shipping_info")
                 )
+                merged_shipping = dict(existing_shipping)
                 merged_shipping.update(normalized_shipping)
                 updated_draft = update_draft_items(
                     db=db,
