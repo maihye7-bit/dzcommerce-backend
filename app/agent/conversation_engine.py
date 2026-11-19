@@ -1603,6 +1603,78 @@ class ConversationEngine:
 
 
 
+    @classmethod
+    def _suppress_saved_delivery_reasks(
+        cls,
+        reply: str,
+        saved_fields: dict[str, Any],
+        *,
+        has_active_draft: bool,
+    ) -> str:
+        """Never ask a customer to repeat delivery fields already persisted."""
+        if not isinstance(reply, str) or not isinstance(saved_fields, dict):
+            return reply
+
+        field_patterns = {
+            "phone": re.compile(
+                r"رقم\s*(?:الهاتف|التليفون|التلفون)|رقمك|الهاتف|التليفون|"
+                r"التلفون|phone|mobile|telephone|num[eé]ro",
+                re.IGNORECASE,
+            ),
+            "wilaya": re.compile(
+                r"الولاية|ولاية|wilaya|province",
+                re.IGNORECASE,
+            ),
+            "municipality": re.compile(
+                r"البلدية|بلدية|البلديه|بلديه|commune|municipality",
+                re.IGNORECASE,
+            ),
+            "address": re.compile(
+                r"العنوان|عنوانك|العنوان الكامل|address|street",
+                re.IGNORECASE,
+            ),
+        }
+        request_pattern = re.compile(
+            r"نحتاج|أحتاج|احتاج|عط[يّ]?ني|عط[يّ]?نا|"
+            r"أرسل|ارسل|ابعث|زوّدني|زودني|من فضلك|يرجى|"
+            r"اعطني|أعطني|please|provide|send|what is|"
+            r"ما هو|ماهو|واش هو",
+            re.IGNORECASE,
+        )
+
+        kept_segments: list[str] = []
+        removed_any = False
+        for segment in re.split(r"(?<=[.!؟?])\s+|\n+", reply):
+            text = segment.strip()
+            if not text:
+                continue
+            repeats_saved_field = any(
+                saved_fields.get(field) is True
+                and pattern.search(text)
+                and request_pattern.search(text)
+                for field, pattern in field_patterns.items()
+            )
+            if repeats_saved_field:
+                removed_any = True
+                continue
+            kept_segments.append(text)
+
+        if not removed_any:
+            return reply.strip()
+
+        cleaned = " ".join(kept_segments).strip()
+        if cleaned:
+            return cleaned
+        if has_active_draft:
+            return "بيانات التوصيل محفوظة. راجع ملخص الطلب وأكد إذا كان كل شيء صحيحاً."
+        if saved_fields.get("phone") and saved_fields.get("wilaya"):
+            return "وصلتني بيانات التوصيل. شحال من قطعة تحب تطلب؟"
+        if saved_fields.get("phone"):
+            return "رقم الهاتف محفوظ. بقيت الولاية باش نكملوا الطلب."
+        if saved_fields.get("wilaya"):
+            return "الولاية محفوظة. بقي رقم الهاتف باش نكملوا الطلب."
+        return reply.strip()
+
     async def _run_agent_tool_loop(
         self,
         *,
@@ -2141,6 +2213,12 @@ class ConversationEngine:
                     content = ""
 
             if not calls:
+                if provider_name == "freellm":
+                    content = self._suppress_saved_delivery_reasks(
+                        content,
+                        safe_context.get("saved_delivery_fields", {}),
+                        has_active_draft=safe_context.get("active_draft") is True,
+                    )
                 current_facts = facts
                 if provider_name != "freellm":
                     for message in messages:
