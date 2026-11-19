@@ -206,7 +206,7 @@ def _ensure_ownership_table(conn):
         conn.execute(sa.text(f"""
             CREATE TABLE {_OWNERSHIP_TABLE} (
                 marker TEXT PRIMARY KEY,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
             )
         """))
 
@@ -280,13 +280,13 @@ def upgrade() -> None:
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
             nullable=False,
         ),
         sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
             nullable=False,
         ),
         sa.ForeignKeyConstraint(
