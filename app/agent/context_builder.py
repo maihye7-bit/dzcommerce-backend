@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.providers.base import LLMMessage
 from app.models.conversation import Conversation, Message
+from app.models.customer import Customer
 
 SYSTEM_PROMPT = """You are DzCommerce Agent, an AI sales assistant for an Algerian online store.
 
@@ -260,8 +261,17 @@ class ConversationContextBuilder:
                     parts.append("- STATUS: ACTIVE_DRAFT")
                     shipping = draft.get("shipping_info")
                     shipping = shipping if isinstance(shipping, dict) else {}
+                    customer_phone = (
+                        self.db.query(Customer.phone)
+                        .filter(
+                            Customer.id == self.customer_id,
+                            Customer.store_id == self.store_id,
+                        )
+                        .scalar()
+                    )
+                    phone_saved = bool(shipping.get("phone") or customer_phone)
                     parts.append("- DELIVERY DATA (saved draft is authoritative):")
-                    parts.append(f"  - PHONE: {'SAVED' if shipping.get('phone') else 'MISSING'}")
+                    parts.append(f"  - PHONE: {'SAVED' if phone_saved else 'MISSING'}")
                     for field in ("wilaya", "municipality", "address", "first_name", "last_name"):
                         value = shipping.get(field)
                         parts.append(f"  - {field.upper()}: {value if isinstance(value, str) and value.strip() else 'NOT PROVIDED'}")
