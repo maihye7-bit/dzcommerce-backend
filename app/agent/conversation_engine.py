@@ -695,6 +695,25 @@ class ConversationEngine:
                 if isinstance(shipping_info.get("municipality"), str)
                 else None
             ),
+            "address": (
+                shipping_info.get("address")
+                if isinstance(shipping_info.get("address"), str)
+                else None
+            ),
+            "first_name": (
+                shipping_info.get("first_name")
+                if isinstance(shipping_info.get("first_name"), str)
+                else None
+            ),
+            "last_name": (
+                shipping_info.get("last_name")
+                if isinstance(shipping_info.get("last_name"), str)
+                else None
+            ),
+            "required_delivery_fields": {
+                "phone": bool(shipping_info.get("phone") or customer),
+                "wilaya": bool(shipping_info.get("wilaya")),
+            },
         }
 
     def _agent_verified_state_facts(
@@ -3972,8 +3991,13 @@ class ConversationEngine:
                 if received_wilaya:
                     shipping_info["wilaya"] = received_wilaya
                 # Normalize shipping info (handles municipality/commune alias)
-                from app.services.order_draft_service import _normalize_canonical_shipping
-                updated_draft["shipping_info"] = _normalize_canonical_shipping(shipping_info)
+                from app.services.order_draft_service import (
+                    _normalize_canonical_shipping,
+                )
+
+                updated_draft["shipping_info"] = _normalize_canonical_shipping(
+                    shipping_info
+                )
                 conversation.active_draft_json = updated_draft
                 # Invalidate any pending confirmation since shipping info changed
                 conversation.metadata_json.pop("confirmation_pending", None)
@@ -3993,6 +4017,7 @@ class ConversationEngine:
                         commune=commune,
                         first_name=first_name,
                         last_name=last_name,
+                        address=updated_draft["shipping_info"].get("address"),
                         language=local_message_nlu.get("language", "ar"),
                     )
                 )
@@ -5267,23 +5292,143 @@ class ConversationEngine:
         had_active_draft = bool(
             isinstance(draft_before, dict) and draft_before.get("items")
         )
+
+        # FreeLLM enters this path before the legacy deterministic checkout
+        # capture. Persist delivery facts here first so the model never has to
+        # infer whether a phone/wilaya/address was already supplied.
+        delivery_capture_applied = False
+        delivery_capture_response = None
+        delivery_capture_question_type = None
+        if had_active_draft:
+            served_wilayas = db.query(Store.served_wilayas).filter(
+                Store.id == store_id
+            ).scalar()
+            normalized_message = (user_message or "").translate(
+                str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+            )
+            is_delivery_statement = not re.search(
+                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
+                normalized_message,
+                flags=re.IGNORECASE,
+            )
+            received_phone, received_wilaya = (
+                self._extract_delivery_details(normalized_message, served_wilayas)
+                if is_delivery_statement
+                else (None, None)
+            )
+            phone_free_message = re.sub(
+                r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
+                " ",
+                normalized_message,
+            )
+            municipality_match = (
+                re.search(
+                    r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
+                    phone_free_message,
+                    flags=re.IGNORECASE,
+                )
+                if is_delivery_statement
+                else None
+            )
+            address_match = (
+                re.search(
+                    r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
+                    phone_free_message,
+                    flags=re.IGNORECASE,
+                )
+                if is_delivery_statement
+                else None
+            )
+            received_municipality = (
+                municipality_match.group(1).strip() if municipality_match else None
+            )
+            received_address = (
+                address_match.group(0).strip() if address_match else None
+            )
+            if received_address:
+                received_address = re.sub(
+                    r"\s+(?:ولاية|الولاية|بلدية|بلديه|البلدية).*$",
+                    "",
+                    received_address,
+                    flags=re.IGNORECASE,
+                ).strip(" ،,؛;")
+            if any((
+                received_phone,
+                received_wilaya,
+                received_municipality,
+                received_address,
+            )):
+                updated_draft = dict(draft_before)
+                shipping_info = dict(updated_draft.get("shipping_info") or {})
+                customer = (
+                    db.query(Customer)
+                    .filter(
+                        Customer.id == customer_id,
+                        Customer.store_id == store_id,
+                    )
+                    .one_or_none()
+                )
+                if received_phone:
+                    shipping_info["phone"] = received_phone
+                    if customer is not None:
+                        customer.phone = received_phone
+                if received_wilaya:
+                    shipping_info["wilaya"] = received_wilaya
+                if received_municipality:
+                    shipping_info["municipality"] = received_municipality
+                if received_address:
+                    shipping_info["address"] = received_address
+                from app.services.order_draft_service import _normalize_canonical_shipping
+                updated_draft["shipping_info"] = _normalize_canonical_shipping(shipping_info)
+                conversation.active_draft_json = updated_draft
+                phone = updated_draft["shipping_info"].get("phone") or (
+                    customer.phone if customer is not None else None
+                )
+                wilaya = updated_draft["shipping_info"].get("wilaya")
+                delivery_capture_response, delivery_capture_question_type = (
+                    self._draft_next_step_response(
+                        updated_draft,
+                        phone=phone,
+                        wilaya=wilaya,
+                        commune=updated_draft["shipping_info"].get("municipality"),
+                        first_name=updated_draft["shipping_info"].get("first_name"),
+                        last_name=updated_draft["shipping_info"].get("last_name"),
+                        address=updated_draft["shipping_info"].get("address"),
+                        language=self._heuristic_nlu(user_message, current_state).get(
+                            "language", "ar"
+                        ),
+                    )
+                )
+                current_state = self._normalize_current_state(conversation, store_id)
+                delivery_capture_applied = True
+
         turn_has_draft_mod_ref = [False]
-        result = await self._run_agent_tool_loop(
-            turn_id=turn_id,
-            db=db,
-            store_id=store_id,
-            customer_id=customer_id,
-            conversation=conversation,
-            channel=channel,
-            user_message=user_message,
-            current_state=current_state,
-            dialogue_context=dialogue_context,
-            language=language,
-            image_observations=image_observations,
-            external_account_id=external_account_id,
-            external_user_id=external_user_id,
-            inbound_message_id=inbound_message_id,
-            turn_has_draft_mod_ref=turn_has_draft_mod_ref,
+        result = (
+            {
+                "accepted": True,
+                "response": delivery_capture_response,
+                "executed_tools": [],
+                "model_calls": [],
+                "nlu_output": self._heuristic_nlu(user_message, current_state),
+            }
+            if delivery_capture_applied
+            else await self._run_agent_tool_loop(
+                turn_id=turn_id,
+                db=db,
+                store_id=store_id,
+                customer_id=customer_id,
+                conversation=conversation,
+                channel=channel,
+                user_message=user_message,
+                current_state=current_state,
+                dialogue_context=dialogue_context,
+                language=language,
+                image_observations=image_observations,
+                external_account_id=external_account_id,
+                external_user_id=external_user_id,
+                inbound_message_id=inbound_message_id,
+                turn_has_draft_mod_ref=turn_has_draft_mod_ref,
+            )
         )
         response = (
             result.get("response")
@@ -5312,7 +5457,24 @@ class ConversationEngine:
             and isinstance(result.get("model_calls"), list)
             else []
         )
-        if any(
+        if delivery_capture_applied:
+            metadata = dict(conversation.metadata_json or {})
+            metadata["last_question_type"] = delivery_capture_question_type
+            if delivery_capture_question_type == "ORDER_CONFIRMATION":
+                draft = conversation.active_draft_json or {}
+                draft_id = draft.get("draft_id")
+                if not isinstance(draft_id, str) or not draft_id:
+                    draft_id = str(uuid.uuid4())
+                    conversation.active_draft_json = {**draft, "draft_id": draft_id}
+                metadata["confirmation_pending"] = {
+                    "draft_id": draft_id,
+                    "status": "awaiting",
+                    "fingerprint": self._compute_draft_fingerprint(conversation.active_draft_json),
+                }
+            else:
+                metadata.pop("confirmation_pending", None)
+            conversation.metadata_json = metadata
+        elif any(
             name in {"create_order_draft", "update_order_draft"}
             for name in executed_tools
         ) or tool_name in {"create_order_draft", "update_order_draft"} or (
@@ -6027,6 +6189,7 @@ class ConversationEngine:
         first_name: str | None,
         last_name: str | None,
         language: str,
+        address: str | None = None,
     ) -> tuple[str, str]:
         # Only phone and wilaya are required for ORDER_CONFIRMATION
         # commune, first_name, last_name are optional additions
@@ -6053,6 +6216,60 @@ class ConversationEngine:
             draft.get("total_price", "")
         )
         summary = "\n".join(rendered_items)
+        delivery_labels = {
+            "fr": {
+                "phone": "Téléphone",
+                "wilaya": "Wilaya",
+                "municipality": "Commune",
+                "address": "Adresse",
+                "first_name": "Prénom",
+                "last_name": "Nom",
+                "heading": "Livraison",
+            },
+            "en": {
+                "phone": "Phone",
+                "wilaya": "Wilaya",
+                "municipality": "Municipality",
+                "address": "Address",
+                "first_name": "First name",
+                "last_name": "Last name",
+                "heading": "Delivery",
+            },
+            "ar": {
+                "phone": "الهاتف",
+                "wilaya": "الولاية",
+                "municipality": "البلدية",
+                "address": "العنوان",
+                "first_name": "الاسم",
+                "last_name": "اللقب",
+                "heading": "بيانات التوصيل",
+            },
+        }.get(language, {
+            "phone": "الهاتف",
+            "wilaya": "الولاية",
+            "municipality": "البلدية",
+            "address": "العنوان",
+            "first_name": "الاسم",
+            "last_name": "اللقب",
+            "heading": "بيانات التوصيل",
+        })
+        delivery_parts = []
+        for field, value in (
+            ("phone", phone),
+            ("wilaya", wilaya),
+            ("municipality", commune),
+            ("address", address),
+            ("first_name", first_name),
+            ("last_name", last_name),
+        ):
+            if value:
+                delivery_parts.append(f"{delivery_labels[field]}: {value}")
+        separator = "، " if language == "ar" else ", "
+        delivery_summary = (
+            f"{delivery_labels['heading']}: " + separator.join(delivery_parts)
+            if delivery_parts
+            else ""
+        )
 
         if language == "fr":
             if missing:
@@ -6068,12 +6285,12 @@ class ConversationEngine:
                 )
                 return (
                     f"Brouillon enregistré :\n{summary}\nTotal : {total} DZD. "
-                    f"Envoyez {fields} pour continuer.",
+                    f"{delivery_summary} Envoyez {fields} pour continuer.",
                     "CUSTOMER_DELIVERY_INFO",
                 )
             return (
                 f"Récapitulatif de la commande :\n{summary}\nTotal : {total} DZD. "
-                "Si tout est correct, écrivez « أكد الطلب » pour confirmer.",
+                f"{delivery_summary} Si tout est correct, écrivez « أكد الطلب » pour confirmer.",
                 "ORDER_CONFIRMATION",
             )
         if language == "en":
@@ -6090,12 +6307,12 @@ class ConversationEngine:
                 )
                 return (
                     f"Draft saved:\n{summary}\nTotal: {total} DZD. "
-                    f"Send {fields} to continue.",
+                    f"{delivery_summary} Send {fields} to continue.",
                     "CUSTOMER_DELIVERY_INFO",
                 )
             return (
                 f"Order summary:\n{summary}\nTotal: {total} DZD. "
-                "If everything is correct, write « أكد الطلب » to confirm.",
+                f"{delivery_summary} If everything is correct, write « أكد الطلب » to confirm.",
                 "ORDER_CONFIRMATION",
             )
 
@@ -6106,12 +6323,12 @@ class ConversationEngine:
             )
             return (
                 f"تم حفظ مسودة الطلب:\n{summary}\nالمجموع: {total} دج. "
-                f"أرسل {fields} لمتابعة الطلب.",
+                f"{delivery_summary} أرسل {fields} لمتابعة الطلب.",
                 "CUSTOMER_DELIVERY_INFO",
             )
         return (
             f"ملخص الطلب:\n{summary}\nالمجموع: {total} دج. "
-            "إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.",
+            f"{delivery_summary} إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.",
             "ORDER_CONFIRMATION",
         )
 
