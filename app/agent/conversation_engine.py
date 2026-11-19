@@ -340,6 +340,11 @@ class ConversationEngine:
             "has_confirmed_order": has_confirmed_order,
             "conversation_memory": metadata.get("conversation_memory") or {},
             "confirmation_pending": metadata.get("confirmation_pending"),
+            "shipping_info": (
+                draft.get("shipping_info", {}) if isinstance(draft, dict) else {}
+            )
+            or metadata.get("shipping_info", {}),
+            "draft_id": draft.get("draft_id") if isinstance(draft, dict) else None,
         }
 
     @classmethod
@@ -479,6 +484,9 @@ class ConversationEngine:
                             "wilaya": {"type": "string"},
                             "municipality": {"type": "string"},
                             "address": {"type": "string"},
+                            "commune": {"type": "string"},
+                            "first_name": {"type": "string"},
+                            "last_name": {"type": "string"},
                         },
                         "additionalProperties": False,
                     },
@@ -528,6 +536,9 @@ class ConversationEngine:
                             "wilaya": {"type": "string"},
                             "municipality": {"type": "string"},
                             "address": {"type": "string"},
+                            "commune": {"type": "string"},
+                            "first_name": {"type": "string"},
+                            "last_name": {"type": "string"},
                         },
                         "additionalProperties": False,
                     },
@@ -2559,15 +2570,21 @@ class ConversationEngine:
     def _is_positive_integer(value: Any) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
+    _CANONICAL_SHIPPING_KEYS = frozenset({
+        "phone",
+        "wilaya",
+        "municipality",
+        "commune",
+        "address",
+        "first_name",
+        "last_name",
+    })
+
     @staticmethod
     def _valid_shipping_info(value: Any) -> bool:
-        if not isinstance(value, dict) or set(value) - {
-            "phone",
-            "wilaya",
-            "commune",
-            "first_name",
-            "last_name",
-        }:
+        if not isinstance(value, dict):
+            return False
+        if set(value) - ConversationEngine._CANONICAL_SHIPPING_KEYS:
             return False
         return all(
             isinstance(field, str) and 0 < len(field.strip()) <= 160
@@ -3954,8 +3971,12 @@ class ConversationEngine:
                         customer.phone = received_phone
                 if received_wilaya:
                     shipping_info["wilaya"] = received_wilaya
-                updated_draft["shipping_info"] = shipping_info
+                # Normalize shipping info (handles municipality/commune alias)
+                from app.services.order_draft_service import _normalize_canonical_shipping
+                updated_draft["shipping_info"] = _normalize_canonical_shipping(shipping_info)
                 conversation.active_draft_json = updated_draft
+                # Invalidate any pending confirmation since shipping info changed
+                conversation.metadata_json.pop("confirmation_pending", None)
 
                 phone = shipping_info.get("phone") or (
                     customer.phone if customer is not None else None

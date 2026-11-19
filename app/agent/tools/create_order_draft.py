@@ -52,6 +52,8 @@ class CreateOrderDraftTool(BaseTool):
                     "properties": {
                         "phone": {"type": "string"},
                         "wilaya": {"type": "string"},
+                        "municipality": {"type": "string"},
+                        "address": {"type": "string"},
                         "commune": {"type": "string"},
                         "first_name": {"type": "string"},
                         "last_name": {"type": "string"},
@@ -113,9 +115,9 @@ class CreateOrderDraftTool(BaseTool):
                         "wilaya": (draft_data.get("shipping_info") or {}).get(
                             "wilaya"
                         ),
-                        "commune": (
+                        "municipality": (
                             draft_data.get("shipping_info") or {}
-                        ).get("commune"),
+                        ).get("municipality"),
                         "first_name_provided": bool(
                             (draft_data.get("shipping_info") or {}).get("first_name")
                         ),
@@ -123,12 +125,12 @@ class CreateOrderDraftTool(BaseTool):
                             (draft_data.get("shipping_info") or {}).get("last_name")
                         ),
                     },
-                        "instruction": (
-                            "Do not confirm the final order. The conversation engine "
-                            "will continue the conversation and require explicit "
-                            "customer approval before placing the order."
-                        ),
-                    },
+                    "instruction": (
+                        "Do not confirm the final order. The conversation engine "
+                        "will continue the conversation and require explicit "
+                        "customer approval before placing the order."
+                    ),
+                },
             )
         except ValidationError as exc:
             message = str(exc)

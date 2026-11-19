@@ -10,6 +10,7 @@ from app.services.order_draft_service import (
     get_current_draft,
     replace_draft_item_variant,
     update_draft_items,
+    _normalize_canonical_shipping,
 )
 
 
@@ -69,6 +70,9 @@ class UpdateOrderDraftTool(BaseTool):
                         "wilaya": {"type": "string"},
                         "municipality": {"type": "string"},
                         "address": {"type": "string"},
+                        "commune": {"type": "string"},
+                        "first_name": {"type": "string"},
+                        "last_name": {"type": "string"},
                     },
                     "additionalProperties": False,
                 },
@@ -93,11 +97,11 @@ class UpdateOrderDraftTool(BaseTool):
             action = args["action"]
             if action == "set_shipping":
                 shipping_info = args.get("shipping_info")
+                allowed_keys = {"phone", "wilaya", "municipality", "address", "commune", "first_name", "last_name"}
                 if (
                     not isinstance(shipping_info, dict)
                     or not shipping_info
-                    or set(shipping_info)
-                    - {"phone", "wilaya", "municipality", "address"}
+                    or set(shipping_info) - allowed_keys
                     or any(
                         not isinstance(value, str)
                         or not value.strip()
@@ -110,24 +114,19 @@ class UpdateOrderDraftTool(BaseTool):
                         error="Valid shipping details are required.",
                         error_code="VALIDATION_ERROR",
                     )
+                # Normalize shipping info (handles municipality/commune alias)
+                normalized_shipping = _normalize_canonical_shipping(shipping_info)
                 current_draft = get_current_draft(db, conversation_id)
                 if not current_draft:
                     return ToolResult(
-                        success=False,
-                        error="No active draft found to update.",
+                        success=False, error="No active draft found to update.",
                     )
-                existing_shipping = current_draft.get("shipping_info")
-                merged_shipping = (
-                    dict(existing_shipping)
-                    if isinstance(existing_shipping, dict)
-                    else {}
+                # Normalize existing shipping to canonical form (handles legacy commune field)
+                existing_shipping = _normalize_canonical_shipping(
+                    current_draft.get("shipping_info")
                 )
-                merged_shipping.update(
-                    {
-                        key: value.strip()
-                        for key, value in shipping_info.items()
-                    }
-                )
+                merged_shipping = dict(existing_shipping)
+                merged_shipping.update(normalized_shipping)
                 updated_draft = update_draft_items(
                     db=db,
                     conversation_id=conversation_id,
@@ -156,8 +155,11 @@ class UpdateOrderDraftTool(BaseTool):
                             "municipality": updated_draft["shipping_info"].get(
                                 "municipality"
                             ),
-                            "address_provided": bool(
-                                updated_draft["shipping_info"].get("address")
+                            "first_name_provided": bool(
+                                updated_draft["shipping_info"].get("first_name")
+                            ),
+                            "last_name_provided": bool(
+                                updated_draft["shipping_info"].get("last_name")
                             ),
                         },
                     },
