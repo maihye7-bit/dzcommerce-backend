@@ -206,7 +206,7 @@ def _ensure_ownership_table(conn):
         conn.execute(sa.text(f"""
             CREATE TABLE {_OWNERSHIP_TABLE} (
                 marker TEXT PRIMARY KEY,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
             )
         """))
 
@@ -251,76 +251,73 @@ def upgrade() -> None:
     If the table already exists, validate its schema matches expectations.
     This migration does NOT touch ai_usage_events table.
     """
-    bind = op.get_bind()
-    conn = bind.connect()
+    # Alembic owns this Connection and its transaction; never reopen or close it.
+    conn = op.get_bind()
 
-    try:
-        if _table_exists(conn):
-            # Table exists - validate schema
-            _validate_schema(conn)
-            # Record that table was pre-existing
-            _record_ownership(conn, created=False)
-            return
+    if _table_exists(conn):
+        # Table exists - validate schema
+        _validate_schema(conn)
+        # Record that table was pre-existing
+        _record_ownership(conn, created=False)
+        return
 
-        # Create table and indexes using op methods for Alembic compatibility
-        op.create_table(
-            "customer_memories",
-            sa.Column("id", sa.UUID(), primary_key=True, nullable=False),
-            sa.Column("store_id", sa.UUID(), nullable=False),
-            sa.Column("customer_id", sa.UUID(), nullable=False),
-            sa.Column("memory_type", sa.String(50), nullable=False),
-            sa.Column("key", sa.String(100), nullable=False),
-            sa.Column("value", sa.String(500), nullable=False),
-            sa.Column(
-                "confidence",
-                sa.Float(),
-                nullable=False,
-                server_default="1.0"
-            ),
-            sa.Column("source", sa.String(100), nullable=True),
-            sa.Column(
-                "created_at",
-                sa.DateTime(timezone=True),
-                server_default=sa.text("now()"),
-                nullable=False,
-            ),
-            sa.Column(
-                "updated_at",
-                sa.DateTime(timezone=True),
-                server_default=sa.text("now()"),
-                nullable=False,
-            ),
-            sa.ForeignKeyConstraint(
-                ["store_id"], ["stores.id"], ondelete="CASCADE"
-            ),
-            sa.ForeignKeyConstraint(
-                ["customer_id"], ["customers.id"], ondelete="CASCADE"
-            ),
-            sa.CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_memory_confidence_range"),
-        )
+    # Create table and indexes using op methods for Alembic compatibility
+    op.create_table(
+        "customer_memories",
+        sa.Column("id", sa.UUID(), primary_key=True, nullable=False),
+        sa.Column("store_id", sa.UUID(), nullable=False),
+        sa.Column("customer_id", sa.UUID(), nullable=False),
+        sa.Column("memory_type", sa.String(50), nullable=False),
+        sa.Column("key", sa.String(100), nullable=False),
+        sa.Column("value", sa.String(500), nullable=False),
+        sa.Column(
+            "confidence",
+            sa.Float(),
+            nullable=False,
+            server_default="1.0"
+        ),
+        sa.Column("source", sa.String(100), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["store_id"], ["stores.id"], ondelete="CASCADE"
+        ),
+        sa.ForeignKeyConstraint(
+            ["customer_id"], ["customers.id"], ondelete="CASCADE"
+        ),
+        sa.CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_memory_confidence_range"),
+    )
 
-        op.create_index(
-            op.f("ix_customer_memories_store_customer"),
-            "customer_memories",
-            ["store_id", "customer_id"],
-            unique=False,
-        )
-        op.create_index(
-            op.f("ix_customer_memories_type"),
-            "customer_memories",
-            ["store_id", "memory_type"],
-            unique=False,
-        )
+    op.create_index(
+        op.f("ix_customer_memories_store_customer"),
+        "customer_memories",
+        ["store_id", "customer_id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_customer_memories_type"),
+        "customer_memories",
+        ["store_id", "memory_type"],
+        unique=False,
+    )
 
-        # Ensure ownership table exists and record that we created customer_memories
-        _ensure_ownership_table(conn)
-        conn.execute(sa.text(f"""
-            INSERT INTO {_OWNERSHIP_TABLE} (marker) VALUES (:marker)
-            ON CONFLICT (marker) DO NOTHING
-        """), {"marker": _OWNERSHIP_MARKER})
+    # Ensure ownership table exists and record that we created customer_memories
+    _ensure_ownership_table(conn)
+    conn.execute(sa.text(f"""
+        INSERT INTO {_OWNERSHIP_TABLE} (marker) VALUES (:marker)
+        ON CONFLICT (marker) DO NOTHING
+    """), {"marker": _OWNERSHIP_MARKER})
 
-    finally:
-        conn.close()
 
     # This migration does NOT drop or recreate ai_usage_events
     # that table was handled by earlier migrations and should be preserved
@@ -335,33 +332,30 @@ def downgrade() -> None:
     3. Safe to run multiple times (idempotent)
     4. Uses persistent metadata to determine ownership
     """
-    bind = op.get_bind()
-    conn = bind.connect()
+    # Alembic owns this Connection and its transaction; never reopen or close it.
+    conn = op.get_bind()
 
-    try:
-        if not _table_exists(conn):
-            return
+    if not _table_exists(conn):
+        return
 
-        # Check if this migration owns this table using persistent metadata
-        if _migration_created_table(conn):
-            # We created it - remove it
-            op.drop_index(
-                op.f("ix_customer_memories_store_customer"),
-                table_name="customer_memories"
-            )
-            op.drop_index(
-                op.f("ix_customer_memories_type"),
-                table_name="customer_memories"
-            )
-            op.drop_table("customer_memories")
+    # Check if this migration owns this table using persistent metadata
+    if _migration_created_table(conn):
+        # We created it - remove it
+        op.drop_index(
+            op.f("ix_customer_memories_store_customer"),
+            table_name="customer_memories"
+        )
+        op.drop_index(
+            op.f("ix_customer_memories_type"),
+            table_name="customer_memories"
+        )
+        op.drop_table("customer_memories")
 
-            # Record that we removed it
-            conn.execute(sa.text(f"""
-                DELETE FROM {_OWNERSHIP_TABLE} WHERE marker = :marker
-            """), {"marker": _OWNERSHIP_MARKER})
-        # If not owned by this migration, we leave the table intact
+        # Record that we removed it
+        conn.execute(sa.text(f"""
+            DELETE FROM {_OWNERSHIP_TABLE} WHERE marker = :marker
+        """), {"marker": _OWNERSHIP_MARKER})
+    # If not owned by this migration, we leave the table intact
 
-    finally:
-        conn.close()
 
     # This migration does NOT touch ai_usage_events

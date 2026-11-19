@@ -378,3 +378,54 @@ def pg_engine():
     eng = create_engine(pg_url)
     yield eng
     eng.dispose()
+
+
+class TestActualAlembicMigration:
+    """Exercise the real revision functions through Alembic Operations."""
+
+    def test_upgrade_and_downgrade_reuse_alembic_connection(self):
+        import importlib.util
+        from pathlib import Path
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        migration_path = Path("alembic/versions/fix_customer_memories_20261119.py")
+        spec = importlib.util.spec_from_file_location("customer_memories_revision", migration_path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+
+        engine = create_engine("sqlite:///:memory:")
+        with engine.begin() as connection:
+            _create_referenced_tables(connection)
+            connection.execute(text(
+                "INSERT INTO ai_usage_events "
+                "(id, store_id, provider, model, input_tokens, output_tokens, total_tokens, "
+                "estimated_cost, latency_ms, created_at) "
+                "VALUES (:id, :store_id, 'test', 'test-model', 1, 1, 2, 0, 1, CURRENT_TIMESTAMP)"
+            ), {"id": uuid.uuid4().hex, "store_id": uuid.uuid4().hex})
+            before = connection.execute(
+                text("SELECT COUNT(*) FROM ai_usage_events")
+            ).scalar_one()
+
+            context = MigrationContext.configure(connection)
+            with Operations.context(context):
+                migration.upgrade()
+
+            inspector = inspect(connection)
+            assert "customer_memories" in inspector.get_table_names()
+            assert "ix_customer_memories_store_customer" in {
+                item["name"] for item in inspector.get_indexes("customer_memories")
+            }
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM ai_usage_events")
+            ).scalar_one() == before
+
+            with Operations.context(context):
+                migration.downgrade()
+
+            assert "customer_memories" not in inspect(connection).get_table_names()
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM ai_usage_events")
+            ).scalar_one() == before
+
+        engine.dispose()
