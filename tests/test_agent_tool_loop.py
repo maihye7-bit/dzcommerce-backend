@@ -5187,6 +5187,78 @@ async def test_freellm_captures_delivery_details_before_generating_checkout_repl
     assert "حي 60 مسكن" in second["response"]
     assert provider.calls == []
 
+
+@pytest.mark.asyncio
+async def test_freellm_persists_delivery_details_before_draft_creation(db_session):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "commerce_stage": "VARIANT_SELECTED",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider([LLMResponse(content="وصلتني معلومات التوصيل.")])
+    provider.provider_name = "freellm"
+    provider.model = "mock-freellm-model"
+    engine = ConversationEngine(provider, make_registry())
+
+    result = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="ولاية قالمة بلدية قالمة 0674251265",
+    )
+
+    db_session.refresh(conversation)
+    db_session.refresh(customer)
+    assert result["response"] == "وصلتني معلومات التوصيل."
+    assert conversation.active_draft_json is None
+    assert conversation.metadata_json["shipping_info"] == {
+        "phone": "0674251265",
+        "wilaya": "قالمة",
+        "municipality": "قالمة",
+    }
+    assert customer.phone == "0674251265"
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_draft_merges_delivery_details_saved_before_checkout(db_session):
+    from app.agent.tools.create_order_draft import CreateOrderDraftTool
+
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.metadata_json = {
+        "variant_index_map": {"1": str(variant.id)},
+        "shipping_info": {
+            "phone": "0674251265",
+            "wilaya": "قالمة",
+            "municipality": "قالمة",
+            "address": "حي 60 مسكن",
+        },
+    }
+    db_session.commit()
+
+    result = await CreateOrderDraftTool().execute(
+        store.id,
+        {"items": [{"variant_index": 1, "quantity": 1}]},
+        {"db": db_session, "conversation_id": conversation.id},
+    )
+
+    db_session.refresh(conversation)
+    assert result.success is True
+    assert conversation.active_draft_json["shipping_info"] == {
+        "phone": "0674251265",
+        "wilaya": "قالمة",
+        "municipality": "قالمة",
+        "address": "حي 60 مسكن",
+    }
+    assert "shipping_info" not in (conversation.metadata_json or {})
+
 @pytest.mark.asyncio
 async def test_free_agent_cannot_confirm_without_immediate_explicit_approval(db_session):
     store, customer, conversation, product, variant = make_fixture(db_session)

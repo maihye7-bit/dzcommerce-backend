@@ -1743,6 +1743,12 @@ class ConversationEngine:
                 "phone_provided": bool(provided_phone),
                 "wilaya_provided": bool(provided_wilaya),
             },
+            "saved_delivery_fields": {
+                "phone": bool((current_state.get("shipping_info") or {}).get("phone")),
+                "wilaya": bool((current_state.get("shipping_info") or {}).get("wilaya")),
+                "municipality": bool((current_state.get("shipping_info") or {}).get("municipality")),
+                "address": bool((current_state.get("shipping_info") or {}).get("address")),
+            },
             "verified_facts": facts,
             "agent_working_memory": self._sanitize_agent_working_memory(
                 (conversation.metadata_json or {}).get("agent_working_memory")
@@ -1849,6 +1855,7 @@ class ConversationEngine:
                     "\n"
                     "1. Customer expresses purchase intent -> create draft with verified variant\n"
                     "2. Collect delivery details (phone, wilaya, commune optional) -> update_order_draft set_shipping\n"
+                    "- If saved_delivery_fields marks a field as saved, never ask the customer for it again; pending details will be merged into a new draft automatically.\n"
                     "3. Summarize verified draft -> ask for EXPLICIT approval (أكد؟ نؤكد الطلب؟)\n"
                     "4. ONLY on explicit أكيد/أوك/نعم confirma -> confirm_order\n"
                     "5. Never infer consent from silence, نعم to unrelated question, or memory\n"
@@ -5293,93 +5300,99 @@ class ConversationEngine:
             isinstance(draft_before, dict) and draft_before.get("items")
         )
 
-        # FreeLLM enters this path before the legacy deterministic checkout
-        # capture. Persist delivery facts here first so the model never has to
-        # infer whether a phone/wilaya/address was already supplied.
-        delivery_capture_applied = False
-        delivery_capture_response = None
-        delivery_capture_question_type = None
-        if had_active_draft:
-            served_wilayas = db.query(Store.served_wilayas).filter(
-                Store.id == store_id
-            ).scalar()
-            normalized_message = (user_message or "").translate(
-                str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
-            )
-            is_delivery_statement = not re.search(
-                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
-                normalized_message,
+        # Capture delivery details independently of draft creation. Customers often
+        # send their phone/address before the model successfully creates the cart.
+        # Keep those facts on the conversation and merge them into the draft later.
+        served_wilayas = db.query(Store.served_wilayas).filter(
+            Store.id == store_id
+        ).scalar()
+        normalized_message = (user_message or "").translate(
+            str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+        )
+        is_delivery_statement = not re.search(
+            r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
+            normalized_message,
+            flags=re.IGNORECASE,
+        )
+        received_phone, received_wilaya = (
+            self._extract_delivery_details(normalized_message, served_wilayas)
+            if is_delivery_statement
+            else (None, None)
+        )
+        phone_free_message = re.sub(
+            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
+            " ",
+            normalized_message,
+        )
+        municipality_match = (
+            re.search(
+                r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
+                phone_free_message,
                 flags=re.IGNORECASE,
             )
-            received_phone, received_wilaya = (
-                self._extract_delivery_details(normalized_message, served_wilayas)
-                if is_delivery_statement
-                else (None, None)
+            if is_delivery_statement
+            else None
+        )
+        address_match = (
+            re.search(
+                r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
+                phone_free_message,
+                flags=re.IGNORECASE,
             )
-            phone_free_message = re.sub(
-                r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
-                " ",
-                normalized_message,
-            )
-            municipality_match = (
-                re.search(
-                    r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
-                    phone_free_message,
-                    flags=re.IGNORECASE,
-                )
-                if is_delivery_statement
-                else None
-            )
-            address_match = (
-                re.search(
-                    r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
-                    phone_free_message,
-                    flags=re.IGNORECASE,
-                )
-                if is_delivery_statement
-                else None
-            )
-            received_municipality = (
-                municipality_match.group(1).strip() if municipality_match else None
-            )
-            received_address = (
-                address_match.group(0).strip() if address_match else None
-            )
-            if received_address:
-                received_address = re.sub(
-                    r"\s+(?:ولاية|الولاية|بلدية|بلديه|البلدية).*$",
-                    "",
-                    received_address,
-                    flags=re.IGNORECASE,
-                ).strip(" ،,؛;")
-            if any((
-                received_phone,
-                received_wilaya,
-                received_municipality,
+            if is_delivery_statement
+            else None
+        )
+        received_municipality = (
+            municipality_match.group(1).strip() if municipality_match else None
+        )
+        received_address = (
+            address_match.group(0).strip() if address_match else None
+        )
+        if received_address:
+            received_address = re.sub(
+                r"\s+(?:ولاية|الولاية|بلدية|بلديه|البلدية).*$",
+                "",
                 received_address,
-            )):
-                updated_draft = dict(draft_before)
-                shipping_info = dict(updated_draft.get("shipping_info") or {})
-                customer = (
-                    db.query(Customer)
-                    .filter(
-                        Customer.id == customer_id,
-                        Customer.store_id == store_id,
-                    )
-                    .one_or_none()
+                flags=re.IGNORECASE,
+            ).strip(" ،,؛;")
+
+        if any((received_phone, received_wilaya, received_municipality, received_address)):
+            customer = (
+                db.query(Customer)
+                .filter(
+                    Customer.id == customer_id,
+                    Customer.store_id == store_id,
                 )
+                .one_or_none()
+            )
+            if received_phone and customer is not None:
+                customer.phone = received_phone
+
+            from app.services.order_draft_service import _normalize_canonical_shipping
+
+            if had_active_draft:
+                updated_draft = dict(draft_before)
+                metadata = dict(conversation.metadata_json or {})
+                pending_shipping = _normalize_canonical_shipping(
+                    metadata.get("shipping_info")
+                )
+                shipping_info = _normalize_canonical_shipping(
+                    updated_draft.get("shipping_info")
+                )
+                shipping_info.update(pending_shipping)
                 if received_phone:
                     shipping_info["phone"] = received_phone
-                    if customer is not None:
-                        customer.phone = received_phone
                 if received_wilaya:
                     shipping_info["wilaya"] = received_wilaya
                 if received_municipality:
                     shipping_info["municipality"] = received_municipality
                 if received_address:
                     shipping_info["address"] = received_address
-                from app.services.order_draft_service import _normalize_canonical_shipping
-                updated_draft["shipping_info"] = _normalize_canonical_shipping(shipping_info)
+                updated_draft["shipping_info"] = _normalize_canonical_shipping(
+                    shipping_info
+                )
+                metadata.pop("shipping_info", None)
+                conversation.metadata_json = metadata
                 conversation.active_draft_json = updated_draft
                 phone = updated_draft["shipping_info"].get("phone") or (
                     customer.phone if customer is not None else None
@@ -5394,13 +5407,30 @@ class ConversationEngine:
                         first_name=updated_draft["shipping_info"].get("first_name"),
                         last_name=updated_draft["shipping_info"].get("last_name"),
                         address=updated_draft["shipping_info"].get("address"),
-                        language=self._heuristic_nlu(user_message, current_state).get(
-                            "language", "ar"
-                        ),
+                        language=language,
                     )
                 )
-                current_state = self._normalize_current_state(conversation, store_id)
                 delivery_capture_applied = True
+            else:
+                metadata = dict(conversation.metadata_json or {})
+                pending_shipping = _normalize_canonical_shipping(
+                    metadata.get("shipping_info")
+                )
+                if received_phone:
+                    pending_shipping["phone"] = received_phone
+                if received_wilaya:
+                    pending_shipping["wilaya"] = received_wilaya
+                if received_municipality:
+                    pending_shipping["municipality"] = received_municipality
+                if received_address:
+                    pending_shipping["address"] = received_address
+                metadata["shipping_info"] = _normalize_canonical_shipping(
+                    pending_shipping
+                )
+                conversation.metadata_json = metadata
+
+            db.flush()
+            current_state = self._normalize_current_state(conversation, store_id)
 
         turn_has_draft_mod_ref = [False]
         result = (
