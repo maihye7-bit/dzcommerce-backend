@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = "db_merge_fix_customer_memories_heads"
+revision = "merge_cust_mem_heads"
 down_revision = ("6f3a1c9d2b84", "fix_customer_memories_20261119")
 branch_labels = None
 depends_on = None
