@@ -5111,6 +5111,79 @@ async def test_freellm_selected_shipping_tool_persists_redacted_phone_and_city(
     )
 
 
+
+@pytest.mark.asyncio
+async def test_freellm_captures_delivery_details_before_generating_checkout_reply(
+    db_session,
+):
+    store, customer, conversation, product, variant = make_fixture(db_session)
+    conversation.channel = "facebook"
+    conversation.metadata_json = {
+        "commerce_stage": "DRAFT_PENDING",
+        "selected_product_id": str(product.id),
+        "selected_product_name": product.name,
+        "selected_variant_id": str(variant.id),
+        "last_question_type": "CUSTOMER_DELIVERY_INFO",
+    }
+    draft_id = str(uuid.uuid4())
+    conversation.active_draft_json = {
+        "draft_id": draft_id,
+        "items": [
+            {
+                "variant_id": str(variant.id),
+                "product_name": product.name,
+                "variant_name": variant.name,
+                "quantity": 1,
+                "unit_price": 100.0,
+                "line_total": 100.0,
+            }
+        ],
+        "total_price": 100.0,
+        "shipping_info": {},
+    }
+    db_session.commit()
+
+    provider = ScriptedToolProvider([])
+    provider.provider_name = "freellm"
+    provider.model = "mock-freellm-model"
+    engine = ConversationEngine(provider, make_registry())
+
+    first = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="ولاية قالمة بلدية قالمة 0674251265",
+    )
+    db_session.refresh(conversation)
+    shipping = conversation.active_draft_json["shipping_info"]
+    assert shipping["phone"] == "0674251265"
+    assert shipping["wilaya"] == "قالمة"
+    assert shipping["municipality"] == "قالمة"
+    assert conversation.metadata_json["last_question_type"] == "ORDER_CONFIRMATION"
+    assert conversation.metadata_json["confirmation_pending"]["draft_id"] == draft_id
+    assert "أكد الطلب" in first["response"]
+
+    second = await engine.process_message(
+        db=db_session,
+        store_id=store.id,
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        channel="facebook",
+        user_message="حي 60 مسكن",
+    )
+    db_session.refresh(conversation)
+    shipping = conversation.active_draft_json["shipping_info"]
+    assert shipping["address"] == "حي 60 مسكن"
+    assert shipping["phone"] == "0674251265"
+    assert shipping["wilaya"] == "قالمة"
+    assert conversation.metadata_json["confirmation_pending"]["fingerprint"] == (
+        engine._compute_draft_fingerprint(conversation.active_draft_json)
+    )
+    assert "أكد الطلب" in second["response"]
+    assert provider.calls == []
+
 @pytest.mark.asyncio
 async def test_free_agent_cannot_confirm_without_immediate_explicit_approval(db_session):
     store, customer, conversation, product, variant = make_fixture(db_session)
