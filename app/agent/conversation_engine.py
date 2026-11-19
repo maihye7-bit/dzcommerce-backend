@@ -340,6 +340,11 @@ class ConversationEngine:
             "has_confirmed_order": has_confirmed_order,
             "conversation_memory": metadata.get("conversation_memory") or {},
             "confirmation_pending": metadata.get("confirmation_pending"),
+            "shipping_info": (
+                draft.get("shipping_info", {}) if isinstance(draft, dict) else {}
+            )
+            or metadata.get("shipping_info", {}),
+            "draft_id": draft.get("draft_id") if isinstance(draft, dict) else None,
         }
 
     @classmethod
@@ -2559,15 +2564,21 @@ class ConversationEngine:
     def _is_positive_integer(value: Any) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
+    _CANONICAL_SHIPPING_KEYS = frozenset({
+        "phone",
+        "wilaya",
+        "municipality",
+        "commune",
+        "address",
+        "first_name",
+        "last_name",
+    })
+
     @staticmethod
     def _valid_shipping_info(value: Any) -> bool:
-        if not isinstance(value, dict) or set(value) - {
-            "phone",
-            "wilaya",
-            "commune",
-            "first_name",
-            "last_name",
-        }:
+        if not isinstance(value, dict):
+            return False
+        if set(value) - ConversationEngine._CANONICAL_SHIPPING_KEYS:
             return False
         return all(
             isinstance(field, str) and 0 < len(field.strip()) <= 160

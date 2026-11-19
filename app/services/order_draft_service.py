@@ -281,126 +281,151 @@ def update_draft_items(
     return updated_draft
 
 
+CANONICAL_SHIPPING_KEYS = {
+    "phone",
+    "wilaya",
+    "municipality",
+    "commune",
+    "address",
+    "first_name",
+    "last_name",
+}
+
+
+def _normalize_canonical_shipping(raw: dict | None) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    merged: dict[str, str] = {}
+    for key in CANONICAL_SHIPPING_KEYS:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            merged[key] = value.strip()
+    return merged
+
+
 def save_draft_safe(
     db: Session,
     conversation_id: uuid.UUID,
-    store_id: uuid.UUID, # Trusted Store ID from Context
-    items: list[dict],   # [{"variant_index": int, "quantity": int}]
-    shipping_info: dict | None = None
+    store_id: uuid.UUID,
+    items: list[dict],
+    shipping_info: dict | None = None,
 ) -> dict:
     """
     Resolves variant indices to UUIDs using stored mapping.
     Validates against existing draft state.
-    Handles Cases A, B, C, D safely.
+    Handles Cases A, B, C safely:
+      A - same items: preserve draft, merge new shipping info, return updated draft
+      B - different items: conflict error, draft untouched
+      C - no draft / multi-item: create new draft
     """
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conv:
         raise NotFoundError("Conversation not found")
 
-    # 1. Retrieve Variant Map from Metadata
     metadata = conv.metadata_json or {}
     variant_map = metadata.get("variant_index_map", {})
-    
     if not variant_map:
         raise ValidationError(
             "No active product context. Please call 'get_product_details' first to see available options."
         )
 
     resolved_items = []
-    
-    # 2. Resolve Indices to UUIDs
     for item in items:
         idx = item.get("variant_index")
         qty = item.get("quantity", 1)
-        
+
         if idx is None or qty <= 0:
             raise ValidationError(f"Invalid item format: {item}")
-        
-        # Map index string/int to UUID string
+
         variant_id_str = variant_map.get(str(idx))
         if not variant_id_str:
-             raise ValidationError(
+            raise ValidationError(
                 f"Variant index {idx} not found. Valid indices are: {list(variant_map.keys())}. Call get_product_details again."
             )
-        
+
         try:
             variant_id = uuid.UUID(variant_id_str)
         except ValueError:
             raise ValidationError("Corrupted variant mapping. Reset context.")
 
-        # Verify Variant Belongs to Store (Tenant Isolation)
         variant = db.query(ProductVariant).join(Product).filter(
             ProductVariant.id == variant_id,
-            Product.store_id == store_id
+            Product.store_id == store_id,
         ).first()
-        
+
         if not variant:
             raise ValidationError("Selected variant does not belong to this store.")
-            
+
         resolved_items.append({
             "variant_id": variant_id,
             "variant_obj": variant,
-            "quantity": qty
+            "quantity": qty,
         })
 
-    # 3. Check Existing Draft (Cases A & B)
     existing_draft = conv.active_draft_json
-    
+
     if existing_draft and existing_draft.get("items"):
         ex_items = existing_draft["items"]
-        
-        # Simple comparison for single-item case (most common in test)
+
         if len(resolved_items) == 1 and len(ex_items) == 1:
             req_vid = str(resolved_items[0]["variant_id"])
             req_qty = resolved_items[0]["quantity"]
-            
+
             ex_vid = ex_items[0].get("variant_id")
             ex_qty = ex_items[0].get("quantity")
-            
-            # CASE A: Same Variant + Same Quantity -> Success (Idempotent)
-            if req_vid == ex_vid and req_qty == ex_qty:
-                summary = f"{ex_items[0]['product_name']} ({ex_items[0]['variant_name']}) x{ex_qty}"
-                total = existing_draft.get("total_price", 0)
-                print(f"ℹ️ Draft Save Skipped: Identical request detected. Returning existing draft.")
-                return existing_draft
-            
-            # CASE B: Different Item -> Conflict Warning (Do Not Overwrite Silently)
-            else:
-                ex_summary = f"{ex_items[0]['product_name']} ({ex_items[0]['variant_name']}) x{ex_qty}"
-                ex_total = existing_draft.get("total_price", 0)
-                req_variant = resolved_items[0]["variant_obj"]
-                req_summary = f"{req_variant.product.name} ({req_variant.name}) x{req_qty}"
-                # Business logic unchanged: still rejected, existing draft untouched.
-                # Only the message is corrective so the model asks the user instead of apologizing.
-                raise ValidationError(
-                    f"NO CHANGE MADE. An active draft already exists and was NOT modified.\n"
-                    f"Existing draft: {ex_summary} - total {ex_total} DZD.\n"
-                    f"The requested selection is different: {req_summary}.\n"
-                    f"Instruction: Do not apologize and do not retry this tool. "
-                    f"Tell the customer about the existing draft and ask whether they want to "
-                    f"KEEP it (reply 'أكد' to confirm it) or CHANGE it."
-                )
 
-    # 4. CASE C: No Draft or Multi-Item Complexity -> Create New
+            # CASE A: Same Variant + Same Quantity -> Idempotent, merge shipping
+            if req_vid == ex_vid and req_qty == ex_qty:
+                existing_shipping: dict[str, Any] = dict(
+                    existing_draft.get("shipping_info") or {}
+                )
+                new_shipping = _normalize_canonical_shipping(shipping_info)
+                existing_shipping.update(new_shipping)
+                updated_draft = dict(existing_draft)
+                updated_draft["shipping_info"] = existing_shipping
+                updated_draft["updated_at"] = datetime.now(timezone.utc).isoformat()
+                conv.active_draft_json = updated_draft
+                db.flush()
+                return updated_draft
+
+            # CASE B: Different Item -> Conflict Warning
+            ex_summary = f"{ex_items[0]['product_name']} ({ex_items[0]['variant_name']}) x{ex_qty}"
+            ex_total = existing_draft.get("total_price", 0)
+            req_variant = resolved_items[0]["variant_obj"]
+            req_summary = f"{req_variant.product.name} ({req_variant.name}) x{req_qty}"
+            raise ValidationError(
+                f"NO CHANGE MADE. An active draft already exists and was NOT modified.\n"
+                f"Existing draft: {ex_summary} - total {ex_total} DZD.\n"
+                f"The requested selection is different: {req_summary}.\n"
+                f"Instruction: Do not apologize and do not retry this tool. "
+                f"Tell the customer about the existing draft and ask whether they want to "
+                f"KEEP it (reply 'أكد' to confirm it) or CHANGE it."
+            )
+
+    # CASE C: No Draft or Multi-Item Complexity -> Create New
     validated_items = []
     total_price = Decimal("0")
 
     for ri in resolved_items:
         variant = ri["variant_obj"]
         qty = ri["quantity"]
-        
+
         unit_price = (
             Decimal(str(variant.product.base_price))
             + Decimal(str(variant.price_adjustment or 0))
         )
         line_total = unit_price * qty
         total_price += line_total
-        
-        inv_item = db.query(InventoryItem).filter(InventoryItem.variant_id == variant.id).first()
+
+        inv_item = db.query(InventoryItem).filter(
+            InventoryItem.variant_id == variant.id
+        ).first()
         avail = inv_item.quantity if inv_item else 0
-        
+
         if avail < qty:
-             raise ValidationError(f"Insufficient stock for {variant.product.name}. Available: {avail}")
+            raise ValidationError(
+                f"Insufficient stock for {variant.product.name}. Available: {avail}"
+            )
 
         validated_items.append({
             "variant_id": str(variant.id),
@@ -420,16 +445,15 @@ def save_draft_safe(
             else str(uuid.uuid4())
         ),
         "items": validated_items,
-        "shipping_info": shipping_info or {},
+        "shipping_info": _normalize_canonical_shipping(shipping_info),
         "total_price": float(total_price),
         "currency": "DZD",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Save to Conversation Model
     conv.active_draft_json = draft_data
-    db.flush() 
-    
+    db.flush()
+
     return draft_data
 
 
