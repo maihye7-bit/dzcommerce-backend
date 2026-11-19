@@ -5356,6 +5356,7 @@ class ConversationEngine:
                 flags=re.IGNORECASE,
             ).strip(" ،,؛;")
 
+        delivery_capture_applied = False
         if any((received_phone, received_wilaya, received_municipality, received_address)):
             customer = (
                 db.query(Customer)
