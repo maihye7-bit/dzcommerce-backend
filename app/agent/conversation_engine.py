@@ -4017,6 +4017,7 @@ class ConversationEngine:
                         commune=commune,
                         first_name=first_name,
                         last_name=last_name,
+                        address=updated_draft["shipping_info"].get("address"),
                         language=local_message_nlu.get("language", "ar"),
                     )
                 )
@@ -5392,6 +5393,7 @@ class ConversationEngine:
                         commune=updated_draft["shipping_info"].get("municipality"),
                         first_name=updated_draft["shipping_info"].get("first_name"),
                         last_name=updated_draft["shipping_info"].get("last_name"),
+                        address=updated_draft["shipping_info"].get("address"),
                         language=self._heuristic_nlu(user_message, current_state).get(
                             "language", "ar"
                         ),
@@ -6186,6 +6188,7 @@ class ConversationEngine:
         commune: str | None,
         first_name: str | None,
         last_name: str | None,
+        address: str | None = None,
         language: str,
     ) -> tuple[str, str]:
         # Only phone and wilaya are required for ORDER_CONFIRMATION
@@ -6213,6 +6216,20 @@ class ConversationEngine:
             draft.get("total_price", "")
         )
         summary = "\n".join(rendered_items)
+        delivery_parts = []
+        if phone:
+            delivery_parts.append(f"الهاتف: {phone}")
+        if wilaya:
+            delivery_parts.append(f"الولاية: {wilaya}")
+        if commune:
+            delivery_parts.append(f"البلدية: {commune}")
+        if address:
+            delivery_parts.append(f"العنوان: {address}")
+        delivery_summary = (
+            "بيانات التوصيل: " + "، ".join(delivery_parts)
+            if delivery_parts
+            else ""
+        )
 
         if language == "fr":
             if missing:
@@ -6228,12 +6245,12 @@ class ConversationEngine:
                 )
                 return (
                     f"Brouillon enregistré :\n{summary}\nTotal : {total} DZD. "
-                    f"Envoyez {fields} pour continuer.",
+                    f"{delivery_summary} Envoyez {fields} pour continuer.",
                     "CUSTOMER_DELIVERY_INFO",
                 )
             return (
                 f"Récapitulatif de la commande :\n{summary}\nTotal : {total} DZD. "
-                "Si tout est correct, écrivez « أكد الطلب » pour confirmer.",
+                f"{delivery_summary} Si tout est correct, écrivez « أكد الطلب » pour confirmer.",
                 "ORDER_CONFIRMATION",
             )
         if language == "en":
@@ -6250,12 +6267,12 @@ class ConversationEngine:
                 )
                 return (
                     f"Draft saved:\n{summary}\nTotal: {total} DZD. "
-                    f"Send {fields} to continue.",
+                    f"{delivery_summary} Send {fields} to continue.",
                     "CUSTOMER_DELIVERY_INFO",
                 )
             return (
                 f"Order summary:\n{summary}\nTotal: {total} DZD. "
-                "If everything is correct, write « أكد الطلب » to confirm.",
+                f"{delivery_summary} If everything is correct, write « أكد الطلب » to confirm.",
                 "ORDER_CONFIRMATION",
             )
 
@@ -6266,12 +6283,12 @@ class ConversationEngine:
             )
             return (
                 f"تم حفظ مسودة الطلب:\n{summary}\nالمجموع: {total} دج. "
-                f"أرسل {fields} لمتابعة الطلب.",
+                f"{delivery_summary} أرسل {fields} لمتابعة الطلب.",
                 "CUSTOMER_DELIVERY_INFO",
             )
         return (
             f"ملخص الطلب:\n{summary}\nالمجموع: {total} دج. "
-            "إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.",
+            f"{delivery_summary} إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.",
             "ORDER_CONFIRMATION",
         )
 
