@@ -1855,7 +1855,7 @@ class ConversationEngine:
                     "\n"
                     "1. Customer expresses purchase intent -> create draft with verified variant\n"
                     "2. Collect delivery details (phone, wilaya, commune optional) -> update_order_draft set_shipping\n"
-                    "- If saved_delivery_fields marks a field as saved, never ask the customer for it again; pending details will be merged into a new draft automatically.\\n"
+                    "- If saved_delivery_fields marks a field as saved, never ask the customer for it again; pending details will be merged into a new draft automatically.\n"
                     "3. Summarize verified draft -> ask for EXPLICIT approval (أكد؟ نؤكد الطلب؟)\n"
                     "4. ONLY on explicit أكيد/أوك/نعم confirma -> confirm_order\n"
                     "5. Never infer consent from silence, نعم to unrelated question, or memory\n"
