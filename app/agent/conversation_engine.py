@@ -6188,8 +6188,8 @@ class ConversationEngine:
         commune: str | None,
         first_name: str | None,
         last_name: str | None,
-        address: str | None = None,
         language: str,
+        address: str | None = None,
     ) -> tuple[str, str]:
         # Only phone and wilaya are required for ORDER_CONFIRMATION
         # commune, first_name, last_name are optional additions
@@ -6216,17 +6216,57 @@ class ConversationEngine:
             draft.get("total_price", "")
         )
         summary = "\n".join(rendered_items)
+        delivery_labels = {
+            "fr": {
+                "phone": "Téléphone",
+                "wilaya": "Wilaya",
+                "municipality": "Commune",
+                "address": "Adresse",
+                "first_name": "Prénom",
+                "last_name": "Nom",
+                "heading": "Livraison",
+            },
+            "en": {
+                "phone": "Phone",
+                "wilaya": "Wilaya",
+                "municipality": "Municipality",
+                "address": "Address",
+                "first_name": "First name",
+                "last_name": "Last name",
+                "heading": "Delivery",
+            },
+            "ar": {
+                "phone": "الهاتف",
+                "wilaya": "الولاية",
+                "municipality": "البلدية",
+                "address": "العنوان",
+                "first_name": "الاسم",
+                "last_name": "اللقب",
+                "heading": "بيانات التوصيل",
+            },
+        }.get(language, {
+            "phone": "الهاتف",
+            "wilaya": "الولاية",
+            "municipality": "البلدية",
+            "address": "العنوان",
+            "first_name": "الاسم",
+            "last_name": "اللقب",
+            "heading": "بيانات التوصيل",
+        })
         delivery_parts = []
-        if phone:
-            delivery_parts.append(f"الهاتف: {phone}")
-        if wilaya:
-            delivery_parts.append(f"الولاية: {wilaya}")
-        if commune:
-            delivery_parts.append(f"البلدية: {commune}")
-        if address:
-            delivery_parts.append(f"العنوان: {address}")
+        for field, value in (
+            ("phone", phone),
+            ("wilaya", wilaya),
+            ("municipality", commune),
+            ("address", address),
+            ("first_name", first_name),
+            ("last_name", last_name),
+        ):
+            if value:
+                delivery_parts.append(f"{delivery_labels[field]}: {value}")
+        separator = "، " if language == "ar" else ", "
         delivery_summary = (
-            "بيانات التوصيل: " + "، ".join(delivery_parts)
+            f"{delivery_labels['heading']}: " + separator.join(delivery_parts)
             if delivery_parts
             else ""
         )
