@@ -281,11 +281,22 @@ def update_draft_items(
     return updated_draft
 
 
+# Input keys accepted at boundary (including aliases)
+ACCEPTED_SHIPPING_KEYS = {
+    "phone",
+    "wilaya",
+    "municipality",
+    "commune",  # alias, normalized to municipality
+    "address",
+    "first_name",
+    "last_name",
+}
+
+# Stored canonical keys (no aliases)
 CANONICAL_SHIPPING_KEYS = {
     "phone",
     "wilaya",
     "municipality",
-    "commune",
     "address",
     "first_name",
     "last_name",
@@ -293,10 +304,27 @@ CANONICAL_SHIPPING_KEYS = {
 
 
 def _normalize_canonical_shipping(raw: dict | None) -> dict:
+    """
+    Normalize shipping info to canonical form.
+    - municipality is the stored field; commune is an alias accepted at boundary.
+    - If commune provided without municipality, convert to municipality.
+    - If both provided, municipality takes precedence.
+    - commune is NOT stored as a separate field.
+    """
     if not isinstance(raw, dict):
         return {}
     merged: dict[str, str] = {}
+    # Handle municipality/commune alias
+    municipality = raw.get("municipality")
+    commune = raw.get("commune")
+    if isinstance(municipality, str) and municipality.strip():
+        merged["municipality"] = municipality.strip()
+    elif isinstance(commune, str) and commune.strip():
+        merged["municipality"] = commune.strip()
+    # Process other canonical keys
     for key in CANONICAL_SHIPPING_KEYS:
+        if key == "municipality":
+            continue  # already handled
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
             merged[key] = value.strip()

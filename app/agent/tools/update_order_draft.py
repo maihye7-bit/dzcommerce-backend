@@ -10,6 +10,7 @@ from app.services.order_draft_service import (
     get_current_draft,
     replace_draft_item_variant,
     update_draft_items,
+    _normalize_canonical_shipping,
 )
 
 
@@ -69,6 +70,9 @@ class UpdateOrderDraftTool(BaseTool):
                         "wilaya": {"type": "string"},
                         "municipality": {"type": "string"},
                         "address": {"type": "string"},
+                        "commune": {"type": "string"},
+                        "first_name": {"type": "string"},
+                        "last_name": {"type": "string"},
                     },
                     "additionalProperties": False,
                 },
@@ -110,6 +114,8 @@ class UpdateOrderDraftTool(BaseTool):
                         error="Valid shipping details are required.",
                         error_code="VALIDATION_ERROR",
                     )
+                # Normalize shipping info (handles municipality/commune alias)
+                normalized_shipping = _normalize_canonical_shipping(shipping_info)
                 current_draft = get_current_draft(db, conversation_id)
                 if not current_draft:
                     return ToolResult(
@@ -121,13 +127,7 @@ class UpdateOrderDraftTool(BaseTool):
                     if isinstance(existing_shipping, dict)
                     else {}
                 )
-                merged_shipping.update(
-                    {
-                        key: value.strip()
-                        for key, value in shipping_info.items()
-                        if key in allowed_keys
-                    }
-                )
+                merged_shipping.update(normalized_shipping)
                 updated_draft = update_draft_items(
                     db=db,
                     conversation_id=conversation_id,
@@ -155,9 +155,6 @@ class UpdateOrderDraftTool(BaseTool):
                             "wilaya": updated_draft["shipping_info"].get("wilaya"),
                             "municipality": updated_draft["shipping_info"].get(
                                 "municipality"
-                            ),
-                            "commune": updated_draft["shipping_info"].get(
-                                "commune"
                             ),
                             "first_name_provided": bool(
                                 updated_draft["shipping_info"].get("first_name")

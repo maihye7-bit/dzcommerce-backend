@@ -52,6 +52,8 @@ class CreateOrderDraftTool(BaseTool):
                     "properties": {
                         "phone": {"type": "string"},
                         "wilaya": {"type": "string"},
+                        "municipality": {"type": "string"},
+                        "address": {"type": "string"},
                         "commune": {"type": "string"},
                         "first_name": {"type": "string"},
                         "last_name": {"type": "string"},

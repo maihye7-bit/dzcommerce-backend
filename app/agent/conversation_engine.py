@@ -3965,7 +3965,9 @@ class ConversationEngine:
                         customer.phone = received_phone
                 if received_wilaya:
                     shipping_info["wilaya"] = received_wilaya
-                updated_draft["shipping_info"] = shipping_info
+                # Normalize shipping info (handles municipality/commune alias)
+                from app.services.order_draft_service import _normalize_canonical_shipping
+                updated_draft["shipping_info"] = _normalize_canonical_shipping(shipping_info)
                 conversation.active_draft_json = updated_draft
                 # Invalidate any pending confirmation since shipping info changed
                 conversation.metadata_json.pop("confirmation_pending", None)
