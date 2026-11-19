@@ -1617,7 +1617,7 @@ class ConversationEngine:
 
         field_patterns = {
             "phone": re.compile(
-                r"رقم\\s*(?:الهاتف|التليفون|التلفون)|رقمك|الهاتف|التليفون|"
+                r"رقم\s*(?:الهاتف|التليفون|التلفون)|رقمك|الهاتف|التليفون|"
                 r"التلفون|phone|mobile|telephone|num[eé]ro",
                 re.IGNORECASE,
             ),
@@ -1644,7 +1644,7 @@ class ConversationEngine:
 
         kept_segments: list[str] = []
         removed_any = False
-        for segment in re.split(r"(?<=[.!؟?])\\s+|\\n+", reply):
+        for segment in re.split(r"(?<=[.!؟?])\s+|\n+", reply):
             text = segment.strip()
             if not text:
                 continue
