@@ -3991,8 +3991,13 @@ class ConversationEngine:
                 if received_wilaya:
                     shipping_info["wilaya"] = received_wilaya
                 # Normalize shipping info (handles municipality/commune alias)
-                from app.services.order_draft_service import _normalize_canonical_shipping
-                updated_draft["shipping_info"] = _normalize_canonical_shipping(shipping_info)
+                from app.services.order_draft_service import (
+                    _normalize_canonical_shipping,
+                )
+
+                updated_draft["shipping_info"] = _normalize_canonical_shipping(
+                    shipping_info
+                )
                 conversation.active_draft_json = updated_draft
                 # Invalidate any pending confirmation since shipping info changed
                 conversation.metadata_json.pop("confirmation_pending", None)
@@ -5308,15 +5313,28 @@ class ConversationEngine:
                 " ",
                 normalized_message,
             )
-            municipality_match = re.search(
-                r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
-                phone_free_message,
+            is_delivery_statement = not re.search(
+                r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\\b",
+                normalized_message,
                 flags=re.IGNORECASE,
             )
-            address_match = re.search(
-                r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
-                phone_free_message,
-                flags=re.IGNORECASE,
+            municipality_match = (
+                re.search(
+                    r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
+                    phone_free_message,
+                    flags=re.IGNORECASE,
+                )
+                if is_delivery_statement
+                else None
+            )
+            address_match = (
+                re.search(
+                    r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
+                    phone_free_message,
+                    flags=re.IGNORECASE,
+                )
+                if is_delivery_statement
+                else None
             )
             received_municipality = (
                 municipality_match.group(1).strip() if municipality_match else None
@@ -5331,7 +5349,12 @@ class ConversationEngine:
                     received_address,
                     flags=re.IGNORECASE,
                 ).strip(" ،,؛;")
-            if any((received_phone, received_wilaya, received_municipality, received_address)):
+            if any((
+                received_phone,
+                received_wilaya,
+                received_municipality,
+                received_address,
+            )):
                 updated_draft = dict(draft_before)
                 shipping_info = dict(updated_draft.get("shipping_info") or {})
                 customer = (
@@ -5367,7 +5390,9 @@ class ConversationEngine:
                         commune=updated_draft["shipping_info"].get("municipality"),
                         first_name=updated_draft["shipping_info"].get("first_name"),
                         last_name=updated_draft["shipping_info"].get("last_name"),
-                        language=self._heuristic_nlu(user_message, current_state).get("language", "ar"),
+                        language=self._heuristic_nlu(user_message, current_state).get(
+                            "language", "ar"
+                        ),
                     )
                 )
                 current_state = self._normalize_current_state(conversation, store_id)
@@ -5384,22 +5409,22 @@ class ConversationEngine:
             }
             if delivery_capture_applied
             else await self._run_agent_tool_loop(
-            turn_id=turn_id,
-            db=db,
-            store_id=store_id,
-            customer_id=customer_id,
-            conversation=conversation,
-            channel=channel,
-            user_message=user_message,
-            current_state=current_state,
-            dialogue_context=dialogue_context,
-            language=language,
-            image_observations=image_observations,
-            external_account_id=external_account_id,
-            external_user_id=external_user_id,
-            inbound_message_id=inbound_message_id,
-            turn_has_draft_mod_ref=turn_has_draft_mod_ref,
-        )
+                turn_id=turn_id,
+                db=db,
+                store_id=store_id,
+                customer_id=customer_id,
+                conversation=conversation,
+                channel=channel,
+                user_message=user_message,
+                current_state=current_state,
+                dialogue_context=dialogue_context,
+                language=language,
+                image_observations=image_observations,
+                external_account_id=external_account_id,
+                external_user_id=external_user_id,
+                inbound_message_id=inbound_message_id,
+                turn_has_draft_mod_ref=turn_has_draft_mod_ref,
+            )
         )
         response = (
             result.get("response")
