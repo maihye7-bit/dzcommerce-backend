@@ -110,27 +110,26 @@ MANDATORY RULES:
 H. ORDER COMPLETION - HIGHEST PRIORITY (OVER MARKETING/UPSELLING)
 When customer selects product and starts purchase, completion becomes #1 priority.
 
-REQUIRED DELIVERY FIELDS (EXACTLY 5):
-1. first_name
-2. last_name
-3. wilaya
-4. commune
-5. phone
+REQUIRED DELIVERY FIELDS:
+- phone
+- wilaya
+
+OPTIONAL DELIVERY DETAILS:
+- municipality, address, first_name, last_name
 
 ORDER COMPLETION RULES (MANDATORY):
-1. Collect EXACTLY these 5 fields.
-2. NEVER ask for street, neighborhood, building, apartment.
-3. Address detail is NOT required for order completion.
-4. Preserve info customer already gave in previous messages.
-5. NEVER re-ask for already-completed fields.
-6. NEVER overwrite valid data with empty/unknown values.
-7. If info comes across multiple messages, accumulate it gradually.
-8. Ask ONLY for missing fields.
-8. If customer asks side question during checkout, answer naturally while preserving purchase goal.
-9. Don't let upselling block order completion.
-10. Never change product/variant/quantity without customer consent.
-11. Never claim order created/confirmed before commerce tool confirms it.
-11. When all 5 fields complete → move to order summary + confirmation per current flow.
+1. Only phone and wilaya are required to prepare an order for confirmation.
+2. Municipality, address, first_name, and last_name are optional; never block checkout waiting for them.
+3. Preserve delivery information already saved in the active draft. The saved draft is the source of truth, not chat-history guesses.
+4. NEVER ask again for a field that is already saved and valid.
+5. NEVER overwrite valid saved data with empty, null, or unknown values.
+6. If information arrives across multiple messages, merge it into the existing shipping_info; never replace the whole object with only the latest fields.
+7. Ask ONLY for a required field that is actually missing.
+8. If both phone and wilaya are saved, show the verified order summary and ask for explicit confirmation.
+9. If the customer asks a side question during checkout, answer naturally while preserving the active order.
+10. Don't let upselling block order completion.
+11. Never change product/variant/quantity without customer consent.
+12. Never claim an order is created/confirmed before the commerce tool confirms it.
 Order Completion > Marketing > Upselling > Cross-Selling.
 
 I. CONVERSATION CONTINUITY
@@ -258,8 +257,16 @@ class ConversationContextBuilder:
                     parts.append("🛒 ACTIVE CART: YES")
                     parts.append(f"- ITEMS: {summary}")
                     parts.append(f"- TOTAL: {total} DZD")
-                    parts.append("- STATUS: READY_FOR_CONFIRMATION")
-                    parts.append("- ACTION: Do not search. Do not create draft. Ask customer to confirm with 'أكد'.")
+                    parts.append("- STATUS: ACTIVE_DRAFT")
+                    shipping = draft.get("shipping_info")
+                    shipping = shipping if isinstance(shipping, dict) else {}
+                    parts.append("- DELIVERY DATA (saved draft is authoritative):")
+                    parts.append(f"  - PHONE: {'SAVED' if shipping.get('phone') else 'MISSING'}")
+                    for field in ("wilaya", "municipality", "address", "first_name", "last_name"):
+                        value = shipping.get(field)
+                        parts.append(f"  - {field.upper()}: {value if isinstance(value, str) and value.strip() else 'NOT PROVIDED'}")
+                    parts.append("- REQUIRED TO CONFIRM: phone and wilaya only.")
+                    parts.append("- ACTION: Never re-ask saved fields. If phone and wilaya exist, present the summary and ask for explicit confirmation.")
                 else:
                     parts.append("🛒 ACTIVE CART: Empty")
             else:
