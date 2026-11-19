@@ -5309,7 +5309,7 @@ class ConversationEngine:
             str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
         )
         is_delivery_statement = not re.search(
-            r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\\b",
+            r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
             normalized_message,
             flags=re.IGNORECASE,
         )
@@ -5319,13 +5319,13 @@ class ConversationEngine:
             else (None, None)
         )
         phone_free_message = re.sub(
-            r"(?<!\\d)(?:\\+?213[\\s.-]?[567](?:[\\s.-]?\\d){8}|0[567](?:[\\s.-]?\\d){8})(?!\\d)",
+            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
             " ",
             normalized_message,
         )
         municipality_match = (
             re.search(
-                r"(?:بلدية|بلديه|البلدية|commune|municipality)\\s*[:：]?\\s*([^،,;\\n]+)",
+                r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
                 phone_free_message,
                 flags=re.IGNORECASE,
             )
@@ -5334,7 +5334,7 @@ class ConversationEngine:
         )
         address_match = (
             re.search(
-                r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\\s*[:：]?\\s*([^،,;\\n]+)",
+                r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
                 phone_free_message,
                 flags=re.IGNORECASE,
             )
@@ -5349,7 +5349,7 @@ class ConversationEngine:
         )
         if received_address:
             received_address = re.sub(
-                r"\\s+(?:ولاية|الولاية|بلدية|بلديه|البلدية).*$",
+                r"\s+(?:ولاية|الولاية|بلدية|بلديه|البلدية).*$",
                 "",
                 received_address,
                 flags=re.IGNORECASE,
