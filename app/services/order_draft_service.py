@@ -408,12 +408,20 @@ def save_draft_safe(
                 existing_shipping = _normalize_canonical_shipping(
                     existing_draft.get("shipping_info")
                 )
+                pending_shipping = _normalize_canonical_shipping(
+                    metadata.get("shipping_info")
+                )
                 new_shipping = _normalize_canonical_shipping(shipping_info)
+                existing_shipping.update(pending_shipping)
                 existing_shipping.update(new_shipping)
                 updated_draft = dict(existing_draft)
                 updated_draft["shipping_info"] = existing_shipping
                 updated_draft["updated_at"] = datetime.now(timezone.utc).isoformat()
                 conv.active_draft_json = updated_draft
+                if metadata.get("shipping_info"):
+                    updated_metadata = dict(metadata)
+                    updated_metadata.pop("shipping_info", None)
+                    conv.metadata_json = updated_metadata
                 db.flush()
                 return updated_draft
 
@@ -466,6 +474,8 @@ def save_draft_safe(
             "available_stock": avail,
         })
 
+    pending_shipping = _normalize_canonical_shipping(metadata.get("shipping_info"))
+    pending_shipping.update(_normalize_canonical_shipping(shipping_info))
     draft_data = {
         "draft_id": (
             existing_draft.get("draft_id")
@@ -474,13 +484,17 @@ def save_draft_safe(
             else str(uuid.uuid4())
         ),
         "items": validated_items,
-        "shipping_info": _normalize_canonical_shipping(shipping_info),
+        "shipping_info": pending_shipping,
         "total_price": float(total_price),
         "currency": "DZD",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
     conv.active_draft_json = draft_data
+    if metadata.get("shipping_info"):
+        updated_metadata = dict(metadata)
+        updated_metadata.pop("shipping_info", None)
+        conv.metadata_json = updated_metadata
     db.flush()
 
     return draft_data
@@ -540,4 +554,7 @@ def clear_draft(db: Session, conversation_id: uuid.UUID) -> None:
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if conv:
         conv.active_draft_json = None
+        metadata = dict(conv.metadata_json or {})
+        metadata.pop("shipping_info", None)
+        conv.metadata_json = metadata
         db.flush()
