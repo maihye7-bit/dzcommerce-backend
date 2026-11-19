@@ -3967,6 +3967,8 @@ class ConversationEngine:
                     shipping_info["wilaya"] = received_wilaya
                 updated_draft["shipping_info"] = shipping_info
                 conversation.active_draft_json = updated_draft
+                # Invalidate any pending confirmation since shipping info changed
+                conversation.metadata_json.pop("confirmation_pending", None)
 
                 phone = shipping_info.get("phone") or (
                     customer.phone if customer is not None else None
