@@ -48,7 +48,7 @@ def diagnose_reply(
         return False, "INTERNAL_IDENTIFIER"
     if re.search(r"\b(?:product_id|variant_id|order_id|store_id|customer_id|conversation_id|sku)\b", reply, re.IGNORECASE):
         return False, "INTERNAL_IDENTIFIER"
-    if re.search(r"(?i)(?:Ø¶Ù…Ø§Ø©|warranty|ØªÙˆØµÙŠÙ„|delivery|Ø¥Ø±Ø¬Ø§Ø¹|return|Ø®ØµÙ…|discount)", reply):
+    if re.search(r"(?i)(?:ضمان|warranty|توصيل|delivery|إرجاع|ارجاع|return|خصم|discount)", reply):
         return False, "UNSUPPORTED_CLAIM"
 
     names = [p.get("name", "").strip() for p in products if isinstance(p.get("name"), str)]
@@ -479,7 +479,7 @@ class ReplyComposer:
             return False
 
         currency_claims = list(_CURRENCY_AMOUNT.finditer(normalized))
-        allowed_currencies = {"Ø¯Ø¬", "Ø¯ÙŠÙ†Ø§Ø±", "dzd", "da"}
+        allowed_currencies = {"دج", "دينار", "dzd", "da"}
         if any(
             match.group(2).casefold().replace(".", "").replace(" ", "")
             not in allowed_currencies
