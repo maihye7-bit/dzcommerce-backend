@@ -982,3 +982,41 @@ async def test_confirm_recovers_only_unambiguous_legacy_variant(factory):
         }
         item = db.query(OrderItem).filter(OrderItem.order_id == order.id).one()
         assert item.variant_id == variant_id
+
+
+@pytest.mark.asyncio
+async def test_legacy_create_draft_service_persists_resolver_shipping_fields(factory):
+    store_id, conv_id, variant_id = seed(factory)
+    engine = ConversationEngine(None, ToolRegistry())
+
+    with factory() as db:
+        variant = db.query(ProductVariant).filter(
+            ProductVariant.id == variant_id
+        ).one()
+        result, succeeded, _question_type = await engine._handle_service_call(
+            "create_draft",
+            {
+                "product_id": str(variant.product_id),
+                "variant_id": str(variant_id),
+                "quantity": 1,
+                "unit_price": 110,
+                "total_price": 110,
+                "shipping_info": {
+                    "phone": "0674251243",
+                    "wilaya": "قالمة",
+                    "municipality": "قالمة",
+                    "address": "MUST NOT BE COPIED",
+                },
+            },
+            db,
+            conv_id,
+        )
+        assert succeeded, result
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conv_id
+        ).one()
+        shipping = conversation.active_draft_json["shipping_info"]
+        assert shipping["phone"] == "0674251243"
+        assert shipping["wilaya"] == "قالمة"
+        assert shipping["municipality"] == "قالمة"
+        assert "address" not in shipping
