@@ -446,7 +446,7 @@ async def test_repeated_confirmation_no_duplicate_order(factory):
         save_draft_safe(
             db=db, conversation_id=conv_id, store_id=store_id,
             items=[{"variant_index": 1, "quantity": 2}],
-            shipping_info={"phone": "0555777777", "wilaya": "Annaba", "municipality": "Annaba"},
+            shipping_info={"phone": "0555777777", "wilaya": "Annaba", "municipality": "Annaba", "address": "Legacy address"},
         )
         conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
         fp_data = {
@@ -465,6 +465,9 @@ async def test_repeated_confirmation_no_duplicate_order(factory):
     assert r1.success
     with factory.begin() as db:
         count = db.query(Order).filter(Order.conversation_id == conv_id).count()
+        order = db.query(Order).filter(Order.conversation_id == conv_id).one()
+        saved_shipping = json.loads(order.shipping_address) if isinstance(order.shipping_address, str) else order.shipping_address
+        assert set(saved_shipping) == {"phone", "wilaya", "municipality"}
         inv = db.query(InventoryItem).filter(InventoryItem.variant_id == variant_id).first()
     assert count == 1
     assert inv.quantity == 8  # 10 - 2
@@ -855,6 +858,8 @@ async def test_real_engine_flow_create_draft_collect_shipping_confirm(factory):
         shipping = _json.loads(order.shipping_address) if isinstance(order.shipping_address, str) else (order.shipping_address or {})
         assert shipping.get("phone") == "0555999999"
         assert shipping.get("wilaya") == "باتنة"
+        assert shipping.get("municipality") == "باتنة"
+        assert set(shipping) == {"phone", "wilaya", "municipality"}
 
         # Re-confirm should not create a second order
         conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
