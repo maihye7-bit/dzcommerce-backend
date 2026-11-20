@@ -164,22 +164,17 @@ def test_composer_diagnoses_unverified_product_names(reply):
     ],
 )
 def test_composer_rejects_explicit_moroccan_darija(reply):
-    products = [{"name": "المنتج", "price": None}]
-    assert ReplyComposer.diagnose_reply(reply, "ar", products) == (
+    assert ReplyComposer.diagnose_reply(reply, "ar", []) == (
         False,
         "LANGUAGE_MISMATCH",
     )
-    assert not ReplyComposer._is_safe_reply(reply, "ar", products)
+    assert not ReplyComposer._is_safe_reply(reply, "ar", [])
 
 
 @pytest.mark.parametrize("reply", ["بشحال هذا؟", "هذا المنتج تاعنا، نقدر نعاونك"])
 def test_composer_keeps_natural_algerian_darija(reply):
-    assert ReplyComposer.diagnose_reply(
-        reply, "ar", [{"name": "المنتج", "price": None}]
-    ) == (True, None)
-    assert ReplyComposer._is_safe_reply(
-        reply, "ar", [{"name": "المنتج", "price": None}]
-    )
+    assert ReplyComposer.diagnose_reply(reply, "ar", []) == (True, None)
+    assert ReplyComposer._is_safe_reply(reply, "ar", [])
 
 
 @pytest.mark.asyncio
