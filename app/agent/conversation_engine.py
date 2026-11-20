@@ -216,7 +216,7 @@ class ConversationEngine:
         # redacting the value above. Do not let address redaction consume phone data.
         message = re.sub(
             r"(?i)(?:رقم الهاتف|الهاتف)\s*[:=]?",
-            "رقم الهاتف ",
+            "رقم التواصل ",
             message,
         )
         message = re.sub(
@@ -1930,15 +1930,15 @@ class ConversationEngine:
                     "\n"
                     "If a tool fails: acknowledge it, do not invent the result. Continue the conversation honestly.\n"
                     "\n"
-                    "CHECKOUT DELIVERY CONTRACT — STRICT\\n"
-                    "- Collect ONLY these three delivery fields: mobile phone, wilaya, municipality (بلدية).\\n"
-                    "- NEVER ask for a street address, building number, full address, first name, or last name.\\n"
-                    "- Algerian mobile numbers beginning 05, 06, or 07 are valid mobile numbers. Treat a supplied valid number as received.\\n"
-                    "- saved_delivery_fields are authoritative across turns and across model/provider switches. If a field is true, NEVER ask for it again.\\n"
-                    "- If the customer sends only a phone number, record it as the mobile number; do not ask what kind/type of number it is.\\n"
-                    "- If all three fields are saved, move to the order summary and ask for explicit confirmation. Do not restart data collection.\\n"
-                    "- Canonical delivery line: ولاية [wilaya] بلدية [municipality] [mobile phone].\\n"
-                    "\\n"
+                    "CHECKOUT DELIVERY CONTRACT — STRICT\n"
+                    "- Collect ONLY these three delivery fields: mobile phone, wilaya, municipality (بلدية).\n"
+                    "- NEVER ask for a street address, building number, full address, first name, or last name.\n"
+                    "- Algerian mobile numbers beginning 05, 06, or 07 are valid mobile numbers. Treat a supplied valid number as received.\n"
+                    "- saved_delivery_fields are authoritative across turns and across model/provider switches. If a field is true, NEVER ask for it again.\n"
+                    "- If the customer sends only a phone number, record it as the mobile number; do not ask what kind/type of number it is.\n"
+                    "- If all three fields are saved, move to the order summary and ask for explicit confirmation. Do not restart data collection.\n"
+                    "- Canonical delivery line: ولاية [wilaya] بلدية [municipality] [mobile phone].\n"
+                    "\n"
                     "MEMORY AND CONTEXT - HELPER, NOT AUTHORITY\n"
                     "\n"
                     "- conversation_memory / agent_working_memory: unverified summaries - useful for flow, NEVER for facts\n"
