@@ -4055,7 +4055,7 @@ class ConversationEngine:
             received_municipality = self._extract_delivery_municipality(user_message)
             delivery_info_capture_turn = bool(
                 received_phone or received_wilaya or received_municipality
-                or re.search(r"\\d{6,}|\\b(?:ال)?ولاية\\b|\\b(?:بلدية|بلديه|commune)\\b", user_message or "")
+                or re.search(r"\d{6,}|\b(?:ال)?ولاية\b|\b(?:بلدية|بلديه|commune)\b", user_message or "")
             )
             if delivery_info_capture_turn:
                 updated_draft = dict(active_draft)
@@ -5379,7 +5379,7 @@ class ConversationEngine:
         served_wilayas = db.query(Store.served_wilayas).filter(Store.id == store_id).scalar()
         normalized_message = (user_message or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
         received_phone, received_wilaya = self._extract_delivery_details(normalized_message, served_wilayas)
-        is_delivery_statement = not re.search(r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\\b", normalized_message, flags=re.IGNORECASE)
+        is_delivery_statement = not re.search(r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b", normalized_message, flags=re.IGNORECASE)
         received_municipality = self._extract_delivery_municipality(normalized_message) if is_delivery_statement else None
 
         delivery_capture_applied = False
