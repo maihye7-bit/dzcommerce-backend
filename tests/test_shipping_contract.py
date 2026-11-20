@@ -504,7 +504,7 @@ async def test_multi_turn_integration_customer_selects_then_confirms(factory):
     # Step 2: Add phone + wilaya
     r = await run(UpdateOrderDraftTool(), {
         "action": "set_shipping",
-        "shipping_info": {"phone": "0555888888", "wilaya": "Batna"},
+        "shipping_info": {"phone": "0555888888", "wilaya": "Batna", "municipality": "Batna"},
     })
     assert r.success, f"Shipping update failed: {r.error}"
 
@@ -512,6 +512,7 @@ async def test_multi_turn_integration_customer_selects_then_confirms(factory):
         draft = get_draft(db, conv_id)
         assert draft["shipping_info"]["phone"] == "0555888888"
         assert draft["shipping_info"]["wilaya"] == "Batna"
+        assert draft["shipping_info"]["municipality"] == "Batna"
 
     # Step 3: Change phone only — wilaya must persist
     r = await run(UpdateOrderDraftTool(), {
