@@ -102,61 +102,61 @@ def diagnose_reply(
 
 _CURRENCY_AMOUNT = re.compile(
     r"(?<![\w])([\d][\d., \u00a0]*[\d]|[\d])\s*"
-    r"(Ø¯\.?\s*Ø¬|Ø¯ÙŠÙ†Ø§Ø±|dzd|da|eur|usd|â‚¬|\$)",
+    r"(د\.?\s*ج|دينار|dzd|da|eur|usd|€|\$)",
     re.IGNORECASE,
 )
 _PRICE_LANGUAGE = re.compile(
-    r"Ø§Ù„Ø³Ø¹Ø±|Ø§Ù„Ø³ÙˆÙ…Ø©|Ø³Ø¹Ø±|Ø¨Ø´Ø­Ø§Ù„|prix|price|how much|combien",
+    r"السعر|السومة|سعر|بشحال|قداش|prix|price|how much|combien",
     re.IGNORECASE,
 )
 _UNSUPPORTED_CLAIMS = re.compile(
-    r"Ù…ØªÙˆÙØ±|Ù…ØªØ§Ø­Ø©|Ø§Ù„Ù…Ø®Ø²ÙˆÙ†|stock|available|in stock|"
-    r"Ø¶Ù…Ø§Ù†|garantie|warranty|guarantee|Ø£ØµÙ„ÙŠ|Ø§ØµÙ„[ÙŠÙŠØ©]|authentique|original|"
-    r"ØªÙˆØµÙŠÙ„|Ø§Ù„ØªÙˆØµÙŠÙ„|livraison|delivery|shipping|"
-    r"Ø¥Ø±Ø¬Ø§Ø¹|Ø§Ø³ØªØ±Ø¬Ø§Ø¹|remboursement|return",
+    r"متوفر|متاحة|المخزون|stock|available|in stock|"
+    r"ضمان|garantie|warranty|guarantee|أصلي|اصلي|أصلية|اصلية|authentique|original|"
+    r"توصيل|التوصيل|livraison|delivery|shipping|"
+    r"إرجاع|ارجاع|استرجاع|ترجيع|remboursement|return",
     re.IGNORECASE,
 )
 _UNVERIFIED_POLICY_CLAIMS = re.compile(
-    r"Ø¶Ù…Ø§Ù†|garantie|warranty|guarantee|Ø£ØµÙ„ÙŠ|Ø§ØµÙ„[ÙŠÙŠØ©]|authentique|original|"
-    r"ØªÙˆØµÙŠÙ„|Ø§Ù„ØªÙˆØµÙŠÙ„|livraison|delivery|shipping|"
-    r"Ø¥Ø±Ø¬Ø§Ø¹|Ø§Ø³ØªØ±Ø¬Ø§Ø¹|remboursement|return|Ø®ØµÙ…|ØªØ®ÙÙŠØ¶|discount|"
-    r"rÃ©duction|promotion spÃ©ciale|special offer",
+    r"ضمان|garantie|warranty|guarantee|أصلي|اصلي|أصلية|اصلية|authentique|original|"
+    r"توصيل|التوصيل|livraison|delivery|shipping|"
+    r"إرجاع|ارجاع|استرجاع|ترجيع|remboursement|return|خصم|تخفيض|discount|"
+    r"réduction|promotion spéciale|special offer",
     re.IGNORECASE,
 )
 _STOCK_CLAIM = re.compile(
-    r"Ù…ØªÙˆÙØ±|Ù…ØªØ§Ø­Ø©|Ø§Ù„Ù…Ø®Ø²ÙˆÙ†|stock|available|in stock|"
-    r"ØºÙŠØ± Ù…ØªÙˆÙØ±|Ù†ÙØ¯|rupture|out of stock|indisponible",
+    r"متوفر|متاحة|المخزون|stock|available|in stock|"
+    r"غير متوفر|نفد|نفذت|rupture|out of stock|indisponible",
     re.IGNORECASE,
 )
 _NEGATIVE_STOCK_CLAIM = re.compile(
-    r"ØºÙŠØ± Ù…ØªÙˆÙØ±|Ù†ÙØ¯|rupture|out of stock|indisponible|"
+    r"غير متوفر|نفد|نفذت|rupture|out of stock|indisponible|"
     r"not available|unavailable|no stock",
     re.IGNORECASE,
 )
 _CONFIRMED_ORDER_CLAIM = re.compile(
     r"order.{0,24}confirm|confirm.{0,24}order|"
-    r"Ø·Ù„Ø¨Ùƒ.{0,24}(?:ØªØ£ÙƒØ¯|ØªØ£ÙƒØ¯Øª|Ù…Ø¤ÙƒØ¯)|"
-    r"ØªÙ….{0,16}ØªØ£ÙƒÙŠØ¯.{0,16}(?:Ø§Ù„Ø·Ù„Ø¨|Ø·Ù„Ø¨Ùƒ)|"
+    r"طلبك.{0,24}(?:تأكد|تأكدت|مؤكد)|"
+    r"تم.{0,16}تأكيد.{0,16}(?:الطلب|طلبك)|"
     r"commande.{0,24}confirm",
     re.IGNORECASE,
 )
 _SAVED_DRAFT_CLAIM = re.compile(
     r"(?:order )?draft.{0,24}(?:saved|created|prepared)|"
     r"(?:saved|created|prepared).{0,24}draft|"
-    r"Ù…Ø³ÙˆØ¯Ø©.{0,24}(?:Ø­ÙØ¸|Ø¥Ù†Ø´Ø§Ø¡|Ø§Ù†Ø´Ø§Ø¡|ØªØ­Ø¶ÙŠØ±)|"
-    r"(?:Ø­ÙØ¸|Ø¥Ù†Ø´Ø§Ø¡|Ø§Ù†Ø´Ø§Ø¡|ØªØ­Ø¶ÙŠØ±).{0,24}Ù…Ø³ÙˆØ¯Ø©|"
-    r"commande provisoire.{0,24}(?:enregistr|prÃ©par)",
+    r"مسودة.{0,24}(?:حفظ|إنشاء|انشاء|تحضير)|"
+    r"(?:حفظ|إنشاء|انشاء|تحضير).{0,24}مسودة|"
+    r"commande provisoire.{0,24}(?:enregistr|prépar)",
     re.IGNORECASE,
 )
 _ACTIVE_DRAFT_CLAIM = re.compile(
     r"active draft|draft.{0,12}exists|"
-    r"Ù…Ø³ÙˆØ¯Ø©.{0,16}(?:Ù†Ø´Ø·Ø©|Ù…ÙˆØ¬ÙˆØ¯Ø©)|Ù„Ø¯ÙŠÙƒ Ù…Ø³ÙˆØ¯Ø©|Ø¹Ù†Ø¯Ùƒ Ù…Ø³ÙˆØ¯Ø©",
+    r"مسودة.{0,16}(?:نشطة|موجودة)|لديك مسودة|عندك مسودة",
     re.IGNORECASE,
 )
 _UNVERIFIED_ORDER_STATUS = re.compile(
-    r"(?:order|commande|Ø·Ù„Ø¨Ùƒ|Ø§Ù„Ø·Ù„Ø¨).{0,32}"
+    r"(?:order|commande|طلبك|الطلب).{0,32}"
     r"(?:shipped|delivered|processing|pending|dispatched|ready|"
-    r"en cours|expÃ©di|livrÃ©|Ù‚ÙŠØ¯ Ø§Ù„ØªØ¬Ù‡ÙŠØ²|ØªÙ… Ø§Ù„Ø´Ø­Ù†|ÙˆØµÙ„)",
+    r"en cours|expédi|livré|قيد التجهيز|تم الشحن|وصل)",
     re.IGNORECASE,
 )
 _INTERNAL_IDENTIFIER = re.compile(
@@ -168,20 +168,22 @@ _INTERNAL_IDENTIFIER = re.compile(
 )
 _LANGUAGE_WORDS = {
     "ar": {
-        "Ø£ÙŠ", "Ø£Ùˆ", "Ø§Ùˆ", "Ø¥Ù„ÙŠÙƒ", "Ø§Ù„Ø°ÙŠ", "Ø§Ù„ØªÙŠ", "Ø§Ù„Ø´Ø±Ø§Ø¡", "Ø§Ù„Ø·Ù„Ø¨",
-        "Ø§Ù„Ù…Ù†ØªØ¬", "Ø§Ù„Ù…Ù†ØªØ¬Ø§Øª", "Ø§Ù„Ø³Ø¹Ø±", "Ø§Ù„Ø³ÙˆÙ…Ø©", "Ø§Ø®ØªÙŠØ§Ø±", "ØªÙØ§ØµÙŠÙ„",
-        "ØªÙØ§ØµÙŠÙ„Ù‡", "ØªÙØ§ØµÙŠÙ„Ù‡Ø§", "ØªØ±ÙŠØ¯", "ØªØ±ÙŠØ¯ÙˆÙ†", "ØªØ­Ø¨", "ØªØ­Ø¨ÙŠ", "ØªØ­Ø¨ÙˆØ§",
-        "Ø®ÙŠØ§Ø±", "Ø®ÙŠØ§Ø±Ø§Øª", "Ù„Ø¥ØªÙ…Ø§Ù…", "Ù„Ù„Ø·Ù„Ø¨", "Ù…Ø·Ø§Ø¨Ù‚", "Ù…Ø·Ø§Ø¨Ù‚Ø©", "Ù…Ø§",
-        "Ù…Ù†", "Ù‡Ø°Ø§", "Ù‡Ø°Ù‡", "Ù‡Ù„", "Ù‡Ùˆ", "Ù‡ÙŠ", "ÙˆØ§Ø­Ø¯", "ÙˆØ§Ø­Ø¯Ø©", "ÙˆØ¬Ø¯Øª",
-        "ÙˆØ¬Ø¯Ù†Ø§", "Ù„Ù‚ÙŠÙ†Ø§", "ÙŠØ±Ø¬Ù‰", "Ø§Ø®ØªØ±", "Ù…Ø¹Ø±ÙØ©",
+        "أي", "أو", "او", "إليك", "الذي", "التي", "الشراء", "الطلب",
+        "المنتج", "المنتجات", "السعر", "السومة", "اختيار", "تفاصيل",
+        "تفاصيله", "تفاصيلها", "تريد", "تريدون", "تحب", "تحبي", "تحبوا",
+        "خيار", "خيارات", "لإتمام", "للطلب", "مطابق", "مطابقة", "ما",
+        "من", "هذا", "هذه", "هل", "هو", "هي", "واحد", "واحدة", "وجدت",
+        "وجدنا", "لقينا", "يرجى", "اختر", "معرفة", "نحب", "حاب", "حبيت",
+        "كيفاش", "قداش", "بشحال", "عندي", "عندكم", "متوفر", "موجود",
+        "رقم", "الهاتف", "الولاية", "البلدية", "توصيل", "كوموند",
     },
     "fr": {
         "ai", "au", "avec", "ce", "cette", "choisir", "commander",
-        "correspondant", "correspondante", "de", "des", "dÃ©tails", "est",
+        "correspondant", "correspondante", "de", "des", "détails", "est",
         "et", "ici", "j", "la", "le", "les", "lequel", "lesquels", "mais",
         "ou", "options", "pour", "produit", "produits", "prix", "quel",
         "quelle", "quelles", "quels", "recherchez", "ses", "souhaitez",
-        "trouvÃ©", "trouvÃ©e", "un", "une", "voici", "voir", "vous", "voulez",
+        "trouvé", "trouvée", "un", "une", "voici", "voir", "vous", "voulez",
     },
     "en": {
         "a", "about", "an", "and", "are", "choose", "details", "do", "found",
