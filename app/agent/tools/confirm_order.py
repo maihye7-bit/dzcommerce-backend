@@ -225,9 +225,12 @@ class ConfirmOrderTool(BaseTool):
                 "unit_price": unit_price,
             })
 
-        raw_shipping = shipping_info
-        if customer is not None and not raw_shipping.get("phone"):
-            raw_shipping = {**raw_shipping, "phone": customer.phone}
+        # Persist only the three agreed delivery fields; ignore legacy address/name keys.
+        raw_shipping = {
+            "phone": shipping_info["phone"],
+            "wilaya": shipping_info["wilaya"],
+            "municipality": shipping_info["municipality"],
+        }
 
         new_order = Order(
             store_id=store_id,
