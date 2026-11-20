@@ -14,8 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Reject explicit Moroccan Darija markers while allowing Algerian "بشحال".
 _MOROCCAN_DARIJA_MARKERS = re.compile(
-    r"(?<![\\u0600-\\u06FF])(?:ديال|واش|شحال|هاد|فبالما|ولاش|داز|بغيت)"
-    r"(?![\\u0600-\\u06FF])"
+    r"(?<![؀-ۿ])(?:ديال|واش|شحال|هاد|فبالما|ولاش|داز|بغيت)(?![؀-ۿ])"
 )
 
 # Internal diagnostic codes for ReplyComposer validation failures.
