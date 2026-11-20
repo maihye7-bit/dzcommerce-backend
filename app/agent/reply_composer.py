@@ -12,6 +12,12 @@ from app.agent.providers.base import LLMMessage
 # Module-level logger for ReplyComposer diagnostic messages.
 logger = logging.getLogger(__name__)
 
+# Reject explicit Moroccan Darija markers while allowing Algerian "بشحال".
+_MOROCCAN_DARIJA_MARKERS = re.compile(
+    r"(?<![\\u0600-\\u06FF])(?:ديال|واش|شحال|هاد|فبالما|ولاش|داز|بغيت)"
+    r"(?![\\u0600-\\u06FF])"
+)
+
 # Internal diagnostic codes for ReplyComposer validation failures.
 # These are used only within this module; _is_safe_reply() still returns True/False.
 # They help operators understand why a reply was rejected without exposing user data.
@@ -50,6 +56,8 @@ def diagnose_reply(
         return False, "INTERNAL_IDENTIFIER"
     if re.search(r"(?i)(?:ضمان|warranty|توصيل|delivery|إرجاع|ارجاع|return|خصم|discount)", reply):
         return False, "UNSUPPORTED_CLAIM"
+    if _MOROCCAN_DARIJA_MARKERS.search(reply):
+        return False, "LANGUAGE_MISMATCH"
 
     names = [p.get("name", "").strip() for p in products if isinstance(p.get("name"), str)]
     # Allow natural replies: require at least one verified name if names exist,
@@ -763,6 +771,7 @@ class ReplyComposer:
             or any(ord(char) < 32 and char not in "\n\t" for char in reply)
             or _INTERNAL_IDENTIFIER.search(reply)
             or _UNSUPPORTED_CLAIMS.search(reply)
+            or _MOROCCAN_DARIJA_MARKERS.search(reply)
         ):
             return False
 
