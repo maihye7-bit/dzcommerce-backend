@@ -69,10 +69,10 @@ class UpdateOrderDraftTool(BaseTool):
                         "phone": {"type": "string"},
                         "wilaya": {"type": "string"},
                         "municipality": {"type": "string"},
-                        "address": {"type": "string"},
-                        "commune": {"type": "string"},
-                        "first_name": {"type": "string"},
-                        "last_name": {"type": "string"},
+                        "commune": {
+                            "type": "string",
+                            "description": "Alias for municipality; the backend stores it as municipality.",
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -97,7 +97,7 @@ class UpdateOrderDraftTool(BaseTool):
             action = args["action"]
             if action == "set_shipping":
                 shipping_info = args.get("shipping_info")
-                allowed_keys = {"phone", "wilaya", "municipality", "address", "commune", "first_name", "last_name"}
+                allowed_keys = {"phone", "wilaya", "municipality", "commune"}
                 if (
                     not isinstance(shipping_info, dict)
                     or not shipping_info
@@ -154,12 +154,6 @@ class UpdateOrderDraftTool(BaseTool):
                             "wilaya": updated_draft["shipping_info"].get("wilaya"),
                             "municipality": updated_draft["shipping_info"].get(
                                 "municipality"
-                            ),
-                            "first_name_provided": bool(
-                                updated_draft["shipping_info"].get("first_name")
-                            ),
-                            "last_name_provided": bool(
-                                updated_draft["shipping_info"].get("last_name")
                             ),
                         },
                     },
