@@ -1738,6 +1738,7 @@ class ConversationEngine:
             user_message,
             served_wilayas,
         )
+        provided_municipality = self._extract_delivery_municipality(user_message)
         draft_summary = self._agent_draft_summary(
             db,
             store_id,
@@ -1808,6 +1809,7 @@ class ConversationEngine:
             "delivery_details_in_current_message": {
                 "phone_provided": bool(provided_phone),
                 "wilaya_provided": bool(provided_wilaya),
+                "municipality_provided": bool(provided_municipality),
             },
             "saved_delivery_fields": {
                 "phone": bool((current_state.get("shipping_info") or {}).get("phone")),
@@ -3431,14 +3433,14 @@ class ConversationEngine:
             served_wilayas = db.query(Store.served_wilayas).filter(
                 Store.id == store_id
             ).scalar()
-            message_phone, message_wilaya = self._extract_delivery_details(
-                user_message,
-                served_wilayas,
-            )
+            message_phone, message_wilaya = self._extract_delivery_details(user_message, served_wilayas)
+            message_municipality = self._extract_delivery_municipality(user_message)
             if message_phone:
                 shipping_info.setdefault("phone", message_phone)
             if message_wilaya:
                 shipping_info.setdefault("wilaya", message_wilaya)
+            if message_municipality:
+                shipping_info.setdefault("municipality", message_municipality)
             if shipping_info:
                 safe_arguments["shipping_info"] = shipping_info
         elif tool_name == "update_order_draft":
@@ -3461,14 +3463,14 @@ class ConversationEngine:
                 served_wilayas = db.query(Store.served_wilayas).filter(
                     Store.id == store_id
                 ).scalar()
-                message_phone, message_wilaya = self._extract_delivery_details(
-                    user_message,
-                    served_wilayas,
-                )
+                message_phone, message_wilaya = self._extract_delivery_details(user_message, served_wilayas)
+                message_municipality = self._extract_delivery_municipality(user_message)
                 if message_phone:
                     shipping_info.setdefault("phone", message_phone)
                 if message_wilaya:
                     shipping_info.setdefault("wilaya", message_wilaya)
+                if message_municipality:
+                    shipping_info.setdefault("municipality", message_municipality)
                 result = await self.registry.aexecute(
                     tool_name=tool_name,
                     arguments={
