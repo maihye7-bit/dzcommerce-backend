@@ -4793,6 +4793,51 @@ def test_order_requests_are_not_parsed_as_delivery_wilayas(message):
     )
 
 
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("ولاية قالمة بلدية قالمة 0674251265", "0674251265"),
+        ("05 55 12 34 56", "0555123456"),
+        ("+213 6 74 25 12 65", "0674251265"),
+        ("00213 7 42 51 26 50", "0742512650"),
+        ("٠٦٧٤٢٥١٢٦٥", "0674251265"),
+    ],
+)
+def test_algerian_mobile_parser_normalizes_common_formats(message, expected):
+    phone, _ = ConversationEngine._extract_delivery_details(message, None)
+    assert phone == expected
+
+
+def test_delivery_parser_extracts_wilaya_municipality_and_phone_in_one_message():
+    message = "ولاية قالمة بلدية قالمة 0674251265"
+    phone, wilaya = ConversationEngine._extract_delivery_details(message, None)
+    municipality = ConversationEngine._extract_delivery_municipality(message)
+    assert phone == "0674251265"
+    assert wilaya == "قالمة"
+    assert municipality == "قالمة"
+
+
+def test_delivery_parser_does_not_classify_non_mobile_prefix_as_mobile():
+    phone, _ = ConversationEngine._extract_delivery_details("0812345678", None)
+    assert phone is None
+
+
+def test_delivery_prompt_requires_municipality_but_never_full_address():
+    response, question_type = ConversationEngine._draft_next_step_response(
+        {"items": [{"product_name": "هاتف", "variant_name": "أسود", "quantity": 1}], "total_price": 100},
+        phone="0674251265",
+        wilaya="قالمة",
+        commune=None,
+        first_name=None,
+        last_name=None,
+        language="ar",
+    )
+    assert question_type == "CUSTOMER_DELIVERY_INFO"
+    assert "البلدية" in response
+    assert "العنوان" not in response
+    assert "الشارع" not in response
+
+
 @pytest.mark.asyncio
 async def test_yes_advances_pending_purchase_offer_to_draft(db_session):
     store, _, conversation, product, variant = make_fixture(db_session)

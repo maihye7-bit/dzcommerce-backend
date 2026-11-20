@@ -9,7 +9,7 @@ Covers:
 5. Same items + municipality/address merges without erasing other fields.
 6. Failed draft creation does not lose validated shipping data.
 7. A later conversation turn can recover saved shipping data.
-8. Missing phone or wilaya prevents final confirmation.
+8. Missing phone, wilaya, or municipality prevents final confirmation.
 9. A modified draft invalidates old confirmation.
 10. A repeated successful confirmation does not create a second order.
 11. Multi-turn integration test.
@@ -397,6 +397,23 @@ async def test_confirm_fails_without_wilaya(factory):
     assert result.error_code == "SHIPPING_INFO_REQUIRED"
 
 
+@pytest.mark.asyncio
+async def test_confirm_fails_without_municipality(factory):
+    store_id, conv_id, _ = seed(factory)
+    with factory.begin() as db:
+        save_draft_safe(
+            db=db, conversation_id=conv_id, store_id=store_id,
+            items=[{"variant_index": 1, "quantity": 1}],
+            shipping_info={"phone": "0555555555", "wilaya": "Algiers"},
+        )
+        conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
+        conv.metadata_json["confirmation_pending"] = {"draft_id": conv.active_draft_json["draft_id"]}
+    ctx = make_context(db, store_id, conv_id)
+    result = await ConfirmOrderTool().execute(store_id, {}, ctx)
+    assert not result.success
+    assert result.error_code == "SHIPPING_INFO_REQUIRED"
+
+
 # ---------------------------------------------------------------------------
 # 9. Modified draft invalidates old confirmation
 # ---------------------------------------------------------------------------
@@ -429,7 +446,7 @@ async def test_repeated_confirmation_no_duplicate_order(factory):
         save_draft_safe(
             db=db, conversation_id=conv_id, store_id=store_id,
             items=[{"variant_index": 1, "quantity": 2}],
-            shipping_info={"phone": "0555777777", "wilaya": "Annaba"},
+            shipping_info={"phone": "0555777777", "wilaya": "Annaba", "municipality": "Annaba", "address": "Legacy address"},
         )
         conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
         fp_data = {
@@ -448,6 +465,9 @@ async def test_repeated_confirmation_no_duplicate_order(factory):
     assert r1.success
     with factory.begin() as db:
         count = db.query(Order).filter(Order.conversation_id == conv_id).count()
+        order = db.query(Order).filter(Order.conversation_id == conv_id).one()
+        saved_shipping = json.loads(order.shipping_address) if isinstance(order.shipping_address, str) else order.shipping_address
+        assert set(saved_shipping) == {"phone", "wilaya", "municipality"}
         inv = db.query(InventoryItem).filter(InventoryItem.variant_id == variant_id).first()
     assert count == 1
     assert inv.quantity == 8  # 10 - 2
@@ -462,7 +482,7 @@ async def test_multi_turn_integration_customer_selects_then_confirms(factory):
     """
     Simulates:
       - Customer selects product+variant -> draft created
-      - Customer provides phone+wilaya together
+      - Customer provides phone+wilaya+municipality together
       - Customer changes phone only
       - Confirmation succeeds
       - Exactly one order with latest shipping data
@@ -487,7 +507,7 @@ async def test_multi_turn_integration_customer_selects_then_confirms(factory):
     # Step 2: Add phone + wilaya
     r = await run(UpdateOrderDraftTool(), {
         "action": "set_shipping",
-        "shipping_info": {"phone": "0555888888", "wilaya": "Batna"},
+        "shipping_info": {"phone": "0555888888", "wilaya": "Batna", "municipality": "Batna"},
     })
     assert r.success, f"Shipping update failed: {r.error}"
 
@@ -495,6 +515,7 @@ async def test_multi_turn_integration_customer_selects_then_confirms(factory):
         draft = get_draft(db, conv_id)
         assert draft["shipping_info"]["phone"] == "0555888888"
         assert draft["shipping_info"]["wilaya"] == "Batna"
+        assert draft["shipping_info"]["municipality"] == "Batna"
 
     # Step 3: Change phone only — wilaya must persist
     r = await run(UpdateOrderDraftTool(), {
@@ -589,10 +610,10 @@ def test_engine_exposes_shipping_fields_in_tool_schemas():
     assert "phone" in shipping_props
     assert "wilaya" in shipping_props
     assert "municipality" in shipping_props
-    assert "address" in shipping_props
-    assert "commune" in shipping_props  # alias exposed at boundary
-    assert "first_name" in shipping_props
-    assert "last_name" in shipping_props
+    assert "commune" in shipping_props  # municipality alias
+    assert "address" not in shipping_props
+    assert "first_name" not in shipping_props
+    assert "last_name" not in shipping_props
     assert create_schema["properties"]["shipping_info"]["additionalProperties"] is False
 
     # Check update_order_draft schema
@@ -601,10 +622,10 @@ def test_engine_exposes_shipping_fields_in_tool_schemas():
     assert "phone" in update_shipping_props
     assert "wilaya" in update_shipping_props
     assert "municipality" in update_shipping_props
-    assert "address" in update_shipping_props
-    assert "commune" in update_shipping_props  # alias exposed at boundary
-    assert "first_name" in update_shipping_props
-    assert "last_name" in update_shipping_props
+    assert "commune" in update_shipping_props  # municipality alias
+    assert "address" not in update_shipping_props
+    assert "first_name" not in update_shipping_props
+    assert "last_name" not in update_shipping_props
     assert update_schema["properties"]["shipping_info"]["additionalProperties"] is False
 
 
@@ -726,12 +747,13 @@ async def test_real_engine_flow_create_draft_collect_shipping_confirm(factory):
             customer_id=customer_id,
             conversation_id=conv_id,
             channel="test",
-            user_message="0555888888، ولاية باتنة",
+            user_message="ولاية باتنة بلدية باتنة 0555888888",
         )
         # Delivery capture path updates draft
         # Wilaya is stored in Arabic by the engine's _extract_delivery_details
         assert conv.active_draft_json["shipping_info"]["phone"] == "0555888888"
         assert conv.active_draft_json["shipping_info"]["wilaya"] == "باتنة"  # Arabic name
+        assert conv.active_draft_json["shipping_info"]["municipality"] == "باتنة"
         # Engine sets last_question_type to ORDER_CONFIRMATION
         assert conv.metadata_json.get("last_question_type") == "ORDER_CONFIRMATION"
 
@@ -756,6 +778,7 @@ async def test_real_engine_flow_create_draft_collect_shipping_confirm(factory):
         conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
         assert conv.active_draft_json["shipping_info"]["phone"] == "0555999999"
         assert conv.active_draft_json["shipping_info"]["wilaya"] == "باتنة"  # Arabic name preserved
+        assert conv.active_draft_json["shipping_info"]["municipality"] == "باتنة"
 
         # ============================================================
         # Step 4: Attempt confirmation with stale approval -> rejected (CONFIRMATION_STALE)
@@ -835,6 +858,8 @@ async def test_real_engine_flow_create_draft_collect_shipping_confirm(factory):
         shipping = _json.loads(order.shipping_address) if isinstance(order.shipping_address, str) else (order.shipping_address or {})
         assert shipping.get("phone") == "0555999999"
         assert shipping.get("wilaya") == "باتنة"
+        assert shipping.get("municipality") == "باتنة"
+        assert set(shipping) == {"phone", "wilaya", "municipality"}
 
         # Re-confirm should not create a second order
         conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
