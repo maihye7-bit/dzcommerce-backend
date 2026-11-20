@@ -927,3 +927,58 @@ def test_mobile_only_turn_remains_in_recent_dialogue_context(factory):
     assert recent[-1]["role"] == "customer"
     assert "0674251265" not in recent[-1]["content"]
     assert "phone withheld" in recent[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_recovers_only_unambiguous_legacy_variant(factory):
+    """A legacy draft without variant_id can recover by exact unique labels."""
+    store_id, conv_id, variant_id = seed(factory)
+    with factory.begin() as db:
+        draft = save_draft_safe(
+            db=db,
+            conversation_id=conv_id,
+            store_id=store_id,
+            items=[{"variant_index": 1, "quantity": 1}],
+            shipping_info={
+                "phone": "+213 555 123 456",
+                "wilaya": "Guelma",
+                "municipality": "Guelma",
+            },
+        )
+        # Simulate an older/corrupted draft that retained display labels only.
+        draft["items"][0].pop("variant_id", None)
+        conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
+        conv.active_draft_json = draft
+        fp_data = {
+            "items": draft["items"],
+            "shipping_info": draft["shipping_info"],
+        }
+        fp = hashlib.sha256(
+            json.dumps(fp_data, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:16]
+        conv.metadata_json["confirmation_pending"] = {
+            "draft_id": draft["draft_id"],
+            "fingerprint": fp,
+            "status": "awaiting",
+        }
+        conv.metadata_json["last_question_type"] = "ORDER_CONFIRMATION"
+        result = await ConfirmOrderTool().execute(
+            store_id, {}, make_context(db, store_id, conv_id)
+        )
+        assert result.success, result.error
+        assert result.data["status"] == "confirmed"
+
+    with factory.begin() as db:
+        order = db.query(Order).filter(Order.conversation_id == conv_id).one()
+        shipping = (
+            json.loads(order.shipping_address)
+            if isinstance(order.shipping_address, str)
+            else order.shipping_address
+        )
+        assert shipping == {
+            "phone": "0555123456",
+            "wilaya": "Guelma",
+            "municipality": "Guelma",
+        }
+        item = db.query(OrderItem).filter(OrderItem.order_id == order.id).one()
+        assert item.variant_id == variant_id
