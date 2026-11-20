@@ -39,7 +39,7 @@ from app.database import Base
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageRole
 from app.models.customer import Customer
 from app.models.inventory import InventoryItem
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant
 from app.models.store import Store
 from app.services.exceptions import ValidationError
