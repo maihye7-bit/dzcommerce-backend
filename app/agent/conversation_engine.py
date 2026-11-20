@@ -340,10 +340,10 @@ class ConversationEngine:
             "has_confirmed_order": has_confirmed_order,
             "conversation_memory": metadata.get("conversation_memory") or {},
             "confirmation_pending": metadata.get("confirmation_pending"),
-            "shipping_info": (
-                draft.get("shipping_info", {}) if isinstance(draft, dict) else {}
-            )
-            or metadata.get("shipping_info", {}),
+            "shipping_info": {
+                **(metadata.get("shipping_info", {}) if isinstance(metadata.get("shipping_info"), dict) else {}),
+                **(draft.get("shipping_info", {}) if isinstance(draft, dict) and isinstance(draft.get("shipping_info"), dict) else {}),
+            },
             "draft_id": draft.get("draft_id") if isinstance(draft, dict) else None,
         }
 
@@ -1819,7 +1819,6 @@ class ConversationEngine:
                 "phone": bool((current_state.get("shipping_info") or {}).get("phone")),
                 "wilaya": bool((current_state.get("shipping_info") or {}).get("wilaya")),
                 "municipality": bool((current_state.get("shipping_info") or {}).get("municipality")),
-                "address": bool((current_state.get("shipping_info") or {}).get("address")),
             },
             "verified_facts": facts,
             "agent_working_memory": self._sanitize_agent_working_memory(
@@ -1926,8 +1925,11 @@ class ConversationEngine:
                     "ORDER FLOW - EXPLICIT CONSENT ONLY\n"
                     "\n"
                     "1. Customer expresses purchase intent -> create draft with verified variant\n"
-                    "2. Collect delivery details (phone, wilaya, commune optional) -> update_order_draft set_shipping\n"
-                    "- If saved_delivery_fields marks a field as saved, never ask the customer for it again; pending details will be merged into a new draft automatically.\n"
+                    "2. Collect exactly THREE required delivery fields: Algerian mobile phone, wilaya, and municipality/commune. All three are mandatory.\n"
+                    "- Accept all three in one message and in any order, e.g. «ولاية قالمة بلدية قالمة 0674251265».\n"
+                    "- A 10-digit Algerian number beginning 05, 06, or 07 is a mobile number. Normalize Arabic digits and +213/00213 to local 0XXXXXXXXX format.\n"
+                    "- Never ask for a full address, street, neighborhood, building, first name, or last name. These are NOT checkout requirements.\n"
+                    "- Ask only for whichever of phone, wilaya, or municipality is still missing. Never ask again for a saved field.\n"
                     "3. Summarize verified draft -> ask for EXPLICIT approval (أكد؟ نؤكد الطلب؟)\n"
                     "4. ONLY on explicit أكيد/أوك/نعم confirma -> confirm_order\n"
                     "5. Never infer consent from silence, نعم to unrelated question, or memory\n"
@@ -4053,14 +4055,11 @@ class ConversationEngine:
             served_wilayas = db.query(Store.served_wilayas).filter(
                 Store.id == store_id
             ).scalar()
-            received_phone, received_wilaya = self._extract_delivery_details(
-                user_message,
-                served_wilayas,
-            )
+            received_phone, received_wilaya = self._extract_delivery_details(user_message, served_wilayas)
+            received_municipality = self._extract_delivery_municipality(user_message)
             delivery_info_capture_turn = bool(
-                received_phone
-                or received_wilaya
-                or re.search(r"\d{6,}|\b(?:ال)?ولاية\b", user_message or "")
+                received_phone or received_wilaya or received_municipality
+                or re.search(r"\\d{6,}|\\b(?:ال)?ولاية\\b|\\b(?:بلدية|بلديه|commune)\\b", user_message or "")
             )
             if delivery_info_capture_turn:
                 updated_draft = dict(active_draft)
@@ -4075,6 +4074,8 @@ class ConversationEngine:
                         customer.phone = received_phone
                 if received_wilaya:
                     shipping_info["wilaya"] = received_wilaya
+                if received_municipality:
+                    shipping_info["municipality"] = received_municipality
                 # Normalize shipping info (handles municipality/commune alias)
                 from app.services.order_draft_service import (
                     _normalize_canonical_shipping,
@@ -4091,7 +4092,7 @@ class ConversationEngine:
                     customer.phone if customer is not None else None
                 )
                 wilaya = shipping_info.get("wilaya")
-                commune = shipping_info.get("commune")
+                commune = shipping_info.get("municipality") or shipping_info.get("commune")
                 first_name = shipping_info.get("first_name")
                 last_name = shipping_info.get("last_name")
                 delivery_info_reply, delivery_info_question_type = (
@@ -4102,7 +4103,6 @@ class ConversationEngine:
                         commune=commune,
                         first_name=first_name,
                         last_name=last_name,
-                        address=updated_draft["shipping_info"].get("address"),
                         language=local_message_nlu.get("language", "ar"),
                     )
                 )
@@ -5378,64 +5378,16 @@ class ConversationEngine:
             isinstance(draft_before, dict) and draft_before.get("items")
         )
 
-        # Capture delivery details independently of draft creation. Customers often
-        # send their phone/address before the model successfully creates the cart.
-        # Keep those facts on the conversation and merge them into the draft later.
-        served_wilayas = db.query(Store.served_wilayas).filter(
-            Store.id == store_id
-        ).scalar()
-        normalized_message = (user_message or "").translate(
-            str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
-        )
-        is_delivery_statement = not re.search(
-            r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\b",
-            normalized_message,
-            flags=re.IGNORECASE,
-        )
-        received_phone, received_wilaya = (
-            self._extract_delivery_details(normalized_message, served_wilayas)
-            if is_delivery_statement
-            else (None, None)
-        )
-        phone_free_message = re.sub(
-            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
-            " ",
-            normalized_message,
-        )
-        municipality_match = (
-            re.search(
-                r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*([^،,;\n]+)",
-                phone_free_message,
-                flags=re.IGNORECASE,
-            )
-            if is_delivery_statement
-            else None
-        )
-        address_match = (
-            re.search(
-                r"(?:حي|حى|شارع|نهج|طريق|إقامة|اقامة|عمارة|منطقة)\s*[:：]?\s*([^،,;\n]+)",
-                phone_free_message,
-                flags=re.IGNORECASE,
-            )
-            if is_delivery_statement
-            else None
-        )
-        received_municipality = (
-            municipality_match.group(1).strip() if municipality_match else None
-        )
-        received_address = (
-            address_match.group(0).strip() if address_match else None
-        )
-        if received_address:
-            received_address = re.sub(
-                r"\s+(?:ولاية|الولاية|بلدية|بلديه|البلدية).*$",
-                "",
-                received_address,
-                flags=re.IGNORECASE,
-            ).strip(" ،,؛;")
+        # Capture only the three checkout fields. A valid mobile is captured even
+        # when it appears inside a question or alongside location details.
+        served_wilayas = db.query(Store.served_wilayas).filter(Store.id == store_id).scalar()
+        normalized_message = (user_message or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+        received_phone, received_wilaya = self._extract_delivery_details(normalized_message, served_wilayas)
+        is_delivery_statement = not re.search(r"[?؟]|(?:واش|هل|وين|كيفاش|where|what|how)\\b", normalized_message, flags=re.IGNORECASE)
+        received_municipality = self._extract_delivery_municipality(normalized_message) if is_delivery_statement else None
 
         delivery_capture_applied = False
-        if any((received_phone, received_wilaya, received_municipality, received_address)):
+        if any((received_phone, received_wilaya, received_municipality)):
             customer = (
                 db.query(Customer)
                 .filter(
@@ -5465,8 +5417,6 @@ class ConversationEngine:
                     shipping_info["wilaya"] = received_wilaya
                 if received_municipality:
                     shipping_info["municipality"] = received_municipality
-                if received_address:
-                    shipping_info["address"] = received_address
                 updated_draft["shipping_info"] = _normalize_canonical_shipping(
                     shipping_info
                 )
@@ -5485,7 +5435,6 @@ class ConversationEngine:
                         commune=updated_draft["shipping_info"].get("municipality"),
                         first_name=updated_draft["shipping_info"].get("first_name"),
                         last_name=updated_draft["shipping_info"].get("last_name"),
-                        address=updated_draft["shipping_info"].get("address"),
                         language=language,
                     )
                 )
@@ -5501,8 +5450,6 @@ class ConversationEngine:
                     pending_shipping["wilaya"] = received_wilaya
                 if received_municipality:
                     pending_shipping["municipality"] = received_municipality
-                if received_address:
-                    pending_shipping["address"] = received_address
                 metadata["shipping_info"] = _normalize_canonical_shipping(
                     pending_shipping
                 )
@@ -6259,187 +6206,77 @@ class ConversationEngine:
         return ConversationEngine._is_order_confirmation_reply(message)
 
     @staticmethod
-    def _extract_delivery_details(
-        message: str,
-        served_wilayas: str | None,
-    ) -> tuple[str | None, str | None]:
-        # Try primary regex (Algerian phone numbers with country code or local format)
-        phone_match = re.search(
-            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|0[567](?:[\s.-]?\d){8})(?!\d)",
-            message or "",
-        )
-        phone = None
-        remainder = message or ""
-        if phone_match:
-            digits = re.sub(r"\D", "", phone_match.group())
-            phone = f"0{digits[3:]}" if digits.startswith("213") else digits
-            remainder = remainder[:phone_match.start()] + " " + remainder[phone_match.end():]
-        else:
-            # Fallback: try to find any 10-digit Algerian mobile number
-            fallback_match = re.search(r"(?<!\d)(0[567]\d{8})(?!\d)", message or "")
-            if fallback_match:
-                phone = fallback_match.group(1)
-                remainder = message[:fallback_match.start()] + " " + message[fallback_match.end():]
-            else:
-                phone = None
-                remainder = message or ""
-
-        resolved_wilaya = resolve_delivery_wilaya(remainder, served_wilayas)
-        return phone, resolved_wilaya.name_ar if resolved_wilaya else None
+    def _normalize_algerian_mobile_phone(value: str | None) -> str | None:
+        """Normalize valid Algerian mobile numbers to local 05/06/07 format."""
+        if not isinstance(value, str):
+            return None
+        value = value.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+        digits = re.sub(r"\D", "", value)
+        if digits.startswith("00213"):
+            digits = digits[2:]
+        if digits.startswith("213"):
+            digits = "0" + digits[3:]
+        return digits if re.fullmatch(r"0[567]\d{8}", digits) else None
 
     @classmethod
-    def _draft_next_step_response(
-        cls,
-        draft: dict[str, Any],
-        *,
-        phone: str | None,
-        wilaya: str | None,
-        commune: str | None,
-        first_name: str | None,
-        last_name: str | None,
-        language: str,
-        address: str | None = None,
-    ) -> tuple[str, str]:
-        # Only phone and wilaya are required for ORDER_CONFIRMATION
-        # commune, first_name, last_name are optional additions
-        missing = [
-            field
-            for field, value in (
-                ("phone", phone),
-                ("wilaya", wilaya),
-            )
-            if not value
-        ]
-        items = draft.get("items")
+    def _extract_delivery_details(cls, message: str, served_wilayas: str | None) -> tuple[str | None, str | None]:
+        """Extract phone and served wilaya regardless of their order in the message."""
+        normalized = (message or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+        phone_match = re.search(r"(?<!\d)(?:(?:00|\+)?213[\s().-]?[567](?:[\s().-]?\d){8}|0[567](?:[\s().-]?\d){8})(?!\d)", normalized)
+        phone = cls._normalize_algerian_mobile_phone(phone_match.group()) if phone_match else None
+        remainder = normalized[:phone_match.start()] + " " + normalized[phone_match.end():] if phone_match else normalized
+        wilaya = resolve_delivery_wilaya(remainder, served_wilayas)
+        return phone, wilaya.name_ar if wilaya else None
+
+    @classmethod
+    def _extract_delivery_municipality(cls, message: str) -> str | None:
+        """Extract municipality and stop before any following wilaya/phone field."""
+        normalized = (message or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+        phone_match = re.search(r"(?<!\d)(?:(?:00|\+)?213[\s().-]?[567](?:[\s().-]?\d){8}|0[567](?:[\s().-]?\d){8})(?!\d)", normalized)
+        if phone_match:
+            normalized = normalized[:phone_match.start()] + " " + normalized[phone_match.end():]
+        match = re.search(r"(?:بلدية|بلديه|البلدية|commune|municipality)\s*[:：]?\s*(.+)", normalized, flags=re.IGNORECASE)
+        if not match:
+            return None
+        value = re.split(r"\s+(?:ولاية|الولاية|wilaya)\b|[،,;؛\n]", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0].strip(" \t،,;؛:")
+        return value or None
+
+    @classmethod
+    def _draft_next_step_response(cls, draft: dict[str, Any], *, phone: str | None, wilaya: str | None, commune: str | None, first_name: str | None, last_name: str | None, language: str, address: str | None = None) -> tuple[str, str]:
+        # Checkout requires exactly three delivery fields: phone, wilaya, municipality.
+        delivery = [("phone", phone), ("wilaya", wilaya), ("municipality", commune)]
+        missing = [key for key, value in delivery if not value]
         rendered_items = []
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                product_name = str(item.get("product_name") or "المنتج")
-                variant_name = str(item.get("variant_name") or "")
-                quantity = item.get("quantity", 1)
-                line = f"{product_name} — {variant_name} × {quantity}".strip(" —")
-                rendered_items.append(line)
-        total = cls._format_verified_price(draft.get("total_price")) or str(
-            draft.get("total_price", "")
-        )
+        for item in draft.get("items", []) if isinstance(draft.get("items"), list) else []:
+            if isinstance(item, dict):
+                name = str(item.get("product_name") or "المنتج")
+                variant = str(item.get("variant_name") or "")
+                rendered_items.append(f"{name} — {variant} × {item.get('quantity', 1)}".strip(" —"))
+        total = cls._format_verified_price(draft.get("total_price")) or str(draft.get("total_price", ""))
         summary = "\n".join(rendered_items)
-        delivery_labels = {
-            "fr": {
-                "phone": "Téléphone",
-                "wilaya": "Wilaya",
-                "municipality": "Commune",
-                "address": "Adresse",
-                "first_name": "Prénom",
-                "last_name": "Nom",
-                "heading": "Livraison",
-            },
-            "en": {
-                "phone": "Phone",
-                "wilaya": "Wilaya",
-                "municipality": "Municipality",
-                "address": "Address",
-                "first_name": "First name",
-                "last_name": "Last name",
-                "heading": "Delivery",
-            },
-            "ar": {
-                "phone": "الهاتف",
-                "wilaya": "الولاية",
-                "municipality": "البلدية",
-                "address": "العنوان",
-                "first_name": "الاسم",
-                "last_name": "اللقب",
-                "heading": "بيانات التوصيل",
-            },
-        }.get(language, {
-            "phone": "الهاتف",
-            "wilaya": "الولاية",
-            "municipality": "البلدية",
-            "address": "العنوان",
-            "first_name": "الاسم",
-            "last_name": "اللقب",
-            "heading": "بيانات التوصيل",
-        })
-        delivery_parts = []
-        for field, value in (
-            ("phone", phone),
-            ("wilaya", wilaya),
-            ("municipality", commune),
-            ("address", address),
-            ("first_name", first_name),
-            ("last_name", last_name),
-        ):
-            if value:
-                delivery_parts.append(f"{delivery_labels[field]}: {value}")
-        separator = "، " if language == "ar" else ", "
-        delivery_summary = (
-            f"{delivery_labels['heading']}: " + separator.join(delivery_parts)
-            if delivery_parts
-            else ""
-        )
-
         if language == "fr":
+            labels = {"phone": "Téléphone", "wilaya": "Wilaya", "municipality": "Commune"}
+            prompts = {"phone": "votre numéro de téléphone", "wilaya": "votre wilaya", "municipality": "votre commune"}
+            parts = ", ".join(f"{labels[k]}: {v}" for k, v in delivery if v)
+            prefix = f"Brouillon enregistré :\n{summary}\nTotal : {total} DZD. "
             if missing:
-                fields = " et ".join(
-                    {
-                        "phone": "votre numéro de téléphone",
-                        "wilaya": "votre wilaya",
-                        "commune": "votre commune",
-                        "first_name": "votre prénom",
-                        "last_name": "votre nom",
-                    }[field]
-                    for field in missing
-                )
-                return (
-                    f"Brouillon enregistré :\n{summary}\nTotal : {total} DZD. "
-                    f"{delivery_summary} Envoyez {fields} pour continuer.",
-                    "CUSTOMER_DELIVERY_INFO",
-                )
-            return (
-                f"Récapitulatif de la commande :\n{summary}\nTotal : {total} DZD. "
-                f"{delivery_summary} Si tout est correct, écrivez « أكد الطلب » pour confirmer.",
-                "ORDER_CONFIRMATION",
-            )
+                return prefix + (f"Livraison : {parts}. " if parts else "") + "Envoyez " + " et ".join(prompts[k] for k in missing) + " pour continuer.", "CUSTOMER_DELIVERY_INFO"
+            return prefix + f"Livraison : {parts}. Si tout est correct, écrivez « أكد الطلب » pour confirmer.", "ORDER_CONFIRMATION"
         if language == "en":
+            labels = {"phone": "Phone", "wilaya": "Wilaya", "municipality": "Municipality"}
+            prompts = {"phone": "your mobile number", "wilaya": "your wilaya", "municipality": "your municipality"}
+            parts = ", ".join(f"{labels[k]}: {v}" for k, v in delivery if v)
+            prefix = f"Draft saved:\n{summary}\nTotal: {total} DZD. "
             if missing:
-                fields = " and ".join(
-                    {
-                        "phone": "your phone number",
-                        "wilaya": "your wilaya",
-                        "commune": "your commune",
-                        "first_name": "your first name",
-                        "last_name": "your last name",
-                    }[field]
-                    for field in missing
-                )
-                return (
-                    f"Draft saved:\n{summary}\nTotal: {total} DZD. "
-                    f"{delivery_summary} Send {fields} to continue.",
-                    "CUSTOMER_DELIVERY_INFO",
-                )
-            return (
-                f"Order summary:\n{summary}\nTotal: {total} DZD. "
-                f"{delivery_summary} If everything is correct, write « أكد الطلب » to confirm.",
-                "ORDER_CONFIRMATION",
-            )
-
+                return prefix + (f"Delivery: {parts}. " if parts else "") + "Send " + " and ".join(prompts[k] for k in missing) + " to continue.", "CUSTOMER_DELIVERY_INFO"
+            return prefix + f"Delivery: {parts}. If everything is correct, write « أكد الطلب » to confirm.", "ORDER_CONFIRMATION"
+        labels = {"phone": "الهاتف", "wilaya": "الولاية", "municipality": "البلدية"}
+        prompts = {"phone": "رقم هاتفك النقال", "wilaya": "الولاية", "municipality": "البلدية"}
+        parts = "، ".join(f"{labels[k]}: {v}" for k, v in delivery if v)
+        prefix = f"تم حفظ مسودة الطلب:\n{summary}\nالمجموع: {total} دج. "
         if missing:
-            fields = " و".join(
-                "رقم هاتفك" if field == "phone" else "الولاية"
-                for field in missing
-            )
-            return (
-                f"تم حفظ مسودة الطلب:\n{summary}\nالمجموع: {total} دج. "
-                f"{delivery_summary} أرسل {fields} لمتابعة الطلب.",
-                "CUSTOMER_DELIVERY_INFO",
-            )
-        return (
-            f"ملخص الطلب:\n{summary}\nالمجموع: {total} دج. "
-            f"{delivery_summary} إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.",
-            "ORDER_CONFIRMATION",
-        )
+            return prefix + (f"معلومات التوصيل: {parts}. " if parts else "") + "أرسل " + " و".join(prompts[k] for k in missing) + " فقط لمتابعة الطلب.", "CUSTOMER_DELIVERY_INFO"
+        return prefix + f"معلومات التوصيل: {parts}. إذا كان كل شيء صحيحًا، اكتب «أكد الطلب» للتأكيد النهائي.", "ORDER_CONFIRMATION"
 
     def _apply_auto_selected_variant(
         self,
