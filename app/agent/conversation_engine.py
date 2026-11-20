@@ -8724,6 +8724,17 @@ Rules:
             try:
                 with db.begin_nested():
                     conversation.metadata_json = metadata
+                    # The resolver carries server-captured delivery fields in
+                    # resolved_entities. Persist only the checkout contract:
+                    # mobile phone, wilaya, and municipality (never a street address).
+                    raw_shipping = data.get("shipping_info")
+                    shipping_info = {}
+                    if isinstance(raw_shipping, dict):
+                        for field in ("phone", "wilaya", "municipality"):
+                            value = raw_shipping.get(field)
+                            if isinstance(value, str) and value.strip():
+                                shipping_info[field] = value.strip()
+
                     draft = save_draft(
                         db=db,
                         conversation_id=conv_id,
@@ -8732,6 +8743,7 @@ Rules:
                             "variant_index": int(variant_index),
                             "quantity": quantity,
                         }],
+                        shipping_info=shipping_info or None,
                     )
             except (NotFoundError, ValidationError) as exc:
                 logger.info("Draft creation was rejected: %s", exc)
