@@ -39,7 +39,7 @@ from app.database import Base
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageRole
 from app.models.customer import Customer
 from app.models.inventory import InventoryItem
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant
 from app.models.store import Store
 from app.services.exceptions import ValidationError
@@ -927,3 +927,123 @@ def test_mobile_only_turn_remains_in_recent_dialogue_context(factory):
     assert recent[-1]["role"] == "customer"
     assert "0674251265" not in recent[-1]["content"]
     assert "phone withheld" in recent[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_recovers_only_unambiguous_legacy_variant(factory):
+    """A legacy draft without variant_id can recover by exact unique labels."""
+    store_id, conv_id, variant_id = seed(factory)
+    with factory.begin() as db:
+        draft = save_draft_safe(
+            db=db,
+            conversation_id=conv_id,
+            store_id=store_id,
+            items=[{"variant_index": 1, "quantity": 1}],
+            shipping_info={
+                "phone": "+213 555 123 456",
+                "wilaya": "Guelma",
+                "municipality": "Guelma",
+            },
+        )
+        # Simulate an older/corrupted draft that retained display labels only.
+        draft["items"][0].pop("variant_id", None)
+        conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
+        conv.active_draft_json = draft
+        fp_data = {
+            "items": draft["items"],
+            "shipping_info": draft["shipping_info"],
+        }
+        fp = hashlib.sha256(
+            json.dumps(fp_data, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:16]
+        conv.metadata_json["confirmation_pending"] = {
+            "draft_id": draft["draft_id"],
+            "fingerprint": fp,
+            "status": "awaiting",
+        }
+        conv.metadata_json["last_question_type"] = "ORDER_CONFIRMATION"
+        result = await ConfirmOrderTool().execute(
+            store_id, {}, make_context(db, store_id, conv_id)
+        )
+        assert result.success, result.error
+        assert result.data["status"] == "confirmed"
+
+    with factory.begin() as db:
+        order = db.query(Order).filter(Order.conversation_id == conv_id).one()
+        shipping = (
+            json.loads(order.shipping_address)
+            if isinstance(order.shipping_address, str)
+            else order.shipping_address
+        )
+        assert shipping == {
+            "phone": "0555123456",
+            "wilaya": "Guelma",
+            "municipality": "Guelma",
+        }
+        item = db.query(OrderItem).filter(OrderItem.order_id == order.id).one()
+        assert item.variant_id == variant_id
+
+
+@pytest.mark.asyncio
+async def test_legacy_create_draft_service_persists_resolver_shipping_fields(factory):
+    store_id, conv_id, variant_id = seed(factory)
+    engine = ConversationEngine(None, ToolRegistry())
+
+    with factory() as db:
+        variant = db.query(ProductVariant).filter(
+            ProductVariant.id == variant_id
+        ).one()
+        result, succeeded, _question_type = await engine._handle_service_call(
+            "create_draft",
+            {
+                "product_id": str(variant.product_id),
+                "variant_id": str(variant_id),
+                "quantity": 1,
+                "unit_price": 110,
+                "total_price": 110,
+                "shipping_info": {
+                    "phone": "0674251243",
+                    "wilaya": "قالمة",
+                    "municipality": "قالمة",
+                    "address": "MUST NOT BE COPIED",
+                },
+            },
+            db,
+            conv_id,
+        )
+        assert succeeded, result
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conv_id
+        ).one()
+        shipping = conversation.active_draft_json["shipping_info"]
+        assert shipping["phone"] == "0674251243"
+        assert shipping["wilaya"] == "قالمة"
+        assert shipping["municipality"] == "قالمة"
+        assert "address" not in shipping
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_phone"),
+    [
+        ("ولاية قالمة بلدية قالمة0674251243", "0674251243"),
+        ("ولاية قالمة بلدية قالمة +213674251243", "0674251243"),
+        ("ولاية قالمة بلدية قالمة 00213674251243", "0674251243"),
+    ],
+)
+def test_compact_delivery_message_extracts_mobile_and_locations(
+    factory, message, expected_phone
+):
+    store_id, _conv_id, _variant_id = seed(factory)
+    with factory() as db:
+        served_wilayas = db.query(Store.served_wilayas).filter(
+            Store.id == store_id
+        ).scalar()
+
+    phone, wilaya = ConversationEngine._extract_delivery_details(
+        message, served_wilayas
+    )
+    municipality = ConversationEngine._extract_delivery_municipality(message)
+
+    assert phone == expected_phone
+    assert wilaya == "قالمة"
+    assert municipality == "قالمة"

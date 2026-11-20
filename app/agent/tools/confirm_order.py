@@ -171,10 +171,12 @@ class ConfirmOrderTool(BaseTool):
                 raise ValidationError("Invalid item structure in draft.")
 
             variant_id_str = item.get("variant_id")
+            variant_id = None
             try:
-                variant_id = uuid.UUID(str(variant_id_str))
+                if variant_id_str:
+                    variant_id = uuid.UUID(str(variant_id_str))
             except (ValueError, TypeError, AttributeError):
-                raise ValidationError(f"Invalid variant ID format: {variant_id_str}")
+                variant_id = None
 
             raw_quantity = item.get("quantity", 1)
             if isinstance(raw_quantity, bool):
@@ -186,20 +188,48 @@ class ConfirmOrderTool(BaseTool):
             if quantity <= 0 or str(quantity) != str(raw_quantity).strip():
                 raise ValidationError(f"Invalid item quantity: {raw_quantity}")
 
-            # Fetch authoritative variant/product data under this tenant.
-            variant = (
-                db.query(ProductVariant)
-                .join(Product, ProductVariant.product_id == Product.id)
-                .filter(
-                    ProductVariant.id == variant_id,
-                    Product.store_id == store_id,
-                    Product.is_active.is_(True),
+            # Resolve the authoritative variant under this tenant. Older drafts
+            # may contain a product/variant label but no UUID; recover only when
+            # the exact labels identify ONE active variant. Never guess among options.
+            variant = None
+            if variant_id is not None:
+                variant = (
+                    db.query(ProductVariant)
+                    .join(Product, ProductVariant.product_id == Product.id)
+                    .filter(
+                        ProductVariant.id == variant_id,
+                        Product.store_id == store_id,
+                        Product.is_active.is_(True),
+                    )
+                    .first()
                 )
-                .first()
-            )
-            if not variant:
-                raise NotFoundError(
-                    f"Variant {variant_id} not found or unavailable for this store."
+
+            if variant is None:
+                product_name = item.get("product_name")
+                variant_name = item.get("variant_name")
+                if isinstance(product_name, str) and product_name.strip():
+                    candidates_query = (
+                        db.query(ProductVariant)
+                        .join(Product, ProductVariant.product_id == Product.id)
+                        .filter(
+                            Product.store_id == store_id,
+                            Product.is_active.is_(True),
+                            Product.name == product_name.strip(),
+                        )
+                    )
+                    if isinstance(variant_name, str) and variant_name.strip():
+                        candidates_query = candidates_query.filter(
+                            ProductVariant.name == variant_name.strip()
+                        )
+                    candidates = candidates_query.limit(2).all()
+                    if len(candidates) == 1:
+                        variant = candidates[0]
+                        item["variant_id"] = str(variant.id)
+
+            if variant is None:
+                raise ValidationError(
+                    "The selected product variant is missing or ambiguous. "
+                    "A unique exact product/variant match is required."
                 )
 
             product = variant.product
@@ -224,6 +254,10 @@ class ConfirmOrderTool(BaseTool):
                 "quantity": quantity,
                 "unit_price": unit_price,
             })
+
+        # Persist any safely recovered legacy variant IDs together with the
+        # finalized draft state. This is still the same transaction as the order.
+        conv.active_draft_json = draft_data
 
         # Persist only the three agreed delivery fields; ignore legacy address/name keys.
         raw_shipping = {

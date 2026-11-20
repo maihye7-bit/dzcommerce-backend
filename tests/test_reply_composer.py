@@ -153,6 +153,30 @@ def test_composer_diagnoses_unverified_product_names(reply):
     ) == (False, "PRODUCT_NAME_MISMATCH")
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "هاد المنتج زوين بزاف",
+        "واش تحب تعرف الثمن؟",
+        "هذا المنتج ديالنا",
+        "بغيت نعاونك",
+        "شحال السعر؟",
+    ],
+)
+def test_composer_rejects_explicit_moroccan_darija(reply):
+    assert ReplyComposer.diagnose_reply(reply, "ar", []) == (
+        False,
+        "LANGUAGE_MISMATCH",
+    )
+    assert not ReplyComposer._is_safe_reply(reply, "ar", [])
+
+
+@pytest.mark.parametrize("reply", ["بشحال هذا؟", "هذا المنتج تاعنا، نقدر نعاونك"])
+def test_composer_keeps_natural_algerian_darija(reply):
+    assert ReplyComposer.diagnose_reply(reply, "ar", []) == (True, None)
+    assert ReplyComposer._is_safe_reply(reply, "ar", [])
+
+
 @pytest.mark.asyncio
 async def test_composer_requires_all_returned_products_to_be_named():
     provider = FixedProvider(
