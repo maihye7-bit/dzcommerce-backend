@@ -195,8 +195,8 @@ class ConversationEngine:
             str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
         )
         message = re.sub(
-            r"(?<!\d)(?:\+?213[\s.-]?[567](?:[\s.-]?\d){8}|"
-            r"0[567](?:[\s.-]?\d){8})(?!\d)",
+            r"(?<!\d)(?:(?:00|\+)?213[\s().-]?[567](?:[\s().-]?\d){8}|"
+            r"0[567](?:[\s().-]?\d){8})(?!\d)",
             "[phone withheld]",
             message,
         )
@@ -212,10 +212,16 @@ class ConversationEngine:
             message,
             flags=re.IGNORECASE,
         )
+        # Keep the phone field label for conversational understanding, while
+        # redacting the value above. Do not let address redaction consume phone data.
         message = re.sub(
-            r"(?i)(?:delivery address|address|adresse|العنوان|عنوان|"
-            r"رقم الهاتف|الهاتف)\s*[:=]?\s*[^,،;\n]+",
-            "[private delivery detail withheld]",
+            r"(?i)(?:رقم الهاتف|الهاتف)\s*[:=]?",
+            "رقم التواصل ",
+            message,
+        )
+        message = re.sub(
+            r"(?i)(?:delivery address|address|adresse|العنوان|عنوان)\s*[:=]?\s*[^,،;\n]+",
+            "[private address withheld]",
             message,
         )
         if cls._contains_sensitive_nlu_content(message):
@@ -378,7 +384,19 @@ class ConversationEngine:
             ):
                 skipped_current = True
                 continue
-            if not content or cls._contains_sensitive_nlu_content(content):
+            if not content:
+                continue
+            # Preserve the turn while redacting private values. This keeps
+            # cross-model FreeLLM conversations coherent without exposing PII.
+            safe_content = (
+                cls._model_safe_customer_message(content)
+                if row.role == MessageRole.CUSTOMER
+                else content
+            )
+            if (
+                not safe_content
+                or safe_content == "[customer message contains private contact details; withheld]"
+            ):
                 continue
             recent.append(
                 {
@@ -387,7 +405,7 @@ class ConversationEngine:
                         if row.role == MessageRole.CUSTOMER
                         else "assistant"
                     ),
-                    "content": content[:300],
+                    "content": safe_content[:300],
                 }
             )
             if len(recent) == 4:
@@ -1795,6 +1813,7 @@ class ConversationEngine:
                     "PRODUCT_SEARCH_OFFER",
                     "VARIANT_SELECTION",
                     "ORDER_CREATE_OFFER",
+                    "CUSTOMER_DELIVERY_INFO",
                     "ORDER_CONFIRMATION",
                     "SHIPPING_INFO",
                 }
@@ -1910,6 +1929,15 @@ class ConversationEngine:
                     "- send_product_image - explicit request for product photo or image on Messenger\n"
                     "\n"
                     "If a tool fails: acknowledge it, do not invent the result. Continue the conversation honestly.\n"
+                    "\n"
+                    "CHECKOUT DELIVERY CONTRACT — STRICT\n"
+                    "- Collect ONLY these three delivery fields: mobile phone, wilaya, municipality (بلدية).\n"
+                    "- NEVER ask for a street address, building number, full address, first name, or last name.\n"
+                    "- Algerian mobile numbers beginning 05, 06, or 07 are valid mobile numbers. Treat a supplied valid number as received.\n"
+                    "- saved_delivery_fields are authoritative across turns and across model/provider switches. If a field is true, NEVER ask for it again.\n"
+                    "- If the customer sends only a phone number, record it as the mobile number; do not ask what kind/type of number it is.\n"
+                    "- If all three fields are saved, move to the order summary and ask for explicit confirmation. Do not restart data collection.\n"
+                    "- Canonical delivery line: ولاية [wilaya] بلدية [municipality] [mobile phone].\n"
                     "\n"
                     "MEMORY AND CONTEXT - HELPER, NOT AUTHORITY\n"
                     "\n"

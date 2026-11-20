@@ -36,7 +36,7 @@ from app.agent.tools.search_products import SearchProductsTool
 from app.agent.tools.get_product_details import GetProductDetailsTool
 from app.agent.tools.registry import ToolRegistry
 from app.database import Base
-from app.models.conversation import Conversation, ConversationStatus
+from app.models.conversation import Conversation, ConversationStatus, Message, MessageRole
 from app.models.customer import Customer
 from app.models.inventory import InventoryItem
 from app.models.order import Order, OrderStatus
@@ -881,3 +881,49 @@ async def test_real_engine_flow_create_draft_collect_shipping_confirm(factory):
 def conversation_active_draft(conv):
     """Helper to get active draft from conversation."""
     return conv.active_draft_json
+
+# ---------------------------------------------------------------------------
+# 14. Mobile-number extraction and privacy-safe cross-model history
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "phone",
+    [
+        "0512345678",
+        "0612345678",
+        "0712345678",
+        "+213 6 123 456 78",
+        "00213 5 123 456 78",
+    ],
+)
+def test_algerian_mobile_numbers_are_recognized_and_normalized(phone):
+    normalized = ConversationEngine._normalize_algerian_mobile_phone(phone)
+    assert normalized in {"0512345678", "0612345678", "0712345678"}
+
+
+def test_phone_label_does_not_swallow_mobile_value_or_whole_turn():
+    safe = ConversationEngine._model_safe_customer_message(
+        "رقم الهاتف 0674251265"
+    )
+    assert "0674251265" not in safe
+    assert "phone withheld" in safe
+    assert "رقم التواصل" in safe
+
+
+def test_mobile_only_turn_remains_in_recent_dialogue_context(factory):
+    store_id, conv_id, _ = seed(factory)
+    with factory.begin() as db:
+        conv = db.query(Conversation).filter(Conversation.id == conv_id).one()
+        db.add(Message(
+            conversation_id=conv_id,
+            role=MessageRole.CUSTOMER,
+            content="0674251265",
+        ))
+        db.flush()
+        recent = ConversationEngine._recent_dialogue_context(
+            db, conv_id, "next message"
+        )
+    assert recent
+    assert recent[-1]["role"] == "customer"
+    assert "0674251265" not in recent[-1]["content"]
+    assert "phone withheld" in recent[-1]["content"]
