@@ -1020,3 +1020,30 @@ async def test_legacy_create_draft_service_persists_resolver_shipping_fields(fac
         assert shipping["wilaya"] == "قالمة"
         assert shipping["municipality"] == "قالمة"
         assert "address" not in shipping
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_phone"),
+    [
+        ("ولاية قالمة بلدية قالمة0674251243", "0674251243"),
+        ("ولاية قالمة بلدية قالمة +213674251243", "0674251243"),
+        ("ولاية قالمة بلدية قالمة 00213674251243", "0674251243"),
+    ],
+)
+def test_compact_delivery_message_extracts_mobile_and_locations(
+    factory, message, expected_phone
+):
+    store_id, _conv_id, _variant_id = seed(factory)
+    with factory() as db:
+        served_wilayas = db.query(Store.served_wilayas).filter(
+            Store.id == store_id
+        ).scalar()
+
+    phone, wilaya = ConversationEngine._extract_delivery_details(
+        message, served_wilayas
+    )
+    municipality = ConversationEngine._extract_delivery_municipality(message)
+
+    assert phone == expected_phone
+    assert wilaya == "قالمة"
+    assert municipality == "قالمة"
