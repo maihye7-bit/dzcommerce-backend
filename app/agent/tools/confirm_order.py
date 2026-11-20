@@ -3,6 +3,7 @@ Confirm Order Tool: Finalizes the draft into a persistent Order.
 """
 import hashlib
 import json
+import re
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -125,7 +126,7 @@ class ConfirmOrderTool(BaseTool):
                 )
 
         shipping_info = draft_data.get("shipping_info")
-        shipping_info = shipping_info if isinstance(shipping_info, dict) else {}
+        shipping_info = dict(shipping_info) if isinstance(shipping_info, dict) else {}
         customer = (
             db.query(Customer)
             .filter(
@@ -134,15 +135,29 @@ class ConfirmOrderTool(BaseTool):
             )
             .one_or_none()
         )
+        raw_phone = shipping_info.get("phone") or (
+            customer.phone if customer is not None else None
+        )
+        phone_digits = re.sub(r"\D", "", str(raw_phone or ""))
+        if phone_digits.startswith("00213"):
+            phone_digits = phone_digits[2:]
+        if phone_digits.startswith("213"):
+            phone_digits = "0" + phone_digits[3:]
+        municipality = shipping_info.get("municipality") or shipping_info.get("commune")
         if not (
-            shipping_info.get("phone")
-            or (customer.phone if customer is not None else None)
-        ) or not shipping_info.get("wilaya"):
+            re.fullmatch(r"0[567]\d{8}", phone_digits)
+            and shipping_info.get("wilaya")
+            and isinstance(municipality, str)
+            and municipality.strip()
+        ):
             return ToolResult(
                 success=False,
-                error="A phone number and wilaya are required before confirmation.",
+                error="A valid Algerian mobile number, wilaya and municipality are required before confirmation.",
                 error_code="SHIPPING_INFO_REQUIRED",
             )
+        shipping_info["phone"] = phone_digits
+        shipping_info["municipality"] = municipality.strip()
+        shipping_info.pop("commune", None)
 
         items = draft_data["items"]
         if not isinstance(items, list):
