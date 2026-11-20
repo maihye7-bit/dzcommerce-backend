@@ -36,7 +36,7 @@ from app.agent.tools.search_products import SearchProductsTool
 from app.agent.tools.get_product_details import GetProductDetailsTool
 from app.agent.tools.registry import ToolRegistry
 from app.database import Base
-from app.models.conversation import Conversation, ConversationStatus
+from app.models.conversation import Conversation, ConversationStatus, Message, MessageRole
 from app.models.customer import Customer
 from app.models.inventory import InventoryItem
 from app.models.order import Order, OrderStatus
