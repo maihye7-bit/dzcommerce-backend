@@ -4405,7 +4405,7 @@ class ConversationEngine:
                     customer.phone if customer is not None else None
                 )
                 wilaya = shipping_info.get("wilaya")
-                commune = shipping_info.get("commune")
+                commune = shipping_info.get("municipality") or shipping_info.get("commune")
                 first_name = shipping_info.get("first_name")
                 last_name = shipping_info.get("last_name")
                 if phone and not shipping_info.get("phone"):
@@ -8740,7 +8740,7 @@ Rules:
                 customer.phone if customer is not None else None
             )
             wilaya = shipping_info.get("wilaya")
-            commune = shipping_info.get("commune")
+            commune = shipping_info.get("municipality") or shipping_info.get("commune")
             first_name = shipping_info.get("first_name")
             last_name = shipping_info.get("last_name")
             if phone and not shipping_info.get("phone"):
